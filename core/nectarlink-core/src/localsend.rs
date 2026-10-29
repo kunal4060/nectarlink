@@ -11,16 +11,16 @@
 //!   discovers and sends files to LocalSend peers on the network.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     io::ErrorKind,
     net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use nectarlink_protocol::{
@@ -77,6 +77,13 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(150);
 const UPLOAD_CHUNK: usize = 64 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_JSON_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// An approved upload session with no upload activity for this long is
+/// swept (staging deleted, transfer unregistered) on the next
+/// prepare-upload/upload request, so abandoned sessions cannot leak
+/// staging dirs and `Running` transfers forever.
+const SESSION_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Cap on concurrent incoming TCP connections (slowloris/flood bound).
+const MAX_INCOMING_CONNECTIONS: usize = 64;
 
 /// A LocalSend device discovered on the local network.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -224,20 +231,49 @@ struct IncomingFileSpec {
     safe_name: String,
     folder: Option<String>,
     size: u64,
+    /// The sender's claimed SHA-256, if it sent a well-formed one. Enforced
+    /// in `handle_upload` before finalization; `None` means the sender sent
+    /// no digest and only the size check applies.
+    sha256: Option<String>,
     part_path: PathBuf,
     uploaded: bool,
+    /// Set while an upload for this file is in flight, so two parallel
+    /// uploads with the same `fileId`+token cannot interleave writes into
+    /// the same part file.
+    uploading: bool,
 }
 
 struct UploadSession {
     transfer: Transfer,
     peer_name: String,
+    /// IP the prepare-upload arrived from; `handle_cancel` only accepts a
+    /// cancel from this IP.
+    peer_ip: String,
     staging_dir: PathBuf,
     files: Vec<IncomingFileSpec>,
     folder_roots: HashMap<String, PathBuf>,
     saved_items: Vec<PathBuf>,
     cancel: CancellationToken,
     last_progress: Instant,
+    last_activity: Instant,
 }
+
+/// Concurrent incoming TCP connections, for the [`MAX_INCOMING_CONNECTIONS`] cap.
+static INFLIGHT_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Decrements [`INFLIGHT_CONNECTIONS`] when an incoming connection ends.
+struct ConnectionGuard;
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        INFLIGHT_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// IPs with a register callback already in flight, so a flood of announce
+/// packets cannot spawn unbounded callback connections.
+static REGISTER_CALLBACKS_IN_FLIGHT: LazyLock<Mutex<HashSet<(String, u16)>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 struct RunningState {
     cancel: CancellationToken,
@@ -289,7 +325,11 @@ impl LocalSendState {
                 let id = generate_self_signed_identity()?;
                 stored.cert_der_hex = data_encoding::HEXLOWER.encode(&id.cert_der);
                 stored.key_pkcs8_hex = data_encoding::HEXLOWER.encode(&id.key_pkcs8);
-                let _ = save_stored_state(data_dir, &*protector, &stored);
+                // Fail startup rather than run with a throwaway identity
+                // that would never be persisted: otherwise the next launch
+                // generates a new fingerprint and this device appears as a
+                // different peer.
+                save_stored_state(data_dir, &*protector, &stored)?;
                 id
             }
         };
@@ -331,13 +371,16 @@ impl LocalSendState {
     }
 
     pub fn set_enabled(&self, shared: &Arc<Shared>, enabled: bool) -> Result<()> {
-        let prev = self.enabled.swap(enabled, Ordering::SeqCst);
+        // Save before swapping: on a save failure the in-memory flag must
+        // not disagree with disk (reverting on restart).
+        let prev = self.enabled.load(Ordering::SeqCst);
         let stored = StoredLocalSendState {
             enabled,
             cert_der_hex: data_encoding::HEXLOWER.encode(&self.identity.cert_der),
             key_pkcs8_hex: data_encoding::HEXLOWER.encode(&self.identity.key_pkcs8),
         };
         save_stored_state(&self.data_dir, &*self.protector, &stored)?;
+        self.enabled.store(enabled, Ordering::SeqCst);
 
         if enabled && !prev {
             self.start(shared);
@@ -372,6 +415,18 @@ impl LocalSendState {
     pub fn upsert_peer(&self, shared: &Shared, peer: LocalSendPeer) -> bool {
         if peer.fingerprint == self.identity.fingerprint {
             return false;
+        }
+        // Never let a plaintext announcement overwrite a known HTTPS
+        // record: a transient TLS failure (or an attacker breaking the
+        // handshake) must not downgrade later sends to plaintext.
+        {
+            let map = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(existing) = map.get(&peer.id)
+                && existing.protocol.eq_ignore_ascii_case("https")
+                && peer.protocol.eq_ignore_ascii_case("http")
+            {
+                return false;
+            }
         }
         let changed = {
             let mut map = self.peers.lock().unwrap_or_else(|e| e.into_inner());
@@ -463,9 +518,20 @@ impl LocalSendState {
                         res = listener.accept() => res,
                     };
                     let Ok((stream, remote_addr)) = accepted else { continue };
-                    let Some(shared) = weak.upgrade() else { return };
+                    // Bound concurrent connections: without a cap, a LAN
+                    // host drip-feeding connections exhausts tasks/sockets.
+                    if INFLIGHT_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_INCOMING_CONNECTIONS
+                    {
+                        INFLIGHT_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                        continue;
+                    }
+                    let Some(shared) = weak.upgrade() else {
+                        INFLIGHT_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    };
                     let conn_cancel = tcp_cancel.child_token();
                     tokio::spawn(async move {
+                        let _guard = ConnectionGuard;
                         handle_incoming_connection(shared, stream, remote_addr, conn_cancel).await;
                     });
                 }
@@ -549,9 +615,18 @@ impl LocalSendState {
         for (_, tx) in self.pending_approvals.lock().unwrap_or_else(|e| e.into_inner()).drain() {
             let _ = tx.send(false);
         }
+        // Unlike before, stopping also deletes each drained session's
+        // staging dir and unregisters its transfer: otherwise disabling
+        // LocalSend leaked both until restart, and a later `stop()` could
+        // no longer clean them because the map entry was already gone.
         for (_, session) in self.sessions.lock().unwrap_or_else(|e| e.into_inner()).drain() {
-            let s = session.lock().unwrap_or_else(|e| e.into_inner());
-            s.cancel.cancel();
+            let (transfer_id, staging_dir) = {
+                let s = session.lock().unwrap_or_else(|e| e.into_inner());
+                s.cancel.cancel();
+                (s.transfer.id.clone(), s.staging_dir.clone())
+            };
+            shared.unregister_transfer(&transfer_id);
+            let _ = std::fs::remove_dir_all(&staging_dir);
         }
         shared.emit(NodeEvent::LocalSendChanged);
     }
@@ -613,6 +688,7 @@ async fn handle_udp_packet(shared: &Arc<Shared>, data: &[u8], src: SocketAddr) {
     let port = if dto.port == 0 { LOCALSEND_DEFAULT_PORT } else { dto.port };
     let protocol =
         if dto.protocol.eq_ignore_ascii_case("http") { "http".to_owned() } else { "https".to_owned() };
+    let announced_fingerprint = dto.fingerprint.clone();
     let peer = LocalSendPeer {
         id: peer_device_id(&dto.fingerprint, &ip, port),
         alias: dto.alias,
@@ -627,18 +703,39 @@ async fn handle_udp_packet(shared: &Arc<Shared>, data: &[u8], src: SocketAddr) {
 
     let is_announce = dto.announce.or(dto.announcement).unwrap_or(false);
     if is_announce && shared.localsend.receiving() {
-        let shared = shared.clone();
-        tokio::spawn(async move {
-            let _ = send_register_callback(&shared, &ip, port, &protocol).await;
-        });
+        // One in-flight callback per announcer: announce floods must not
+        // spawn unbounded callback connections.
+        let key = (ip.clone(), port);
+        let fresh = REGISTER_CALLBACKS_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
+        if fresh {
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                let _ = send_register_callback(&shared, &ip, port, &protocol, &announced_fingerprint)
+                    .await;
+                REGISTER_CALLBACKS_IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).remove(&key);
+            });
+        }
     }
 }
 
-async fn send_register_callback(shared: &Arc<Shared>, ip: &str, port: u16, protocol: &str) -> Result<()> {
+async fn send_register_callback(
+    shared: &Arc<Shared>,
+    ip: &str,
+    port: u16,
+    protocol: &str,
+    expected_fingerprint: &str,
+) -> Result<()> {
     let our_port = shared.localsend.bound_port();
     let dto = build_our_multicast_dto(shared, our_port, false);
     let body = serde_json::to_vec(&dto).map_err(|e| Error::Internal(e.to_string()))?;
-    let mut stream = connect_peer_stream(shared, ip, port, protocol == "https").await?;
+    // The TLS certificate is checked against the announced fingerprint by
+    // `connect_peer_stream`; the response must then claim that same
+    // fingerprint, or the entry is not recorded.
+    let mut stream =
+        connect_peer_stream(shared, ip, port, protocol == "https", Some(expected_fingerprint)).await?;
     write_http_request(
         &mut stream,
         "POST",
@@ -652,6 +749,7 @@ async fn send_register_callback(shared: &Arc<Shared>, ip: &str, port: u16, proto
     if (200..300).contains(&resp.status)
         && let Ok(info) = serde_json::from_slice::<InfoDto>(&resp.body)
         && info.fingerprint != shared.localsend.identity.fingerprint
+        && info.fingerprint.eq_ignore_ascii_case(expected_fingerprint)
         && !info.alias.trim().is_empty()
     {
         let peer_port = info.port.unwrap_or(port);
@@ -681,9 +779,16 @@ async fn send_register_callback(shared: &Arc<Shared>, ip: &str, port: u16, proto
 pub(crate) async fn probe_peer(shared: &Arc<Shared>, host: &str, port: u16) -> Result<LocalSendPeer> {
     for use_tls in [true, false] {
         let protocol = if use_tls { "https" } else { "http" };
-        let Ok(mut stream) = connect_peer_stream(shared, host, port, use_tls).await else {
+        // Discovery has no expected fingerprint yet, so the certificate
+        // check happens below, against the fingerprint the peer itself
+        // claims in its info response.
+        let Ok(mut stream) = connect_peer_stream(shared, host, port, use_tls, None).await else {
             continue;
         };
+        let cert_fp = stream.peer_cert_fingerprint();
+        // A peer that speaks TLS must not silently downgrade to plaintext:
+        // once the TLS connection itself succeeded, any later failure ends
+        // the probe instead of falling through to HTTP.
         let req_res = if shared.localsend.receiving() {
             let dto = build_our_multicast_dto(shared, shared.localsend.bound_port(), false);
             let body = serde_json::to_vec(&dto).unwrap_or_default();
@@ -708,19 +813,38 @@ pub(crate) async fn probe_peer(shared: &Arc<Shared>, host: &str, port: u16) -> R
             .await
         };
         if req_res.is_err() {
+            if use_tls {
+                return Err(Error::Offline);
+            }
             continue;
         }
         let Ok(resp) = read_http_response(&mut stream).await else {
+            if use_tls {
+                return Err(Error::Offline);
+            }
             continue;
         };
         if !(200..300).contains(&resp.status) {
+            if use_tls {
+                return Err(Error::Offline);
+            }
             continue;
         }
         let Ok(info) = serde_json::from_slice::<InfoDto>(&resp.body) else {
+            if use_tls {
+                return Err(Error::Offline);
+            }
             continue;
         };
         if info.fingerprint == shared.localsend.identity.fingerprint || info.alias.trim().is_empty() {
             return Err(Error::NotFound);
+        }
+        // The TLS certificate must belong to the fingerprint the peer
+        // claims; a mismatch means the responder is not who it says it is.
+        if use_tls
+            && !cert_fp.as_deref().is_some_and(|fp| fp.eq_ignore_ascii_case(&info.fingerprint))
+        {
+            return Err(Error::Offline);
         }
         let peer_port = info.port.unwrap_or(port);
         let peer_proto = info
@@ -866,12 +990,64 @@ async fn handle_incoming_connection(
             handle_upload(&shared, &mut stream, &head, query).await;
         }
         ("POST", "/api/localsend/v2/cancel" | "/api/localsend/v1/cancel") => {
-            handle_cancel(&shared, &mut stream, query).await;
+            handle_cancel(&shared, &mut stream, query, remote_addr).await;
         }
         _ => {
             let _ = write_http_response(&mut stream, 404, "Not Found", None, &[]).await;
         }
     }
+}
+
+/// Removes upload sessions idle for at least [`SESSION_IDLE_TTL`],
+/// deleting their staging dirs and unregistering their transfers, and
+/// reports each as Cancelled. Called on prepare-upload/upload requests;
+/// `stop()` handles the shutdown case.
+async fn sweep_expired_sessions(shared: &Arc<Shared>) {
+    let expired: Vec<Arc<Mutex<UploadSession>>> = {
+        let mut map = shared.localsend.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        let ids: Vec<String> = map
+            .iter()
+            .filter(|(_, s)| {
+                s.lock().unwrap_or_else(|e| e.into_inner()).last_activity.elapsed() >= SESSION_IDLE_TTL
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.iter().filter_map(|id| map.remove(id)).collect()
+    };
+    for session_arc in expired {
+        let (transfer_id, staging_dir, transfer) = {
+            let guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
+            guard.cancel.cancel();
+            (guard.transfer.id.clone(), guard.staging_dir.clone(), guard.transfer.clone())
+        };
+        shared.unregister_transfer(&transfer_id);
+        let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        let mut cancelled = transfer;
+        cancelled.state = TransferState::Cancelled;
+        shared.emit(NodeEvent::Transfer(cancelled));
+    }
+}
+
+/// Records files already delivered when a session later fails or is
+/// cancelled, so the transfer record does not pretend nothing arrived.
+fn record_partial_delivery(shared: &Shared, transfer: &Transfer, peer_name: &str, saved: &[PathBuf]) {
+    if saved.is_empty() {
+        return;
+    }
+    let target = saved.iter().map(|p| p.to_string_lossy().into_owned()).collect::<Vec<_>>().join("\n");
+    let _ = shared.record_timeline(NewTimelineEntry {
+        kind: TimelineKind::File,
+        device_id: transfer.device,
+        device_name: peer_name.to_owned(),
+        incoming: true,
+        timestamp: crate::now_unix(),
+        title: transfer_timeline_title(&transfer.names),
+        detail: format!("Partial delivery (LocalSend) · {} files", saved.len()),
+        target,
+        size_bytes: transfer.done,
+        duration_secs: 0,
+        ref_id: Some(transfer.id.clone()),
+    });
 }
 
 async fn handle_prepare_upload(
@@ -890,6 +1066,18 @@ async fn handle_prepare_upload(
         let _ = write_http_response(stream, 400, "Bad Request", None, &[]).await;
         return;
     }
+    // Duplicate `file_id`s would make the session permanently
+    // uncompletable (two specs, one returned token), so reject them before
+    // any session or staging is created.
+    {
+        let mut seen = HashSet::new();
+        if req.files.values().any(|dto| !seen.insert(dto.id.clone())) {
+            let _ = write_http_response(stream, 400, "Bad Request", None, &[]).await;
+            return;
+        }
+    }
+
+    sweep_expired_sessions(shared).await;
 
     let ip = remote_addr.ip().to_string();
     let port = req.info.port.unwrap_or(LOCALSEND_DEFAULT_PORT);
@@ -908,11 +1096,13 @@ async fn handle_prepare_upload(
         device_model: req.info.device_model,
         device_type: req.info.device_type.unwrap_or_else(|| "desktop".into()),
         fingerprint: req.info.fingerprint,
-        ip,
+        ip: ip.clone(),
         port,
         protocol,
     };
-    shared.localsend.upsert_peer(shared, peer);
+    // The peer entry is only recorded once the user approves the transfer:
+    // upserting here would let a rejected (or never-approved) request poison
+    // the peer list with an attacker's IP/port under a victim's fingerprint.
 
     let session_id = format!("lss_{}", random_token());
     let transfer_id = format!("ls_{}", random_token());
@@ -943,14 +1133,21 @@ async fn handle_prepare_upload(
         total_bytes = total_bytes.saturating_add(dto.size);
         let token = format!("tok_{}", random_token());
         tokens.insert(dto.id.clone(), token.clone());
+        // Only a well-formed 64-hex digest is enforced later; a malformed
+        // one is ignored rather than bricking the transfer.
+        let sha256 = dto.sha256.filter(|h| {
+            h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit())
+        });
         specs.push(IncomingFileSpec {
             file_id: dto.id,
             token,
             safe_name,
             folder,
             size: dto.size,
+            sha256,
             part_path: staging_dir.join(format!("{idx}.part")),
             uploaded: false,
+            uploading: false,
         });
     }
 
@@ -999,6 +1196,9 @@ async fn handle_prepare_upload(
         return;
     }
 
+    // Approved: only now is the sender recorded as a peer.
+    shared.localsend.upsert_peer(shared, peer);
+
     let mut running_transfer = transfer;
     running_transfer.state = TransferState::Running;
     shared.emit(NodeEvent::Transfer(running_transfer.clone()));
@@ -1006,18 +1206,36 @@ async fn handle_prepare_upload(
     let session = Arc::new(Mutex::new(UploadSession {
         transfer: running_transfer,
         peer_name: alias,
+        peer_ip: ip,
         staging_dir,
         files: specs,
         folder_roots: HashMap::new(),
         saved_items: Vec::new(),
         cancel: cancel.clone(),
         last_progress: Instant::now() - PROGRESS_EVERY,
+        last_activity: Instant::now(),
     }));
     shared.localsend.sessions.lock().unwrap_or_else(|e| e.into_inner()).insert(session_id.clone(), session);
 
     let resp = PrepareUploadResponseDto { session_id, files: tokens };
     let resp_body = serde_json::to_vec(&resp).unwrap_or_default();
     let _ = write_http_response(stream, 200, "OK", Some("application/json"), &resp_body).await;
+}
+
+/// SHA-256 hex of a whole file, for LocalSend upload integrity checks.
+fn hash_file_sha256(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(data_encoding::HEXLOWER.encode(&hasher.finalize()))
 }
 
 async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &HttpHead, query: &str) {
@@ -1029,6 +1247,8 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
         return;
     };
 
+    sweep_expired_sessions(shared).await;
+
     let Some(session_arc) =
         shared.localsend.sessions.lock().unwrap_or_else(|e| e.into_inner()).get(&session_id).cloned()
     else {
@@ -1039,25 +1259,35 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
     enum UploadLookup {
         NotFound,
         Forbidden,
-        Found(usize, PathBuf, u64, CancellationToken, String),
+        Found(usize, PathBuf, u64, CancellationToken, String, Option<String>),
     }
 
     let lookup = {
-        let guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
-        match guard.files.iter().enumerate().find(|(_, f)| f.file_id == file_id) {
+        let mut guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.files.iter().position(|f| f.file_id == file_id) {
             None => UploadLookup::NotFound,
-            Some((_, spec)) if spec.token != token || spec.uploaded => UploadLookup::Forbidden,
-            Some((idx, spec)) => UploadLookup::Found(
-                idx,
-                spec.part_path.clone(),
-                spec.size,
-                guard.cancel.clone(),
-                guard.transfer.id.clone(),
-            ),
+            Some(idx) => {
+                let spec = &guard.files[idx];
+                if spec.token != token || spec.uploaded || spec.uploading {
+                    UploadLookup::Forbidden
+                } else {
+                    let spec = &mut guard.files[idx];
+                    spec.uploading = true;
+                    guard.last_activity = Instant::now();
+                    UploadLookup::Found(
+                        idx,
+                        spec.part_path.clone(),
+                        spec.size,
+                        guard.cancel.clone(),
+                        guard.transfer.id.clone(),
+                        spec.sha256.clone(),
+                    )
+                }
+            }
         }
     };
 
-    let (spec_idx, part_path, expected_size, cancel, transfer_id) = match lookup {
+    let (spec_idx, part_path, expected_size, cancel, transfer_id, expected_sha256) = match lookup {
         UploadLookup::NotFound => {
             let _ = write_http_response(stream, 404, "Not Found", None, &[]).await;
             return;
@@ -1066,7 +1296,7 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
             let _ = write_http_response(stream, 403, "Forbidden", None, &[]).await;
             return;
         }
-        UploadLookup::Found(idx, p, sz, c, tid) => (idx, p, sz, c, tid),
+        UploadLookup::Found(idx, p, sz, c, tid, sha) => (idx, p, sz, c, tid, sha),
     };
 
     let Ok(mut out) = tokio::fs::File::create(&part_path).await else {
@@ -1077,6 +1307,7 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
     let stream_res = stream_body_to_file(stream, head, &mut out, expected_size, &cancel, |delta| {
         let mut guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
         guard.transfer.done = guard.transfer.done.saturating_add(delta);
+        guard.last_activity = Instant::now();
         if guard.last_progress.elapsed() >= PROGRESS_EVERY {
             guard.last_progress = Instant::now();
             shared.emit(NodeEvent::Transfer(guard.transfer.clone()));
@@ -1087,13 +1318,39 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
     let _ = out.flush().await;
     drop(out);
 
-    if let Err(err_state) = stream_res {
+    // Size and digest are enforced here, before anything is finalized: a
+    // short, over-long, or corrupted upload must fail the session, not
+    // land in Downloads as a valid file.
+    let mut failed: Option<TransferState> = None;
+    match stream_res {
+        Err(state) => failed = Some(state),
+        Ok(written) => {
+            if written != expected_size {
+                failed = Some(TransferState::Failed(TransferFailure::Other(format!(
+                    "upload delivered {written} bytes, expected {expected_size}"
+                ))));
+            } else if let Some(expected_sha) = &expected_sha256 {
+                let part = part_path.clone();
+                let hashed = tokio::task::spawn_blocking(move || hash_file_sha256(&part)).await;
+                let ok =
+                    matches!(&hashed, Ok(Ok(actual)) if actual.eq_ignore_ascii_case(expected_sha));
+                if !ok {
+                    failed = Some(TransferState::Failed(TransferFailure::Other(
+                        "upload sha256 mismatch".into(),
+                    )));
+                }
+            }
+        }
+    }
+
+    if let Some(err_state) = failed {
         shared.localsend.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(&session_id);
         shared.unregister_transfer(&transfer_id);
         let staging_dir = {
             let mut guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
             guard.transfer.state = err_state;
             shared.emit(NodeEvent::Transfer(guard.transfer.clone()));
+            record_partial_delivery(shared, &guard.transfer, &guard.peer_name, &guard.saved_items);
             guard.staging_dir.clone()
         };
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -1104,6 +1361,10 @@ async fn handle_upload(shared: &Arc<Shared>, stream: &mut ServerStream, head: &H
     // Move completed part file into downloads_dir.
     let finalize_res = finalize_uploaded_file(shared, &session_arc, spec_idx).await;
     if finalize_res.is_err() {
+        // Let a later retry upload this file again instead of leaving it
+        // marked in-progress forever.
+        let mut guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
+        guard.files[spec_idx].uploading = false;
         let _ = write_http_response(stream, 500, "Internal Server Error", None, &[]).await;
         return;
     }
@@ -1171,6 +1432,10 @@ async fn finalize_uploaded_file(
     let downloads_dir = shared.downloads_dir.clone();
     let session_arc = session_arc.clone();
     tokio::task::spawn_blocking(move || {
+        // Same destination lock as the core file transfer: two files with
+        // the same final name must not both compute the same unique path
+        // before either renames.
+        let _dest_guard = crate::transfer::unique_dest_lock();
         fs::create_dir_all(&downloads_dir)?;
         let mut guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
         let folder = guard.files[spec_idx].folder.clone();
@@ -1213,19 +1478,49 @@ async fn finalize_uploaded_file(
     .map_err(std::io::Error::other)?
 }
 
-async fn handle_cancel(shared: &Arc<Shared>, stream: &mut ServerStream, query: &str) {
+async fn handle_cancel(
+    shared: &Arc<Shared>,
+    stream: &mut ServerStream,
+    query: &str,
+    remote_addr: SocketAddr,
+) {
     let params = parse_query(query);
-    let removed = params.get("sessionId").and_then(|session_id| {
+    let session_id = params.get("sessionId").cloned();
+    let removed = session_id.as_deref().and_then(|session_id| {
         shared.localsend.sessions.lock().unwrap_or_else(|e| e.into_inner()).remove(session_id)
     });
     if let Some(session_arc) = removed {
-        let (transfer_id, staging_dir, mut transfer) = {
+        // A session ID alone must not cancel another peer's transfer: only
+        // the IP the prepare-upload arrived from may cancel it. A mismatch
+        // restores the session and is ignored (still 200, so nothing about
+        // the session's existence leaks).
+        let peer_ip = session_arc.lock().unwrap_or_else(|e| e.into_inner()).peer_ip.clone();
+        if remote_addr.ip().to_string() != peer_ip {
+            if let Some(session_id) = session_id {
+                shared
+                    .localsend
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(session_id, session_arc);
+            }
+            let _ = write_http_response(stream, 200, "OK", None, &[]).await;
+            return;
+        }
+        let (transfer_id, staging_dir, mut transfer, peer_name, saved) = {
             let guard = session_arc.lock().unwrap_or_else(|e| e.into_inner());
             guard.cancel.cancel();
-            (guard.transfer.id.clone(), guard.staging_dir.clone(), guard.transfer.clone())
+            (
+                guard.transfer.id.clone(),
+                guard.staging_dir.clone(),
+                guard.transfer.clone(),
+                guard.peer_name.clone(),
+                guard.saved_items.clone(),
+            )
         };
         shared.unregister_transfer(&transfer_id);
         let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+        record_partial_delivery(shared, &transfer, &peer_name, &saved);
         transfer.state = TransferState::Cancelled;
         shared.emit(NodeEvent::Transfer(transfer));
     }
@@ -1385,7 +1680,7 @@ async fn run_outgoing_transfer(
 
     let mut prep_stream = tokio::select! {
         _ = cancel.cancelled() => return Err(TransferState::Cancelled),
-        res = connect_peer_stream(shared, &peer.ip, peer.port, use_tls) => {
+        res = connect_peer_stream(shared, &peer.ip, peer.port, use_tls, Some(&peer.fingerprint)) => {
             res.map_err(|_| TransferState::Failed(TransferFailure::Unreachable))?
         }
     };
@@ -1417,7 +1712,15 @@ async fn run_outgoing_transfer(
     drop(prep_stream);
 
     if prep_resp.status == 204 {
-        return Ok(());
+        // A 204 with files to send is not a delivery: returning Ok here
+        // used to mark the transfer Done (and record a timeline entry)
+        // when the recipient received nothing.
+        if files.is_empty() {
+            return Ok(());
+        }
+        return Err(TransferState::Failed(TransferFailure::Other(
+            "LocalSend peer returned 204 without a session".into(),
+        )));
     }
     if prep_resp.status == 403 || prep_resp.status == 401 {
         return Err(TransferState::Failed(TransferFailure::Denied));
@@ -1439,15 +1742,20 @@ async fn run_outgoing_transfer(
     let mut last_emit = Instant::now();
 
     for f in &mut files {
+        // Skipping a token-less file used to fall through to Ok, marking
+        // the whole transfer Done although that file was never sent.
         let Some(token) = prep.files.get(&f.file_id) else {
-            continue;
+            return Err(TransferState::Failed(TransferFailure::Other(format!(
+                "LocalSend peer omitted token for file {}",
+                f.file_id
+            ))));
         };
         let mut up_stream = tokio::select! {
             _ = cancel.cancelled() => {
                 let _ = send_cancel_request(shared, peer, use_tls, &prep.session_id).await;
                 return Err(TransferState::Cancelled);
             }
-            res = connect_peer_stream(shared, &peer.ip, peer.port, use_tls) => {
+            res = connect_peer_stream(shared, &peer.ip, peer.port, use_tls, Some(&peer.fingerprint)) => {
                 res.map_err(|_| TransferState::Failed(TransferFailure::Unreachable))?
             }
         };
@@ -1524,7 +1832,9 @@ async fn run_outgoing_transfer(
 }
 
 async fn send_cancel_request(shared: &Arc<Shared>, peer: &LocalSendPeer, use_tls: bool, session_id: &str) {
-    let Ok(mut stream) = connect_peer_stream(shared, &peer.ip, peer.port, use_tls).await else {
+    let Ok(mut stream) =
+        connect_peer_stream(shared, &peer.ip, peer.port, use_tls, Some(&peer.fingerprint)).await
+    else {
         return;
     };
     let path = format!("/api/localsend/v2/cancel?sessionId={}", crate::percent_encode(session_id));
@@ -1535,6 +1845,20 @@ async fn send_cancel_request(shared: &Arc<Shared>, peer: &LocalSendPeer, use_tls
 enum ClientStream {
     Plain(TcpStream),
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+impl ClientStream {
+    /// SHA-256 hex fingerprint of the peer's TLS certificate, if any.
+    fn peer_cert_fingerprint(&self) -> Option<String> {
+        match self {
+            ClientStream::Tls(tls) => {
+                let certs = tls.get_ref().1.peer_certificates()?;
+                let first = certs.first()?;
+                Some(data_encoding::HEXLOWER.encode(&Sha256::digest(first.as_ref())))
+            }
+            ClientStream::Plain(_) => None,
+        }
+    }
 }
 
 impl AsyncRead for ClientStream {
@@ -1583,7 +1907,20 @@ impl AsyncWrite for ClientStream {
     }
 }
 
-async fn connect_peer_stream(shared: &Shared, host: &str, port: u16, use_tls: bool) -> Result<ClientStream> {
+/// Connects to a LocalSend peer, optionally checking the peer's TLS
+/// certificate against `expected_fingerprint`. The handshake-signature
+/// check in the verifier only proves the peer holds *some* private key;
+/// without this comparison any LAN host with a self-signed certificate
+/// could impersonate the intended recipient. `None` means discovery
+/// (the fingerprint is not known yet); an empty or `"random"` fingerprint
+/// is likewise unchecked, matching `peer_device_id`'s fallback.
+async fn connect_peer_stream(
+    shared: &Shared,
+    host: &str,
+    port: u16,
+    use_tls: bool,
+    expected_fingerprint: Option<&str>,
+) -> Result<ClientStream> {
     let addr = format!("{host}:{port}");
     let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
         .await
@@ -1598,6 +1935,23 @@ async fn connect_peer_stream(shared: &Shared, host: &str, port: u16, use_tls: bo
             .await
             .map_err(|_| Error::Offline)?
             .map_err(|_| Error::Offline)?;
+        let expected = expected_fingerprint
+            .map(str::trim)
+            .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("random"));
+        if let Some(expected) = expected {
+            let matched = tls
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .is_some_and(|cert| {
+                    data_encoding::HEXLOWER.encode(&Sha256::digest(cert.as_ref()))
+                        .eq_ignore_ascii_case(expected)
+                });
+            if !matched {
+                return Err(Error::Offline);
+            }
+        }
         Ok(ClientStream::Tls(Box::new(tls)))
     } else {
         Ok(ClientStream::Plain(tcp))
@@ -1737,6 +2091,10 @@ async fn read_chunked_vec<S: AsyncRead + Unpin>(
     Ok(out)
 }
 
+/// Streams an upload body to `out`, returning the bytes actually written.
+/// The caller compares that count against the declared size: chunked
+/// bodies have no `Content-Length` to trust, and a short or over-long body
+/// must fail rather than be finalized as a valid file.
 async fn stream_body_to_file<S, F>(
     stream: &mut S,
     head: &HttpHead,
@@ -1744,13 +2102,14 @@ async fn stream_body_to_file<S, F>(
     expected_size: u64,
     cancel: &CancellationToken,
     mut on_progress: F,
-) -> std::result::Result<(), TransferState>
+) -> std::result::Result<u64, TransferState>
 where
     S: AsyncRead + Unpin,
     F: FnMut(u64),
 {
     if head.chunked {
         let mut buf = head.prefetched_body.clone();
+        let mut written: u64 = 0;
         loop {
             while find_crlf(&buf).is_none() {
                 let mut tmp = [0u8; 8192];
@@ -1764,12 +2123,12 @@ where
                     }
                 };
                 if n == 0 {
-                    return Ok(());
+                    return Ok(written);
                 }
                 buf.extend_from_slice(&tmp[..n]);
             }
             let Some(line_end) = find_crlf(&buf) else {
-                return Ok(());
+                return Ok(written);
             };
             let size_line = String::from_utf8_lossy(&buf[..line_end]).into_owned();
             let hex_part = size_line.split(';').next().unwrap_or("").trim();
@@ -1778,17 +2137,23 @@ where
             };
             buf.drain(..line_end + 2);
             if chunk_size == 0 {
-                return Ok(());
+                return Ok(written);
             }
             let mut left_in_chunk = chunk_size;
             while left_in_chunk > 0 {
                 if !buf.is_empty() {
                     let take = buf.len().min(left_in_chunk);
+                    if written.saturating_add(take as u64) > expected_size {
+                        return Err(TransferState::Failed(TransferFailure::Other(
+                            "upload exceeds declared size".into(),
+                        )));
+                    }
                     out.write_all(&buf[..take])
                         .await
                         .map_err(|e| TransferState::Failed(TransferFailure::Other(e.to_string())))?;
                     buf.drain(..take);
                     left_in_chunk -= take;
+                    written = written.saturating_add(take as u64);
                     on_progress(take as u64);
                 } else {
                     let mut tmp = vec![0u8; UPLOAD_CHUNK.min(left_in_chunk)];
@@ -1804,10 +2169,16 @@ where
                     if n == 0 {
                         return Err(TransferState::Failed(TransferFailure::Other("unexpected EOF".into())));
                     }
+                    if written.saturating_add(n as u64) > expected_size {
+                        return Err(TransferState::Failed(TransferFailure::Other(
+                            "upload exceeds declared size".into(),
+                        )));
+                    }
                     out.write_all(&tmp[..n])
                         .await
                         .map_err(|e| TransferState::Failed(TransferFailure::Other(e.to_string())))?;
                     left_in_chunk -= n;
+                    written = written.saturating_add(n as u64);
                     on_progress(n as u64);
                 }
             }
@@ -1826,14 +2197,18 @@ where
             buf.drain(..drain_crlf);
         }
     } else {
-        let total = head.content_length.unwrap_or(expected_size);
+        // Never write past the declared size, even if `Content-Length`
+        // claims more; a short body is caught by the caller's comparison.
+        let total = head.content_length.unwrap_or(expected_size).min(expected_size);
         let mut remaining = total;
+        let mut written: u64 = 0;
         if !head.prefetched_body.is_empty() {
             let take = (head.prefetched_body.len() as u64).min(remaining) as usize;
             out.write_all(&head.prefetched_body[..take])
                 .await
                 .map_err(|e| TransferState::Failed(TransferFailure::Other(e.to_string())))?;
             remaining -= take as u64;
+            written = written.saturating_add(take as u64);
             on_progress(take as u64);
         }
         let mut buf = vec![0u8; UPLOAD_CHUNK];
@@ -1857,9 +2232,10 @@ where
                 .await
                 .map_err(|e| TransferState::Failed(TransferFailure::Other(e.to_string())))?;
             remaining -= n as u64;
+            written = written.saturating_add(n as u64);
             on_progress(n as u64);
         }
-        Ok(())
+        Ok(written)
     }
 }
 
@@ -1925,8 +2301,16 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 
 fn split_localsend_file_name(raw: &str) -> (Option<String>, String) {
     let normalized = raw.replace('\\', "/");
-    let parts: Vec<&str> =
+    let mut parts: Vec<&str> =
         normalized.split('/').map(str::trim).filter(|s| !s.is_empty() && *s != "." && *s != "..").collect();
+    // Cap folder depth (32, matching the protocol's folder limit) and
+    // segment length (255, the usual filesystem component limit), so a
+    // sender cannot declare a path with thousands of segments that fails
+    // at PATH_MAX during finalization after approval.
+    if parts.len() > 33 {
+        parts.truncate(33);
+    }
+    let parts: Vec<String> = parts.iter().map(|s| s.chars().take(255).collect()).collect();
     match parts.as_slice() {
         [] => (None, "file".into()),
         [single] => (None, safe_file_name(single)),
@@ -2003,11 +2387,125 @@ fn decode_stored_identity(stored: &StoredLocalSendState) -> Option<LocalSendIden
     if cert_der.is_empty() || key_pkcs8.is_empty() {
         return None;
     }
+    // An expired (or nearly expired) certificate is discarded so `open()`
+    // generates a fresh identity instead of presenting a dead one. The
+    // check is best-effort: unparseable input keeps the identity, so a
+    // parser miss can never churn the fingerprint on its own.
+    if cert_expired_or_near_expiry(&cert_der) {
+        return None;
+    }
     let fingerprint = data_encoding::HEXLOWER.encode(&Sha256::digest(&cert_der));
     let id = LocalSendIdentity { cert_der, key_pkcs8, fingerprint };
     // Verify the stored key/cert builds a valid rustls ServerConfig.
     build_server_tls_config(&id).ok()?;
     Some(id)
+}
+
+/// Days since the Unix epoch for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Civil date for days since the Unix epoch (inverse of [`days_from_civil`]).
+fn civil_from_days(z_in: i64) -> (i64, i64, i64) {
+    let z = z_in + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Formats Unix seconds as UTCTime (`YYMMDDHHMMSSZ`). UTCTime years wrap
+/// at 2050, so this is only correct for dates before then.
+fn format_utc_time(secs: i64) -> String {
+    let days = secs.div_euclid(86400);
+    let tod = secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(days);
+    format!(
+        "{:02}{:02}{:02}{:02}{:02}{:02}Z",
+        y.rem_euclid(100),
+        mo,
+        d,
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
+}
+
+/// Reads one DER TLV at `pos`, returning its tag, body range, and the
+/// offset just past it. Returns `None` on any malformed input.
+fn read_der_tlv(der: &[u8], pos: usize) -> Option<(u8, std::ops::Range<usize>, usize)> {
+    let tag = *der.get(pos)?;
+    let len_byte = *der.get(pos + 1)?;
+    let (len, hdr) = if len_byte < 0x80 {
+        (len_byte as usize, 2)
+    } else if len_byte == 0x81 {
+        (*der.get(pos + 2)? as usize, 3)
+    } else if len_byte == 0x82 {
+        (((*der.get(pos + 2)? as usize) << 8) | (*der.get(pos + 3)? as usize), 4)
+    } else {
+        return None;
+    };
+    let start = pos + hdr;
+    let end = start.checked_add(len)?;
+    if end > der.len() {
+        return None;
+    }
+    Some((tag, start..end, end))
+}
+
+/// Parses a UTCTime value (`YYMMDDHHMMSSZ`) to Unix seconds.
+fn parse_utc_time(bytes: &[u8]) -> Option<i64> {
+    if bytes.len() != 13 || bytes[12] != b'Z' {
+        return None;
+    }
+    let num = |i: usize| -> Option<i64> {
+        std::str::from_utf8(&bytes[i..i + 2]).ok()?.parse::<i64>().ok()
+    };
+    let (yy, mo, d, hh, mi, ss) = (num(0)?, num(2)?, num(4)?, num(6)?, num(8)?, num(10)?);
+    let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(year, mo, d) * 86400 + hh * 3600 + mi * 60 + ss)
+}
+
+/// Whether a certificate generated by [`generate_self_signed_identity`]
+/// is expired or expires within 30 days, from its DER `notAfter`.
+/// Returns `false` (keep) for anything unparseable.
+fn cert_expired_or_near_expiry(der: &[u8]) -> bool {
+    let Some((_, tbs, _)) = read_der_tlv(der, 0) else { return false };
+    // Inside TBS: version, serial, signature algorithm, issuer, validity.
+    let mut pos = tbs.start;
+    for _ in 0..4 {
+        let Some((_, _, next)) = read_der_tlv(der, pos) else { return false };
+        pos = next;
+    }
+    let Some((tag, validity, _)) = read_der_tlv(der, pos) else { return false };
+    if tag != 0x30 {
+        return false;
+    }
+    let mut vpos = validity.start;
+    let Some((_, _, next)) = read_der_tlv(der, vpos) else { return false };
+    vpos = next;
+    let Some((tag, not_after, _)) = read_der_tlv(der, vpos) else { return false };
+    if tag != 0x17 {
+        return false;
+    }
+    let Some(not_after_secs) = parse_utc_time(&der[not_after]) else { return false };
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    now + 30 * 86400 >= not_after_secs
 }
 
 fn save_stored_state(
@@ -2047,8 +2545,22 @@ pub(crate) fn generate_self_signed_identity() -> Result<LocalSendIdentity> {
     // CN = LocalSend User (2.5.4.3)
     let cn_attr = der_seq(&[der_tlv(0x06, &[0x55, 0x04, 0x03]), der_tlv(0x0C, b"LocalSend User")]);
     let name = der_seq(&[der_tlv(0x31, &cn_attr)]);
-    // Validity: 2024-01-01 to 2036-01-01
-    let validity = der_seq(&[der_tlv(0x17, b"240101000000Z"), der_tlv(0x17, b"360101000000Z")]);
+    // Validity: now to now + 10 years, from the current time — not a
+    // hardcoded window that silently expires (the old 2024–2036 range
+    // would have presented an expired certificate after 2036-01-01).
+    let now_secs =
+        SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now_days = now_secs.div_euclid(86400);
+    let tod = now_secs.rem_euclid(86400);
+    let (y, mo, d) = civil_from_days(now_days);
+    let y_after = y + 10;
+    let leap_after = (y_after % 4 == 0 && y_after % 100 != 0) || y_after % 400 == 0;
+    let d_after = if mo == 2 && d == 29 && !leap_after { 28 } else { d };
+    let after_secs = days_from_civil(y_after, mo, d_after) * 86400 + tod;
+    let validity = der_seq(&[
+        der_tlv(0x17, format_utc_time(now_secs).as_bytes()),
+        der_tlv(0x17, format_utc_time(after_secs).as_bytes()),
+    ]);
     // SubjectPublicKeyInfo: id-ecPublicKey (1.2.840.10045.2.1) + prime256v1 (1.2.840.10045.3.1.7)
     let spki_alg = der_seq(&[
         der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]),

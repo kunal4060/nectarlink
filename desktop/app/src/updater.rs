@@ -19,6 +19,16 @@
 //! it fetches itself, and copies it somewhere only SYSTEM can write before
 //! checking and running it; otherwise it downloads the installer itself.
 //!
+//! Known gap, deliberately NOT papered over here: the installer is verified
+//! only against `SHA256SUMS.txt` from the same GitHub release — a checksum
+//! proves the download matches the listing, not that the listing is genuine.
+//! No signature is checked yet, because no signing key exists to check
+//! against (inventing one here would either break every update or verify
+//! against a key nobody published). The concrete proposal — where a baked-in
+//! key would live and what format it would take — is recorded in the fix
+//! log; until upstream decides it, requiring a signature would break updates
+//! that currently have none to offer.
+//!
 //! The installer replaces the running app, so once the download is ready the
 //! app starts a small hidden relauncher and quits; the relauncher opens the
 //! new version once the installer is done, or the old one again if the
@@ -161,7 +171,14 @@ pub fn check_now(told: bool) -> Option<String> {
             }
             Some(tr!("Updater", "NectarLink %1 is available.", update.version))
         }
-        Ok(None) => told.then(|| tr!("Updater", "NectarLink is up to date.")),
+        Ok(None) => {
+            // A found update that is no longer newer must not linger: the
+            // old code left it in `FOUND`, so the quiet-moment loop staged
+            // and re-installed it daily — and could reinstall it over a
+            // newer version the user installed by hand.
+            *found() = None;
+            told.then(|| tr!("Updater", "NectarLink is up to date."))
+        }
         Err(e) => {
             tracing::info!(error = %e, "couldn't check for updates");
             told.then(|| tr!("Updater", "Couldn't check for updates. Check your internet connection."))
@@ -218,26 +235,21 @@ fn latest() -> Result<Option<Update>, String> {
 const INSTALLER_SUFFIX: &str =
     if cfg!(target_arch = "aarch64") { "-arm64-setup.exe" } else { "-x64-setup.exe" };
 
+// Each install kind takes only its own kind's asset: the old cross-kind
+// fallbacks offered a tarball/AppImage install a `.deb` (or vice versa),
+// and the prompt path then matched no installer branch and reported
+// success without installing anything.
 #[cfg(target_os = "linux")]
-const APPIMAGE_SUFFIXES: &[&str] = if cfg!(target_arch = "aarch64") {
-    &["-aarch64.AppImage", "_arm64.deb", "-linux-aarch64.tar.gz"]
-} else {
-    &["-x86_64.AppImage", "_amd64.deb", "-linux-x86_64.tar.gz"]
-};
+const APPIMAGE_SUFFIXES: &[&str] =
+    if cfg!(target_arch = "aarch64") { &["-aarch64.AppImage"] } else { &["-x86_64.AppImage"] };
 
 #[cfg(target_os = "linux")]
-const DEB_SUFFIXES: &[&str] = if cfg!(target_arch = "aarch64") {
-    &["_arm64.deb", "-aarch64.AppImage", "-linux-aarch64.tar.gz"]
-} else {
-    &["_amd64.deb", "-x86_64.AppImage", "-linux-x86_64.tar.gz"]
-};
+const DEB_SUFFIXES: &[&str] =
+    if cfg!(target_arch = "aarch64") { &["_arm64.deb"] } else { &["_amd64.deb"] };
 
 #[cfg(target_os = "linux")]
-const TARBALL_SUFFIXES: &[&str] = if cfg!(target_arch = "aarch64") {
-    &["-linux-aarch64.tar.gz", "_arm64.deb", "-aarch64.AppImage"]
-} else {
-    &["-linux-x86_64.tar.gz", "_amd64.deb", "-x86_64.AppImage"]
-};
+const TARBALL_SUFFIXES: &[&str] =
+    if cfg!(target_arch = "aarch64") { &["-linux-aarch64.tar.gz"] } else { &["-linux-x86_64.tar.gz"] };
 
 // An RPM install only takes an RPM: a tarball would land in /opt as a
 // second copy beside the package.
@@ -273,9 +285,9 @@ fn detect_linux_install_kind() -> LinuxInstallKind {
     if rpm_installed() {
         return LinuxInstallKind::Rpm;
     }
-    if Path::new("/var/lib/dpkg/status").is_file() {
-        return LinuxInstallKind::Deb;
-    }
+    // No `/var/lib/dpkg/status` fallback: that file exists on every
+    // Debian-based system, so it used to classify any tarball install on
+    // one as a `.deb` install. No package evidence means tarball.
     LinuxInstallKind::Tarball
 }
 
@@ -359,28 +371,70 @@ fn newer_release_for(release: Release, current: &str, suffix: &str) -> Option<Up
     })
 }
 
-/// A version's numbers, and its pre-release part.
-type Version<'a> = ((u64, u64, u64), Option<&'a str>);
+/// A version's numbers (all components, not just the first three), and its
+/// pre-release identifiers.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PreId {
+    /// Numeric identifiers compare numerically, and sort before alphanumeric ones.
+    Num(u64),
+    Str(String),
+}
 
 /// `1.2.3` style versions, with an optional `-pre` part (a release is
-/// newer than its pre-releases).
+/// newer than its pre-releases). All numeric components count (`1.2.3.4` is
+/// newer than `1.2.3`), and pre-release identifiers compare per semver
+/// (`beta.10` is newer than `beta.9`, not older as a plain string compare
+/// said).
 pub(crate) fn is_newer(candidate: &str, current: &str) -> bool {
-    fn parse(v: &str) -> Option<Version<'_>> {
+    fn parse(v: &str) -> Option<(Vec<u64>, Option<Vec<PreId>>)> {
         let (numbers, pre) = match v.split_once('-') {
             Some((n, p)) => (n, Some(p)),
             None => (v, None),
         };
-        let mut parts = numbers.split('.').map(str::parse::<u64>);
-        let version = (parts.next()?.ok()?, parts.next()?.ok()?, parts.next().unwrap_or(Ok(0)).ok()?);
+        let mut version = Vec::new();
+        for part in numbers.split('.') {
+            version.push(part.parse::<u64>().ok()?);
+        }
+        if version.is_empty() {
+            return None;
+        }
+        let pre = pre.map(|p| {
+            p.split('.')
+                .map(|id| {
+                    if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) {
+                        id.parse::<u64>().map(PreId::Num).unwrap_or(PreId::Str(id.to_owned()))
+                    } else {
+                        PreId::Str(id.to_owned())
+                    }
+                })
+                .collect()
+        });
         Some((version, pre))
     }
+    fn cmp_numbers(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+        let len = a.len().max(b.len());
+        for i in 0..len {
+            match a.get(i).copied().unwrap_or(0).cmp(&b.get(i).copied().unwrap_or(0)) {
+                std::cmp::Ordering::Equal => {}
+                ord => return ord,
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
     let (Some((a, a_pre)), Some((b, b_pre))) = (parse(candidate), parse(current)) else { return false };
-    match a.cmp(&b) {
+    match cmp_numbers(&a, &b) {
         std::cmp::Ordering::Greater => true,
         std::cmp::Ordering::Less => false,
         std::cmp::Ordering::Equal => match (a_pre, b_pre) {
             (None, Some(_)) => true,
-            (Some(x), Some(y)) => x > y,
+            (Some(x), Some(y)) => {
+                // A shorter identifier list that is a prefix of the longer
+                // one is older (semver §11.4.4); identifier-by-identifier
+                // comparison is handled by `PreId`'s derived ordering, with
+                // numeric identifiers declared before alphanumeric ones so
+                // `1` < `alpha` (semver §11.4.3).
+                x.cmp(&y) == std::cmp::Ordering::Greater
+            }
             _ => false,
         },
     }
@@ -441,19 +495,34 @@ fn task_registered() -> bool {
 /// app is about to quit for the installer.
 pub fn install(progress: impl FnMut(u64, u64)) -> Result<(), String> {
     let update = available().ok_or("There's no update to install.")?;
+    // Install-time re-check: a found update that is no longer newer than
+    // this copy (the user installed something newer by hand since it was
+    // found) must not be installed over it.
+    if !is_newer(&update.version, env!("CARGO_PKG_VERSION")) {
+        *found() = None;
+        return Err(tr!("Updater", "NectarLink is up to date."));
+    }
     let staged = stage(&update, progress).map_err(|e| {
         tracing::warn!(error = %e, "update download failed");
         e.for_user()
     })?;
-    if task_registered() {
+    let result = if task_registered() {
         match install_with_task(true) {
-            Ok(()) => return Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => {
-                tracing::warn!(error = e, "the update task didn't start; asking for permission instead")
+                tracing::warn!(error = e, "the update task didn't start; asking for permission instead");
+                install_with_prompt(&update, &staged)
             }
         }
+    } else {
+        install_with_prompt(&update, &staged)
+    };
+    if result.is_ok() {
+        // The update is on its way: the stale entry must not survive to be
+        // re-installed at the next quiet moment.
+        *found() = None;
     }
-    install_with_prompt(&update, &staged)
+    result
 }
 
 /// Why a download didn't produce a checked installer.
@@ -523,10 +592,34 @@ fn staging_dir() -> PathBuf {
     }
 }
 
+/// Whether a URL is a GitHub release download: the release JSON used to be
+/// trusted for any host, so a compromised listing could point the installer
+/// and its sums at an attacker's server. Asset downloads come from GitHub
+/// itself (which redirects to its object host).
+fn is_github_release_url(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split('/').next().unwrap_or_default();
+    matches!(host, "github.com" | "objects.githubusercontent.com")
+}
+
 /// The release's SHA-256 for its installer.
 fn expected_hash(update: &Update) -> Result<String, StageError> {
+    if !is_github_release_url(&update.installer_url) || !is_github_release_url(&update.sums_url) {
+        return Err(StageError::Network("update URL is not a GitHub release URL".into()));
+    }
     let sums = http::get_retrying(&update.sums_url, 64 * 1024).map_err(StageError::Network)?;
     listed_hash(&String::from_utf8_lossy(&sums), &update.installer_name).ok_or(StageError::Damaged)
+}
+
+/// File name of the version the app staged and announced, so the SYSTEM
+/// service refuses to install a different version that happened to become
+/// latest in between (see `run_service`).
+const PINNED_VERSION_FILE: &str = "pinned-version";
+
+/// Records the staged version beside the installer (best effort: if the
+/// write fails, the service simply has no pin to check, as before).
+fn write_pinned_version(dir: &Path, version: &str) {
+    let _ = std::fs::write(dir.join(PINNED_VERSION_FILE), version);
 }
 
 fn sha256_file(path: &Path) -> std::io::Result<String> {
@@ -567,19 +660,41 @@ pub fn stage(update: &Update, progress: impl FnMut(u64, u64)) -> Result<PathBuf,
     #[cfg(not(target_os = "linux"))]
     {
         std::fs::create_dir_all(&dir).map_err(|e| StageError::Disk(e.to_string()))?;
+        // The Linux branch checks this; the shared `%ProgramData%` staging
+        // folder is world-writable, so a symlinked staging directory must
+        // not be trusted here either.
+        let meta = std::fs::symlink_metadata(&dir).map_err(|e| StageError::Disk(e.to_string()))?;
+        if meta.file_type().is_symlink() || !meta.is_dir() {
+            return Err(StageError::Disk("untrusted staging directory".into()));
+        }
     }
     let path = dir.join(&update.installer_name);
     let part = dir.join(format!("{}.part", update.installer_name));
-    // Older versions' files.
+    // A planted symlink at either file would make the download (which
+    // follows symlinks) overwrite the link's target as this user, and make
+    // the hash check read the target instead of a real download.
+    for candidate in [&path, &part] {
+        if std::fs::symlink_metadata(candidate).is_ok_and(|m| m.file_type().is_symlink()) {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+    // Older versions' installer files only: the old cleanup deleted every
+    // other file in the shared folder, including files other programs (or
+    // the pinned-version note) had left there.
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let p = entry.path();
-            if p != path && p != part {
-                let _ = std::fs::remove_file(p);
+            if p != path
+                && p != part
+                && p.file_name().is_some_and(|n| is_staging_artefact(&n.to_string_lossy()))
+                && std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_file() || m.file_type().is_symlink())
+            {
+                let _ = std::fs::remove_file(&p);
             }
         }
     }
     if sha256_file(&path).is_ok_and(|h| h == expected) {
+        write_pinned_version(&dir, &update.version);
         return Ok(path);
     }
     let _ = std::fs::remove_file(&path);
@@ -593,7 +708,20 @@ pub fn stage(update: &Update, progress: impl FnMut(u64, u64)) -> Result<PathBuf,
         Err(e) => return Err(StageError::Disk(e.to_string())),
     }
     std::fs::rename(&part, &path).map_err(|e| StageError::Disk(e.to_string()))?;
+    write_pinned_version(&dir, &update.version);
     Ok(path)
+}
+
+/// Whether a staging-directory entry is one of this app's installer
+/// artefacts (an installer for some platform, or its `.part` download).
+fn is_staging_artefact(name: &str) -> bool {
+    let base = name.strip_suffix(".part").unwrap_or(name);
+    base.ends_with("-x64-setup.exe")
+        || base.ends_with("-arm64-setup.exe")
+        || base.ends_with(".AppImage")
+        || base.ends_with(".deb")
+        || base.ends_with(".rpm")
+        || base.ends_with(".tar.gz")
 }
 
 /// Starts [`TASK`], and quits so the installer can replace this copy; a
@@ -601,8 +729,16 @@ pub fn stage(update: &Update, progress: impl FnMut(u64, u64)) -> Result<PathBuf,
 /// window again (the user asked for the update) rather than start in the tray.
 fn install_with_task(shown: bool) -> Result<(), String> {
     let update = available().ok_or("no update")?;
+    if !is_newer(&update.version, env!("CARGO_PKG_VERSION")) {
+        *found() = None;
+        return Err("no newer update".into());
+    }
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    spawn_relauncher(&exe, &update.version, shown)?;
+    // Start the task first, and only then the relauncher: the old order
+    // spawned the hidden relauncher before knowing whether the task would
+    // start, so every failed `schtasks /Run` (and every quiet-loop retry)
+    // leaked an orphan relauncher that reopened the app on its own — and on
+    // the `install()` fallback path the prompt installer ran alongside it.
     let mut cmd = std::process::Command::new("schtasks.exe");
     cmd.args(["/Run", "/TN", TASK]).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     #[cfg(windows)]
@@ -611,7 +747,15 @@ fn install_with_task(shown: bool) -> Result<(), String> {
     if !started.success() {
         return Err(format!("schtasks /Run: {started}"));
     }
+    // The task is already running at this point, so a relauncher failure
+    // must not turn into an error (the `install()` fallback would then run
+    // a second installer alongside the task). Log it: the update still
+    // installs, the user just relaunches by hand.
+    if let Err(e) = spawn_relauncher(&exe, &update.version, shown) {
+        tracing::warn!(error = %e, "relauncher didn't start; the update still installs");
+    }
     tracing::info!(version = update.version, "updating; quitting for the installer");
+    *found() = None;
     crate::bridge::app::request_quit();
     Ok(())
 }
@@ -718,6 +862,20 @@ pub fn run_service() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // The service used to install whatever was latest at the moment it ran,
+    // not the version the app staged and announced. If the app pinned a
+    // version when it staged, refuse a different one: the user approved the
+    // pinned version, and the relauncher is waiting for that one.
+    if let Ok(pinned) = std::fs::read_to_string(staging_dir().join(PINNED_VERSION_FILE)) {
+        let pinned = pinned.trim();
+        if !pinned.is_empty() && pinned != update.version {
+            log(&format!(
+                "not installing: staged version {pinned} is not the latest version {}",
+                update.version
+            ));
+            return ExitCode::FAILURE;
+        }
+    }
     let dir = match service_dir() {
         Ok(dir) => dir,
         Err(e) => {
@@ -774,7 +932,10 @@ pub fn run_service() -> ExitCode {
                 .stderr(std::process::Stdio::null())
                 .spawn()
         } else {
-            std::process::Command::new(&path).arg("/S").spawn()
+            // An AppImage takes no `/S` installer flag: spawning it just
+            // launches the app, yet the old code logged "installing" and
+            // exited SUCCESS. Refuse instead of pretending to install.
+            Err(std::io::Error::other("AppImage install is not supported by the update service"))
         }
     };
     match spawned {
@@ -795,27 +956,32 @@ fn unix_seconds_now() -> String {
     format!("[{secs}]")
 }
 
+/// Removes stale `nectarlink-update-*` directories from a service parent
+/// folder (best effort: entries that cannot be removed are left alone).
+fn clean_old_service_dirs(parent: &Path) {
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with("nectarlink-update-") {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+}
+
 /// A new, empty folder for the download that only SYSTEM and administrators
 /// can change: Windows' `SystemTemp` (older Windows: the SYSTEM account's
 /// temp folder, whose new subfolders users can't write to). Earlier ones are
-/// removed first (in `SystemTemp` only, where nobody else can create them).
+/// removed first, in whichever parent folder is used.
 #[cfg(windows)]
 fn service_dir() -> std::io::Result<PathBuf> {
     let windows =
         std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let system_temp = windows.join("SystemTemp");
-    let parent = if system_temp.is_dir() {
-        if let Ok(entries) = std::fs::read_dir(&system_temp) {
-            for entry in entries.flatten() {
-                if entry.file_name().to_string_lossy().starts_with("nectarlink-update-") {
-                    let _ = std::fs::remove_dir_all(entry.path());
-                }
-            }
-        }
-        system_temp
-    } else {
-        std::env::temp_dir()
-    };
+    let parent = if system_temp.is_dir() { system_temp } else { std::env::temp_dir() };
+    // Old runs used to be cleaned only in the SystemTemp branch, and the
+    // fallback branch never at all: clean both, so stale installer copies
+    // do not accumulate in either place.
+    clean_old_service_dirs(&parent);
     let mut random = [0u8; 8];
     if !crate::win::secure_random(&mut random) {
         return Err(std::io::Error::other("no secure random source"));
@@ -823,6 +989,15 @@ fn service_dir() -> std::io::Result<PathBuf> {
     let name = format!("nectarlink-update-{}", random.iter().map(|b| format!("{b:02x}")).collect::<String>());
     let dir = parent.join(name);
     std::fs::create_dir(&dir)?;
+    // A random name makes a pre-planted symlink vanishingly unlikely, but
+    // check anyway: the directory the SYSTEM installer runs from must not
+    // be a link somewhere else. (An explicit SYSTEM+Administrators-only ACL
+    // is still owed: it needs a Windows security helper that lives in
+    // `win/`, outside this file set — see the fix log.)
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        let _ = std::fs::remove_dir(&dir);
+        return Err(std::io::Error::other("untrusted service directory"));
+    }
     Ok(dir)
 }
 
@@ -830,6 +1005,9 @@ fn service_dir() -> std::io::Result<PathBuf> {
 fn service_dir() -> std::io::Result<PathBuf> {
     use std::os::unix::fs::DirBuilderExt;
     let parent = PathBuf::from("/var/cache");
+    // The old non-Windows branch never cleaned its service directories, so
+    // every run left an installer copy behind.
+    clean_old_service_dirs(&parent);
     let mut random = [0u8; 8];
     if !crate::win::secure_random(&mut random) {
         return Err(std::io::Error::other("no secure random source"));
@@ -872,9 +1050,27 @@ fn install_with_prompt(update: &Update, staged: &Path) -> Result<(), String> {
         tr!("Updater", "The update couldn't be started. Try again.")
     };
     let expected = expected_hash(update).map_err(|e| e.for_user())?;
-    let dir = std::env::temp_dir().join("Nectarlink update");
+    // The old fixed `%TEMP%\Nectarlink update` directory was predictable
+    // and user-writable, so same-user malware could pre-plant a directory
+    // symlink or a DLL the elevated installer might load. Use an
+    // unpredictable per-run directory instead, and refuse a symlinked one.
+    let mut random = [0u8; 8];
+    if !crate::win::secure_random(&mut random) {
+        return Err(failed("no secure random source".into()));
+    }
+    let dir = std::env::temp_dir().join(format!(
+        "Nectarlink update-{}",
+        random.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    ));
     let path: PathBuf = dir.join(&update.installer_name);
     std::fs::create_dir_all(&dir)
+        .and_then(|()| match std::fs::symlink_metadata(&dir) {
+            Ok(m) if m.file_type().is_symlink() => {
+                Err(std::io::Error::other("untrusted update directory"))
+            }
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        })
         .and_then(|()| match std::fs::remove_file(&path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -985,7 +1181,7 @@ fn install_with_prompt(update: &Update, staged: &Path) -> Result<(), String> {
             return Err(failed(format!("privileged .deb install exited with status {code}")));
         }
         if let Ok(exe) = std::env::current_exe() {
-            let _ = spawn_relauncher(&exe, &update.version, true);
+            spawn_relauncher(&exe, &update.version, true).map_err(failed)?;
         }
         crate::bridge::app::request_quit();
         return Ok(());
@@ -1002,7 +1198,7 @@ fn install_with_prompt(update: &Update, staged: &Path) -> Result<(), String> {
             return Err(failed(format!("privileged .rpm install exited with status {code}")));
         }
         if let Ok(exe) = std::env::current_exe() {
-            let _ = spawn_relauncher(&exe, &update.version, true);
+            spawn_relauncher(&exe, &update.version, true).map_err(failed)?;
         }
         crate::bridge::app::request_quit();
         return Ok(());
@@ -1050,16 +1246,17 @@ fn install_with_prompt(update: &Update, staged: &Path) -> Result<(), String> {
             }
         }
         if let Some(exe) = exe {
-            let _ = spawn_relauncher(&exe, &update.version, true);
+            spawn_relauncher(&exe, &update.version, true).map_err(failed)?;
         }
         crate::bridge::app::request_quit();
         return Ok(());
     }
 
-    if crate::win::shell::open_url(&update.notes_url).is_err() {
-        return Err(tr!("Updater", "The update couldn't be started. Try again."));
-    }
-    Ok(())
+    // An installer kind this path does not handle used to "succeed" by
+    // merely opening the release notes, while nothing was installed. Fail
+    // instead (the single-kind suffix lists above should keep this
+    // unreachable for genuine releases).
+    Err(tr!("Updater", "The update couldn't be started. Try again."))
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]

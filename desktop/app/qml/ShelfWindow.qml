@@ -40,10 +40,14 @@ Window {
     property bool justDropped: false
     property bool undoPending: false
     property bool undoCancelled: false
+    property bool noPhoneBanner: false
     property var pendingUrls: []
     property string pendingText: ""
     property string pendingLabel: ""
     property real undoProgress: 0.0
+    // Timestamp the Undo window opened, so the progress bar can be driven
+    // by a timer when animations are disabled (reduce-motion).
+    property double undoStartedAt: 0
 
     readonly property string targetPhoneName: shelfData.hasDevice && shelfData.deviceName.length > 0
         ? shelfData.deviceName
@@ -57,6 +61,13 @@ Window {
         if (undoPending) {
             commitPendingSend()
         }
+        // Never queue a send with no phone connected: the confirmation
+        // banner would otherwise claim a send that cannot happen.
+        if (!shelfWin.shelfData.hasDevice) {
+            noPhoneBanner = true
+            dropConfirmTimer.restart()
+            return
+        }
         pendingUrls = cleanUrls
         pendingText = cleanText
         pendingLabel = label ? String(label) : ""
@@ -64,8 +75,11 @@ Window {
         justDropped = false
         undoPending = true
         undoProgress = 1.0
+        undoStartedAt = Date.now()
         if (!Theme.reduceMotion) {
             undoProgressAnim.restart()
+        } else {
+            undoProgressTimer.restart()
         }
         undoSendTimer.restart()
     }
@@ -75,8 +89,10 @@ Window {
             return
         undoSendTimer.stop()
         undoProgressAnim.stop()
+        undoProgressTimer.stop()
         const urls = pendingUrls
         const text = pendingText
+        const hadDevice = shelfWin.shelfData.hasDevice
         undoPending = false
         pendingUrls = []
         pendingText = ""
@@ -84,8 +100,13 @@ Window {
         undoProgress = 0.0
         if (urls.length > 0 || text.trim().length > 0) {
             AppController.dropToShelf(urls, text)
-            justDropped = true
-            dropConfirmTimer.restart()
+            // When the phone disconnected during the Undo window the
+            // backend may retarget the send and its toast names the real
+            // recipient; do not show a banner naming the old device.
+            if (hadDevice) {
+                justDropped = true
+                dropConfirmTimer.restart()
+            }
         }
     }
 
@@ -94,6 +115,7 @@ Window {
             return
         undoSendTimer.stop()
         undoProgressAnim.stop()
+        undoProgressTimer.stop()
         undoPending = false
         pendingUrls = []
         pendingText = ""
@@ -152,20 +174,17 @@ Window {
         if (visible) {
             Qt.callLater(() => AppController.styleShelfWindow())
         } else if (undoPending) {
-            commitPendingSend()
+            // Hiding the Shelf cancels a pending send: committing here
+            // would send something the user never confirmed, and the
+            // Undo pill is gone with the window.
+            cancelPendingSend()
         }
     }
 
-    Shortcut {
-        sequence: "Escape"
-        onActivated: AppController.closeShelf()
-    }
-
-    Shortcut {
-        sequence: "Ctrl+Z"
-        enabled: shelfWin.undoPending
-        onActivated: shelfWin.cancelPendingSend()
-    }
+    // NOTE: no Escape / Ctrl+Z shortcuts here on purpose. This window has
+    // Qt.WindowDoesNotAcceptFocus and never becomes active, so the
+    // shortcuts could never fire; an application-context Undo would
+    // hijack the foreground app's own Undo.
 
     Timer {
         id: undoSendTimer
@@ -184,12 +203,27 @@ Window {
         easing.type: Easing.Linear
     }
 
+    // Reduce-motion progress: the NumberAnimation above is skipped when
+    // animations are disabled, so drive the bar from the wall clock.
+    Timer {
+        id: undoProgressTimer
+        interval: 50
+        repeat: true
+        onTriggered: {
+            shelfWin.undoProgress = Math.max(0, Math.min(1,
+                1 - (Date.now() - shelfWin.undoStartedAt) / 3000))
+            if (shelfWin.undoProgress <= 0)
+                stop()
+        }
+    }
+
     Timer {
         id: dropConfirmTimer
         interval: 1800
         onTriggered: {
             shelfWin.justDropped = false
             shelfWin.undoCancelled = false
+            shelfWin.noPhoneBanner = false
         }
     }
 
@@ -366,11 +400,13 @@ Window {
                                 : (shelfWin.justDropped ? Theme.secondaryContainerContent : Theme.surfaceContent)
                             text: shelfDropArea.containsDrag
                                 ? qsTr("Release to send to %1").arg(shelfWin.targetPhoneName)
-                                : (shelfWin.justDropped
-                                    ? qsTr("Sent to %1").arg(shelfWin.targetPhoneName)
-                                    : (shelfWin.undoCancelled
-                                        ? qsTr("Send cancelled")
-                                        : qsTr("Drop or flick items here to send")))
+                                : (shelfWin.noPhoneBanner
+                                    ? qsTr("No phone connected")
+                                    : (shelfWin.justDropped
+                                        ? qsTr("Sent to %1").arg(shelfWin.targetPhoneName)
+                                        : (shelfWin.undoCancelled
+                                            ? qsTr("Send cancelled")
+                                            : qsTr("Drop or flick items here to send"))))
                         }
                     }
 
@@ -404,7 +440,11 @@ Window {
                                 weight: 600
                                 elide: Text.ElideRight
                                 color: Theme.primaryContainerContent
-                                text: qsTr("Sending to %1…").arg(shelfWin.targetPhoneName)
+                                text: shelfWin.pendingLabel.length > 0
+                                    ? qsTr("Sending %1 to %2…").arg(shelfWin.pendingLabel).arg(shelfWin.targetPhoneName)
+                                    : (shelfWin.pendingUrls.length > 1
+                                        ? qsTr("Sending %1 files to %2…").arg(shelfWin.pendingUrls.length).arg(shelfWin.targetPhoneName)
+                                        : qsTr("Sending to %1…").arg(shelfWin.targetPhoneName))
                             }
                         }
 
@@ -474,8 +514,11 @@ Window {
                                     readonly property bool hasItem: itemData !== null && itemData !== undefined
                                     readonly property string thumbSource: hasItem ? (itemData.thumbUrl || itemData.thumbnailDataUrl || "") : ""
                                     readonly property string targetRef: hasItem ? (itemData.localPath || itemData.id || "") : ""
+                                    // Local path only: falling back to the thumbnail
+                                    // URL would send a data: URL as text to the phone.
+                                    // A thumbnail-only card has no sendUrl and bounces back.
                                     readonly property string sendUrl: hasItem
-                                        ? ((itemData.localPath && itemData.localPath.length > 0) ? itemData.localPath : thumbSource)
+                                        ? ((itemData.localPath && itemData.localPath.length > 0) ? itemData.localPath : "")
                                         : ""
 
                                     property real flickOffsetX: 0
@@ -824,12 +867,23 @@ Window {
                                         IconButton {
                                             width: 24
                                             height: 24
-                                            visible: clipCard.hasClip && (clipCard.clipData.text || "").length > 0
+                                            visible: clipCard.hasClip && ((clipCard.clipData.text || "").length > 0
+                                                || (clipCard.clipData.kind === "image"
+                                                    && clipCard.clipId.length > 0
+                                                    && (shelfWin.shelfData.deviceId || "").length > 0))
                                             iconPath: Icons.send
                                             label: qsTr("Send clip to phone")
                                             onClicked: {
                                                 clipFlickAnim.restart()
-                                                shelfWin.queueSendToPhone([], clipCard.clipData.text || "", qsTr("Clip"))
+                                                if (clipCard.clipData.kind === "image") {
+                                                    // Images go through clipboard history by
+                                                    // id: the text queue would send a data: URL
+                                                    // as plain text instead of the image.
+                                                    AppController.sendClipboardHistory(
+                                                        shelfWin.shelfData.deviceId, clipCard.clipId)
+                                                } else {
+                                                    shelfWin.queueSendToPhone([], clipCard.clipData.text || "", qsTr("Clip"))
+                                                }
                                             }
                                         }
 
@@ -943,9 +997,17 @@ Window {
                                             flicking = false
                                             dragged = true
                                             clipCard.flickOffsetX = 0
-                                            if (shouldSend && (clipCard.clipData.text || "").length > 0) {
+                                            const isImageClip = clipCard.clipData.kind === "image"
+                                                && clipCard.clipId.length > 0
+                                                && (shelfWin.shelfData.deviceId || "").length > 0
+                                            if (shouldSend && ((clipCard.clipData.text || "").length > 0 || isImageClip)) {
                                                 clipFlickAnim.restart()
-                                                shelfWin.queueSendToPhone([], clipCard.clipData.text || "", qsTr("Clip"))
+                                                if (isImageClip) {
+                                                    AppController.sendClipboardHistory(
+                                                        shelfWin.shelfData.deviceId, clipCard.clipId)
+                                                } else {
+                                                    shelfWin.queueSendToPhone([], clipCard.clipData.text || "", qsTr("Clip"))
+                                                }
                                             } else {
                                                 clipCard.flickOffsetY = 0
                                             }

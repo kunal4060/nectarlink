@@ -258,6 +258,31 @@ fn read_pc_entries_inner(dir: &Path, prefix: &str, depth: usize, out: &mut Vec<S
     }
 }
 
+/// Whether a phone-supplied relative path is safe to join under a PC folder:
+/// every `/`-separated segment must be a plain file/folder name. Empty
+/// segments, `.`/`..`, and `\`/`:` (Windows separator / drive tricks) are
+/// rejected, so a compromised paired phone cannot escape the sync folder
+/// (e.g. `a/../../startup/evil.exe` or an absolute path replacing the base).
+fn is_safe_rel_path(rel_path: &str) -> bool {
+    !rel_path.is_empty()
+        && rel_path
+            .split('/')
+            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':', '\0']))
+}
+
+/// Joins a validated relative path under `pc_dir`, segment by segment.
+/// Returns `None` for an unsafe path instead of joining it.
+fn join_pc_path(pc_dir: &Path, rel_path: &str) -> Option<PathBuf> {
+    if !is_safe_rel_path(rel_path) {
+        return None;
+    }
+    let mut out = pc_dir.to_path_buf();
+    for seg in rel_path.split('/') {
+        out.push(seg);
+    }
+    Some(out)
+}
+
 fn join_phone_path(folder: &str, rel_path: &str) -> String {
     let trimmed = folder.trim_matches('/');
     if trimmed.is_empty() {
@@ -285,6 +310,7 @@ async fn list_phone_entries(node: &Node, peer: DeviceId, base_folder: &str) -> O
             if entry.name.starts_with('.')
                 || entry.name.ends_with(".nectarlink.part")
                 || entry.name.contains(" (conflict-")
+                || !is_safe_rel_path(&entry.name)
             {
                 continue;
             }
@@ -521,8 +547,8 @@ pub async fn sync_now(node: &Node) -> usize {
         for action in actions {
             match action {
                 SyncAction::PullToPc { rel_path } => {
+                    let Some(dest) = join_pc_path(&pc_dir, &rel_path) else { continue };
                     let remote = join_phone_path(&rule.phone_folder, &rel_path);
-                    let dest = pc_dir.join(&rel_path);
                     if let Some((size, modified)) = pull_phone_file_streaming(node, peer, remote, &dest).await
                     {
                         updated_baseline.insert(rel_path, (size, modified));
@@ -530,20 +556,26 @@ pub async fn sync_now(node: &Node) -> usize {
                     }
                 }
                 SyncAction::PushToPhone { rel_path } => {
+                    // PC-originated: `rel_path` was built by scanning the
+                    // local disk, so its segments are real file names and
+                    // cannot escape `pc_dir` the way phone-supplied names
+                    // can; keep the plain join (Linux file names may
+                    // legally contain `:`/`\`, which the phone-side check
+                    // above rejects).
+                    let src = pc_dir.join(&rel_path);
                     if let Some((parent_rel, _)) = rel_path.rsplit_once('/') {
                         let remote_parent = join_phone_path(&rule.phone_folder, parent_rel);
                         let _ = node.storage_mkdir(peer, remote_parent).await;
                     }
                     let remote = join_phone_path(&rule.phone_folder, &rel_path);
-                    let src = pc_dir.join(&rel_path);
                     if let Ok(done) = node.storage_write(peer, remote, &src).await {
                         updated_baseline.insert(rel_path, (done.size, done.modified));
                         executed += 1;
                     }
                 }
                 SyncAction::ConflictRenamePcAndPull { rel_path, conflict_rel_path } => {
-                    let src = pc_dir.join(&rel_path);
-                    let conflict_dst = pc_dir.join(&conflict_rel_path);
+                    let Some(src) = join_pc_path(&pc_dir, &rel_path) else { continue };
+                    let Some(conflict_dst) = join_pc_path(&pc_dir, &conflict_rel_path) else { continue };
                     if let Some(parent) = conflict_dst.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }

@@ -51,6 +51,11 @@ const DEFER_DIAL: Duration = Duration::from_millis(750);
 /// How long a phone plugged into a PC waits for the PC to dial through the cable before
 /// dialing itself (see [`Shared::usb_tunnel_inbound`]).
 const USB_DIAL_GRACE: Duration = Duration::from_secs(6);
+/// Maximum entries kept in the local notification history: without a cap a
+/// long-running process (or a peer posting many distinct notifications)
+/// grows the history — and every substring search over it — without bound.
+const NOTIFICATION_HISTORY_CAP: usize = 1000;
+
 /// Broadcast channel capacity for [`NodeEvent`]s: large enough to absorb initial
 /// notification snapshots and multi-peer capability/state bursts without lagging
 /// UI or FFI subscribers.
@@ -117,6 +122,18 @@ struct Supervisor {
 
 /// A PC's reader of a phone's mirroring: the phone, the session, video or sound.
 pub(crate) type MirrorStop = (DeviceId, u32, &'static str);
+
+/// What [`Shared::register_session`] decided. Callers must not treat a
+/// refusal as a kept duplicate: falling back to a pre-existing session
+/// after a policy refusal would report a refused dial as success.
+pub(crate) enum RegisterOutcome {
+    Registered(Arc<Session>),
+    /// The new connection was dropped in favour of a live duplicate.
+    KeptDuplicate,
+    /// The connection was refused (unpaired, non-LAN path, reconnect off,
+    /// or already closed) and no session was registered.
+    Refused,
+}
 
 /// State shared by the node, its sessions and background tasks.
 pub(crate) struct Shared {
@@ -419,7 +436,8 @@ impl Shared {
 
     pub(crate) fn cancel_queue_or_transfer(self: &Arc<Self>, id: &str) -> Result<bool> {
         self.localsend.resolve_transfer_approval(id, false);
-        let removed_queue = self.store.remove_queue_item(id)?;
+        // Cancel the live transfer FIRST: a queue-DB error must not leave
+        // an in-progress transfer running after the user pressed Cancel.
         let target = {
             let mut map = lock(&self.transfers);
             if let Some(ctrl) = map.get_mut(id) {
@@ -433,6 +451,19 @@ impl Shared {
                 }
                 Some((peer, direction, paused, running))
             } else {
+                None
+            }
+        };
+        let removed_queue = match self.store.remove_queue_item(id) {
+            Ok(removed) => removed,
+            Err(e) => {
+                // The live transfer above is already cancelled; report the
+                // DB failure instead of silently succeeding, but only fail
+                // outright when nothing was cancelled at all.
+                tracing::warn!(error = %e, "failed to remove cancelled queue item");
+                if target.is_none() {
+                    return Err(e);
+                }
                 None
             }
         };
@@ -599,25 +630,29 @@ impl Shared {
         if self.away_mode() || self.is_usb_connection(conn) {
             return true;
         }
-        let paths = conn.paths();
-        let selected = paths.iter().find(|p| p.is_selected()).or_else(|| paths.iter().next());
-        match selected {
-            Some(p) if p.is_relay() => false,
-            Some(p) => match p.remote_addr() {
+        // Any direct LAN/USB path admits the connection, not just the
+        // currently selected one: path reporting can transiently list the
+        // relay first while a direct path is already available.
+        conn.paths().iter().any(|p| {
+            if p.is_relay() {
+                return false;
+            }
+            match p.remote_addr() {
                 iroh::TransportAddr::Ip(addr) => self.is_usb_addr(addr) || self.is_allowed_peer_ip(addr.ip()),
                 _ => false,
-            },
-            None => false,
-        }
+            }
+        })
     }
 
     pub(crate) async fn wait_connection_allowed(&self, conn: &Connection) -> bool {
         if self.away_mode() || self.is_usb_connection(conn) {
             return true;
         }
+        // Wait briefly for a LAN path to appear instead of deciding on the
+        // first path of any kind (which may be the relay, reported first).
         for _ in 0..20 {
-            if !conn.paths().is_empty() {
-                return self.is_connection_allowed(conn);
+            if self.is_connection_allowed(conn) {
+                return true;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
@@ -683,10 +718,9 @@ impl Shared {
     }
 
     pub(crate) fn is_usb_connection(&self, conn: &Connection) -> bool {
-        let peer = crate::device_id(&conn.remote_id());
-        if self.usb_peer_addr(&peer).is_some() {
-            return true;
-        }
+        // Only this connection's actual path counts: a stale `usb_peers`
+        // entry (left behind by a missed disconnect, with no expiry) must
+        // not let a later relay/WAN connection bypass the LAN-only check.
         conn.paths().iter().any(|p| match p.remote_addr() {
             iroh::TransportAddr::Ip(addr) => self.is_usb_addr(addr),
             _ => false,
@@ -916,6 +950,32 @@ impl Shared {
         }
     }
 
+    /// Paired devices a fresh pairing for `peer` would absorb as a reinstall
+    /// of the same physical device (same kind + peer-supplied `install_id`,
+    /// no live session). Callers that can ask the user — the desktop/Android
+    /// UI — should confirm the takeover with this list before calling
+    /// [`complete_pairing`](Self::complete_pairing): the install ID is
+    /// supplied by the newly pairing peer, so it alone must never silently
+    /// decide that another device's queue and history change hands.
+    pub fn reinstall_candidates(&self, peer: DeviceId, info: &DeviceInfo) -> Vec<DeviceId> {
+        let Some(install_id) = info.install_id.as_deref() else {
+            return Vec::new();
+        };
+        let Ok(existing_peers) = self.store.list_peers() else {
+            return Vec::new();
+        };
+        existing_peers
+            .into_iter()
+            .filter(|old| {
+                old.id != peer
+                    && self.session(&old.id).is_none()
+                    && old.info.kind == info.kind
+                    && old.info.install_id.as_deref() == Some(install_id)
+            })
+            .map(|old| old.id)
+            .collect()
+    }
+
     /// Stores a newly paired device and starts keeping it connected.
     pub async fn complete_pairing(self: &Arc<Self>, peer: DeviceId, info: DeviceInfo) -> Result<()> {
         let info = info.sanitized();
@@ -924,24 +984,25 @@ impl Shared {
         // The same physical device paired again (after a reinstall it has a new identity):
         // move its history and queue to the new pairing and forget the old one. Only the
         // install ID decides; same-name devices (two family phones) stay separate.
-        if let Some(install_id) = info.install_id.as_deref()
-            && let Ok(existing_peers) = self.store.list_peers()
-        {
-            for old in existing_peers {
-                if old.id != peer
-                    && self.session(&old.id).is_none()
-                    && old.info.kind == info.kind
-                    && old.info.install_id.as_deref() == Some(install_id)
-                {
-                    let _ = self.store.reassign_timeline(&old.id, &peer);
-                    if self.store.reassign_send_queue_peer(&old.id, &peer).unwrap_or(0) > 0 {
-                        reassigned_queue = true;
-                    }
-                    let _ = self.forget_peer(&old.id).await;
-                }
-            }
-        }
+        // The new pairing is stored FIRST: if that fails, the old pairing is
+        // left untouched instead of being destroyed for a pairing that never
+        // landed. (The install-ID takeover itself still needs a UI
+        // confirmation step via `reinstall_candidates` — see that method.)
+        let candidates = self.reinstall_candidates(peer, &info);
         self.store.upsert_peer(&peer, &info, paired_at)?;
+        for old_id in candidates {
+            let _ = self.store.reassign_timeline(&old_id, &peer);
+            if self.store.reassign_send_queue_peer(&old_id, &peer).unwrap_or(0) > 0 {
+                reassigned_queue = true;
+            }
+            let _ = self.forget_peer(&old_id).await;
+            // `upsert_peer`'s install-ID cleanup already deleted the old
+            // row, so `forget_peer` above reports it as not existing and
+            // skips its `DeviceRemoved` event; emit it here so the absorbed
+            // device still disappears from the UI (it cannot double-emit:
+            // the row is gone by this point).
+            self.emit(NodeEvent::DeviceRemoved(old_id));
+        }
         tracing::info!(peer = %peer.short(), "paired");
         let device = PairedDevice {
             id: peer,
@@ -991,12 +1052,15 @@ impl Shared {
         for id in active_transfer_ids {
             lock(&self.transfers).remove(&id);
         }
-        let dropped_queue = self.store.drop_all_queue_for_peer(peer).unwrap_or_default();
+        // Remove the peer and its queue atomically: dropping the queue
+        // beforehand would lose it (and its staged files) while peer
+        // removal can still fail, leaving the peer paired but its queue
+        // silently gone. Staged files are cleaned after the commit.
+        let (existed, dropped_queue) = self.store.remove_peer_with_queue(peer)?;
         for (id, _) in &dropped_queue {
             transfer::cleanup_staging_id(self, id);
         }
 
-        let existed = self.store.remove_peer(peer)?;
         if let Some(sup) = lock(&self.supervisors).remove(peer) {
             sup.cancel.cancel();
         }
@@ -1012,6 +1076,20 @@ impl Shared {
         self.toggles.remove_peer(peer);
         self.deck.remove_peer(peer);
         self.stop_webcam(peer);
+        // Revoke everything `on_session_end` would have cleaned for a live
+        // session — it cannot run here, because the session was already
+        // removed from the map above before `close` fires its callback.
+        // Without this, one-time reverse-mirror consent, Play-on-phone watch
+        // offers, and USB tunnel state would survive unpairing.
+        lock(&self.pc_mirror_sessions).remove(peer);
+        lock(&self.watch_offers).remove(peer);
+        lock(&self.mirror_stops).retain(|(p, _, _), _| p != peer);
+        lock(&self.mic_stops).remove(peer);
+        if let Some((_, cancel)) = lock(&self.usb_peers).remove(peer) {
+            cancel.cancel();
+        }
+        lock(&self.usb_inbound).remove(peer);
+        lock(&self.usb_manual_pair).remove(peer);
         if !dropped_queue.is_empty() {
             self.emit(NodeEvent::QueueChanged);
             if dropped_count > 0 {
@@ -1033,22 +1111,31 @@ impl Shared {
         dialer: DeviceId,
         streams: (iroh::endpoint::SendStream, iroh::endpoint::RecvStream),
         remote: nectarlink_protocol::messages::Hello,
-    ) -> Option<Arc<Session>> {
+    ) -> RegisterOutcome {
         let peer = crate::device_id(&conn.remote_id());
         if conn.close_reason().is_some() {
-            return None;
+            return RegisterOutcome::Refused;
+        }
+        // Re-checked here, not just in `SessionProtocol::accept`: the peer
+        // may have been unpaired while a handshake was in flight, and the
+        // outbound dial path has no accept step at all. Fail closed on a
+        // store error, so an unpaired device can never keep a live session.
+        if !self.store.is_paired(&peer).unwrap_or(false) {
+            tracing::debug!(peer = %peer.short(), "refusing session from unpaired device");
+            conn.close(VarInt::from_u32(ErrorCode::Unpaired.close_code()), b"unpaired");
+            return RegisterOutcome::Refused;
         }
         if !self.is_connection_allowed(&conn) {
             tracing::debug!(peer = %peer.short(), "refusing session on non-LAN path while away_mode is off");
             conn.close(VarInt::from_u32(CLOSE_NORMAL), b"away mode disabled");
-            return None;
+            return RegisterOutcome::Refused;
         }
         // Either side may have dialed: while the user has reconnecting off,
         // this device stays disconnected from that one.
         if !self.reconnects(&peer) {
             tracing::debug!(peer = %peer.short(), "refusing session: reconnecting is off for this device");
             conn.close(VarInt::from_u32(CLOSE_NORMAL), b"reconnect off");
-            return None;
+            return RegisterOutcome::Refused;
         }
         let mut sessions = lock(&self.sessions);
         if let Some(existing) = sessions.get(&peer).filter(|s| s.is_alive()) {
@@ -1056,7 +1143,7 @@ impl Shared {
             if keep_existing {
                 drop(sessions);
                 conn.close(VarInt::from_u32(CLOSE_DUPLICATE), b"duplicate");
-                return None;
+                return RegisterOutcome::KeptDuplicate;
             }
             existing.close(CLOSE_DUPLICATE, b"duplicate");
         }
@@ -1065,8 +1152,10 @@ impl Shared {
         if let Err(e) = self.store.update_info(&peer, &remote_device) {
             tracing::warn!(error = %e, "failed to update peer info");
         }
-        let effective_device =
-            self.store.get_peer(&peer).ok().flatten().map(|p| p.info).unwrap_or(remote_device);
+        // Only emit info that is actually stored. On an `update_info`
+        // failure the previous code fell back to the remote value, showing
+        // the UI a name/description the store does not have.
+        let effective_device = self.store.get_peer(&peer).ok().flatten().map(|p| p.info);
         let caps = features::sanitize_capabilities(remote.caps);
         if let Err(e) = self.store.update_capabilities(&peer, Some(&caps), Some(remote.power.effective())) {
             tracing::warn!(error = %e, "failed to update peer capabilities");
@@ -1113,7 +1202,9 @@ impl Shared {
             tracing::warn!(error = %e, "failed to record peer addresses");
         }
         self.remember_addrs(&peer, &persisted_addrs);
-        self.emit(NodeEvent::PeerInfoChanged { device: peer, info: effective_device });
+        if let Some(info) = effective_device {
+            self.emit(NodeEvent::PeerInfoChanged { device: peer, info });
+        }
         self.emit(NodeEvent::PeerPowerChanged { device: peer, power: remote.power.effective() });
         self.refresh_capabilities(&peer);
         self.publish_online(&session);
@@ -1137,7 +1228,7 @@ impl Shared {
             crate::actions::send_active_tasks(&shared, &s).await;
             shared.send_deck(&s).await;
         });
-        Some(session)
+        RegisterOutcome::Registered(session)
     }
 
     fn on_session_end(&self, ended: &Arc<Session>) {
@@ -1211,12 +1302,23 @@ impl Shared {
             }
             return Err(Error::Offline);
         }
+        // Refuse to dial a device that is no longer paired, and re-check
+        // in `register_session` after the handshake: unpairing mid-handshake
+        // must not produce a live session.
+        if !self.store.is_paired(&peer).unwrap_or(false) {
+            return Err(Error::NotPaired);
+        }
         let hello = session::local_hello(self);
         let (send, recv, remote) = session::handshake_dialer(conn_ref, &hello).await?;
         let conn = guard.0.take().expect("connection present");
-        self.register_session(conn, self.id, (send, recv), remote)
-            .or_else(|| self.session(&peer))
-            .ok_or(Error::Offline)
+        match self.register_session(conn, self.id, (send, recv), remote) {
+            RegisterOutcome::Registered(session) => Ok(session),
+            // Only a kept duplicate may fall back to the live session; a
+            // refusal (unpaired, non-LAN, reconnect off) must surface as a
+            // failed dial, not a stale session reported as success.
+            RegisterOutcome::KeptDuplicate => self.session(&peer).ok_or(Error::Offline),
+            RegisterOutcome::Refused => Err(Error::Offline),
+        }
     }
 
     /// Sends a message to every connected device.
@@ -1263,6 +1365,12 @@ async fn maintain(shared: Weak<Shared>, peer: DeviceId, wake: Arc<Notify>, cance
         let Some(node) = shared.upgrade() else { return };
         if cancel.is_cancelled() {
             return;
+        }
+        // The USB grace must reset when the tunnel drops without a session
+        // ever forming; otherwise the next plug-in dials immediately instead
+        // of giving the PC its 6 s chance to dial through the cable.
+        if !node.usb_tunnel_inbound(&peer) {
+            waited_for_usb = false;
         }
         // Reconnecting is off for this device: don't dial until the user
         // turns it back on (which wakes this loop).
@@ -1400,7 +1508,9 @@ impl ProtocolHandler for SessionProtocol {
         let hello = session::local_hello(&shared);
         match session::handshake_listener(&conn, &hello).await {
             Ok((send, recv, remote)) => {
-                shared.register_session(conn, peer, (send, recv), remote);
+                // The connection is already closed on refusal; the outcome
+                // only decides whether a session was registered.
+                let _ = shared.register_session(conn, peer, (send, recv), remote);
                 Ok(())
             }
             Err(e) => {
@@ -1618,11 +1728,11 @@ impl Node {
                         .copied()
                         .filter(|a| !a.ip().to_canonical().is_loopback() && crate::session::is_lan_ip(a.ip()))
                         .collect();
-                    if lan_only.len() != peer.last_addrs.len()
-                        && let Some(seen) = peer.last_seen
-                    {
-                        let _ = self.shared.store.record_seen(&peer.id, seen, &lan_only);
-                    }
+                    // In-memory lookup only: rewriting the stored addresses
+                    // would permanently lose the WAN addresses, so
+                    // re-enabling away mode could not restore them without
+                    // rediscovery. `remember_addrs` already filters by the
+                    // current away-mode setting for live lookups.
                     self.shared.remember_addrs(&peer.id, &lan_only);
                 }
             }
@@ -1814,11 +1924,17 @@ impl Node {
 
     /// Sends a request to a connected device. If the connection is replaced
     /// mid-request (e.g. a duplicate connection was resolved), retries once
-    /// on the new one, so requests must be idempotent.
+    /// on the new one, so requests must be idempotent — except
+    /// `notify.action`, which is never retried: `Session::request` reports
+    /// `Offline` when the reply is lost on a dropped connection, which can
+    /// be after the peer already executed the reply/action, so a retry
+    /// would send a duplicate chat reply or re-run a notification action.
+    /// The remaining callers (`device.ring`, `clip.set`) only set state, so
+    /// a retry there is harmless.
     async fn request(&self, peer: DeviceId, env: Envelope) -> Result<Envelope> {
         let first = self.connected(&peer)?;
         match first.request(env.clone(), REQUEST_TIMEOUT).await {
-            Err(Error::Offline) => match self.shared.session(&peer) {
+            Err(Error::Offline) if env.t != types::NOTIFY_ACTION => match self.shared.session(&peer) {
                 Some(next) if !Arc::ptr_eq(&next, &first) => next.request(env, REQUEST_TIMEOUT).await,
                 _ => Err(Error::Offline),
             },
@@ -3118,6 +3234,10 @@ impl Node {
             let mut hist = lock(&self.shared.notification_history);
             hist.retain(|n| n.key != clean.key);
             hist.push(clean);
+            if hist.len() > NOTIFICATION_HISTORY_CAP {
+                let excess = hist.len() - NOTIFICATION_HISTORY_CAP;
+                hist.drain(..excess);
+            }
         }
         self.shared.notification_posted(notification).await;
     }
@@ -3139,6 +3259,7 @@ impl Node {
     pub fn record_notification_history(&self, items: Vec<Notification>) {
         let mut clean: Vec<Notification> = items.into_iter().filter_map(Notification::sanitized).collect();
         clean.sort_by(|a, b| b.when.cmp(&a.when).then_with(|| a.key.cmp(&b.key)));
+        clean.truncate(NOTIFICATION_HISTORY_CAP);
         *lock(&self.shared.notification_history) = clean;
     }
 
