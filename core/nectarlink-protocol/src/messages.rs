@@ -346,9 +346,55 @@ pub struct DeviceInfo {
 
 impl DeviceInfo {
     pub fn sanitized(mut self) -> Self {
+        self.name = sanitize_text(self.name, 256);
+        self.os = sanitize_text(self.os, 256);
+        self.os_ver = sanitize_text(self.os_ver, 256);
+        self.model = self.model.map(|m| sanitize_text(m, 256)).filter(|m| !m.is_empty());
         self.screen = self.screen.and_then(ScreenShape::sanitized);
         self.install_id = self.install_id.filter(|id| is_valid_install_id(id));
         self
+    }
+
+    /// Whether the device fields are within protocol bounds: non-empty,
+    /// at most 256 bytes, and free of control characters.
+    pub fn is_valid(&self) -> bool {
+        let text_ok = |t: &str| !t.is_empty() && t.len() <= 256 && !t.chars().any(char::is_control);
+        text_ok(&self.name)
+            && text_ok(&self.os)
+            && text_ok(&self.os_ver)
+            && self.model.as_ref().is_none_or(|m| text_ok(m))
+    }
+}
+
+/// Whether `id` is a capability ID (protocol v0 §6): 1-64 bytes of
+/// lowercase `[a-z0-9._-]`. Receivers ignore anything else.
+pub fn is_valid_capability_id(id: &str) -> bool {
+    (1..=64).contains(&id.len())
+        && id.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+impl Hello {
+    /// Whether the handshake is within bounds. Capability IDs follow
+    /// protocol v0 §6 (at most 256 entries); this checks shape only — a
+    /// self-asserted `caps` entry never grants a feature on its own, the
+    /// receiver must also check the peer's power level and toggles.
+    pub fn is_valid(&self) -> bool {
+        self.min <= self.proto
+            && !self.app.is_empty()
+            && self.app.len() <= 256
+            && !self.app.chars().any(char::is_control)
+            && self.device.is_valid()
+            && self.caps.len() <= 256
+            && self.caps.iter().all(|c| is_valid_capability_id(c))
+    }
+}
+
+impl HelloUpdate {
+    /// Whether every field present in the update is within bounds.
+    pub fn is_valid(&self) -> bool {
+        self.caps.as_ref().is_none_or(|caps| {
+            caps.len() <= 256 && caps.iter().all(|c| is_valid_capability_id(c))
+        }) && self.device.as_ref().is_none_or(DeviceInfo::is_valid)
     }
 }
 
@@ -414,6 +460,9 @@ pub struct Battery {
 impl Battery {
     pub fn sanitized(mut self) -> Self {
         self.level = self.level.min(100);
+        // Only the three documented values survive; anything else is
+        // dropped rather than logged or matched on downstream.
+        self.plugged = self.plugged.filter(|p| matches!(p.as_str(), "ac" | "usb" | "wireless"));
         if !self.charging {
             self.full_in = None;
         } else if let Some(mins) = self.full_in
@@ -485,6 +534,37 @@ pub struct PairNonce {
 pub struct PairReveal {
     #[serde(rename = "nA", with = "serde_bytes")]
     pub n_a: Vec<u8>,
+}
+
+impl PairRequest {
+    /// The proof is exactly one HMAC-SHA256 output; anything else
+    /// (empty, truncated, oversized) is rejected before verification.
+    /// `verify_pair_proof` also rejects wrong lengths, this is the
+    /// protocol-boundary check.
+    pub fn is_valid(&self) -> bool {
+        self.device.is_valid() && self.proof.len() == crate::pairing::PROOF_LEN
+    }
+}
+
+impl PairCommit {
+    /// The commitment is exactly one SHA-256 output.
+    pub fn is_valid(&self) -> bool {
+        self.device.is_valid() && self.c.len() == crate::pairing::COMMITMENT_LEN
+    }
+}
+
+impl PairNonce {
+    /// The responder nonce is exactly [`crate::pairing::NONCE_LEN`] bytes.
+    pub fn is_valid(&self) -> bool {
+        self.device.is_valid() && self.n_b.len() == crate::pairing::NONCE_LEN
+    }
+}
+
+impl PairReveal {
+    /// The revealed initiator nonce is exactly [`crate::pairing::NONCE_LEN`] bytes.
+    pub fn is_valid(&self) -> bool {
+        self.n_a.len() == crate::pairing::NONCE_LEN
+    }
 }
 
 // ---- Notifications (docs/protocol/notifications.md) ----
@@ -813,6 +893,16 @@ impl std::fmt::Debug for Notification {
     }
 }
 
+/// Strips control characters, trims, and truncates to `max_chars`
+/// characters. Unlike [`clean_text`], keeps an empty result as an empty
+/// string so `sanitized` never invents a value.
+fn sanitize_text(s: String, max_chars: usize) -> String {
+    let mut s: String = s.chars().filter(|c| !c.is_control()).collect();
+    s = s.trim().to_owned();
+    truncate_chars(&mut s, max_chars);
+    s
+}
+
 fn truncate_chars(s: &mut String, max: usize) {
     if let Some((cut, _)) = s.char_indices().nth(max) {
         s.truncate(cut);
@@ -831,7 +921,10 @@ impl Notification {
     /// can't be shown at all (no key, or neither a title nor a text).
     pub fn sanitized(mut self) -> Option<Notification> {
         use notify_limits::*;
-        if self.key.is_empty() || self.key.len() > KEY_BYTES {
+        if self.key.is_empty()
+            || self.key.len() > KEY_BYTES
+            || self.key.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+        {
             return None;
         }
         self.title = clean_text(self.title, TITLE_CHARS);
@@ -879,6 +972,40 @@ pub struct NotifySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NotifyKey {
     pub key: String,
+}
+
+impl NotifySnapshot {
+    /// At most [`notify_limits::SNAPSHOT_ITEMS`] items, each with a usable key.
+    pub fn is_valid(&self) -> bool {
+        self.items.len() <= notify_limits::SNAPSHOT_ITEMS
+            && self.items.iter().all(|n| {
+                !n.key.is_empty()
+                    && n.key.len() <= notify_limits::KEY_BYTES
+                    && !n.key.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+            })
+    }
+}
+
+impl NotifyKey {
+    /// A usable key: bounded, and free of control characters and path
+    /// separators so it is safe as a map/file key on the receiver.
+    pub fn is_valid(&self) -> bool {
+        !self.key.is_empty()
+            && self.key.len() <= notify_limits::KEY_BYTES
+            && !self.key.chars().any(|c| c.is_control() || c == '/' || c == '\\')
+    }
+}
+
+impl NotifyAction {
+    /// Bounded key and action ID, and a bounded, control-free reply.
+    pub fn is_valid(&self) -> bool {
+        NotifyKey { key: self.key.clone() }.is_valid()
+            && !self.action.is_empty()
+            && self.action.len() <= notify_limits::ACTION_ID_BYTES
+            && self.reply.as_ref().is_none_or(|r| {
+                r.chars().count() <= notify_limits::TEXT_CHARS && !r.chars().any(char::is_control)
+            })
+    }
 }
 
 /// Body of `notify.action`.
@@ -979,7 +1106,19 @@ impl MediaPlayer {
             return None;
         }
         self.actions.retain(|a| media_actions::ALL.contains(&a.as_str()));
-        self.actions.dedup();
+        // `dedup` alone only removes consecutive duplicates; drop every
+        // repeat while keeping first-seen order.
+        let mut seen: Vec<String> = Vec::new();
+        self.actions.retain(|a| {
+            if seen.contains(a) {
+                false
+            } else {
+                // `to_owned`, not `clone`: `a` is a reference, and
+                // cloning a reference would only copy the reference.
+                seen.push(a.to_owned());
+                true
+            }
+        });
         if let (Some(position), Some(duration)) = (self.position, self.duration) {
             self.position = Some(position.min(duration));
         }
@@ -1007,6 +1146,24 @@ pub struct MediaCommand {
     /// For `seek`: where to, milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<u64>,
+}
+
+impl MediaState {
+    /// At most [`media_limits::PLAYERS`] players, each sanitizable.
+    pub fn is_valid(&self) -> bool {
+        self.players.len() <= media_limits::PLAYERS
+            && self.players.iter().all(|p| p.to_owned().sanitized().is_some())
+    }
+}
+
+impl MediaCommand {
+    /// The action must be one of [`media_actions::ALL`], and `position`
+    /// is only meaningful for `seek`.
+    pub fn is_valid(&self) -> bool {
+        (1..=media_limits::ID_BYTES).contains(&self.player.len())
+            && media_actions::ALL.contains(&self.action.as_str())
+            && (self.position.is_none() || self.action == media_actions::SEEK)
+    }
 }
 
 /// Play on phone (`docs/protocol/media.md` §4).
@@ -1038,9 +1195,10 @@ pub struct WatchFile {
 
 impl WatchFile {
     pub fn is_valid(&self) -> bool {
-        (1..=media_limits::TEXT_CHARS).contains(&self.name.chars().count())
-            && !self.name.contains(['/', '\\'])
-            && self.size > 0
+        // Reuse the shared file-name check so `.`, `..`, and control
+        // characters are rejected. `position` is milliseconds and `size`
+        // is bytes, so they are deliberately not compared with each other.
+        is_valid_file_name(&self.name) && self.size > 0
     }
 }
 
@@ -1057,6 +1215,22 @@ pub struct MediaFileRead {
 pub struct MediaFileMeta {
     pub size: u64,
     pub length: u64,
+}
+
+impl MediaFileRead {
+    /// A read is non-empty, within one `media.file` reply
+    /// ([`media_watch::MAX_READ`]), and must not overflow `offset + length`.
+    pub fn is_valid(&self) -> bool {
+        (1..=media_watch::MAX_READ).contains(&self.length)
+            && self.offset.checked_add(self.length).is_some()
+    }
+}
+
+impl MediaFileMeta {
+    /// The bytes that follow cannot exceed the file they belong to.
+    pub fn is_valid(&self) -> bool {
+        self.length <= self.size
+    }
 }
 
 /// Body of `media.watch`: a PC offers to stream what a player of its own
@@ -1090,6 +1264,13 @@ pub struct PcPower {
     pub action: String,
 }
 
+impl PcPower {
+    /// Only the two documented actions are valid.
+    pub fn is_valid(&self) -> bool {
+        matches!(self.action.as_str(), "lock" | "sleep")
+    }
+}
+
 /// The longest link sent, in bytes.
 pub const LINK_MAX_BYTES: usize = 4096;
 
@@ -1108,8 +1289,9 @@ pub mod wake {
 }
 
 /// Parses a 6-byte hardware (MAC) address written as `"aa:bb:cc:dd:ee:ff"` or
-/// `"AA-BB-CC-DD-EE-FF"`. Rejects all-zero (`00:00:00:00:00:00`) and broadcast
-/// (`ff:ff:ff:ff:ff:ff`) addresses.
+/// `"AA-BB-CC-DD-EE-FF"`. Rejects all-zero (`00:00:00:00:00:00`), broadcast
+/// (`ff:ff:ff:ff:ff:ff`), and multicast (first-octet LSB set) addresses: a
+/// wake target must be a single unicast adapter.
 pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
     let s = s.trim();
     let sep = if s.contains(':') { ':' } else { '-' };
@@ -1122,7 +1304,7 @@ pub fn parse_mac(s: &str) -> Option<[u8; 6]> {
         }
         *slot = u8::from_str_radix(part, 16).ok()?;
     }
-    if parts.next().is_some() || bytes == [0; 6] || bytes == [0xff; 6] {
+    if parts.next().is_some() || bytes == [0; 6] || bytes == [0xff; 6] || bytes[0] & 1 == 1 {
         return None;
     }
     Some(bytes)
@@ -1160,12 +1342,21 @@ pub fn ipv4_broadcast(ip: std::net::Ipv4Addr, prefix_len: u8) -> Option<std::net
     }
     let mask = u32::MAX << (32 - u32::from(prefix_len));
     let bcast = std::net::Ipv4Addr::from(u32::from(ip) | !mask);
-    (!bcast.is_unspecified() && !bcast.is_loopback() && !bcast.is_multicast()).then_some(bcast)
+    (!bcast.is_unspecified()
+        && !bcast.is_loopback()
+        && !bcast.is_multicast()
+        && !bcast.is_broadcast())
+    .then_some(bcast)
 }
 
 fn parse_wake_broadcast(s: &str) -> Option<std::net::Ipv4Addr> {
     let ip: std::net::Ipv4Addr = s.trim().parse().ok()?;
-    if ip.is_unspecified() || ip.is_loopback() || ip.is_link_local() || ip.is_multicast() {
+    if ip.is_unspecified()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+    {
         return None;
     }
     Some(ip)
@@ -1218,9 +1409,9 @@ impl PcWakeInfo {
                 }
             }
         }
-        if macs.is_empty() {
-            return Self::default();
-        }
+        // Broadcasts are kept even when no MAC survived: dropping them
+        // here silently lost wake-info that was otherwise valid. (The
+        // storage round-trip still requires a MAC; see `to_storage_string`.)
         let mut broadcasts = Vec::new();
         for b in self.broadcasts {
             if let Some(ip) = parse_wake_broadcast(&b) {
@@ -1278,6 +1469,30 @@ pub struct AudioPcmFrame {
     pub channels: u8,
     #[serde(with = "serde_bytes")]
     pub pcm: Vec<u8>,
+}
+
+impl WakeRelay {
+    /// The target must be a real unicast adapter address (not zero,
+    /// broadcast, or multicast), and any directed broadcast must parse
+    /// as a routable subnet broadcast.
+    pub fn is_valid(&self) -> bool {
+        self.mac != [0; 6]
+            && self.mac != [0xff; 6]
+            && self.mac[0] & 1 == 0
+            && self.broadcast.as_ref().is_none_or(|b| parse_wake_broadcast(b).is_some())
+    }
+}
+
+impl AudioPcmFrame {
+    /// 8-96 kHz, mono or stereo, non-empty PCM bounded to one frame's
+    /// worth (1 MiB), and a whole number of sample frames.
+    pub fn is_valid(&self) -> bool {
+        (8_000..=96_000).contains(&self.sample_rate)
+            && (1..=2).contains(&self.channels)
+            && !self.pcm.is_empty()
+            && self.pcm.len() <= 1024 * 1024
+            && self.pcm.len() % (2 * usize::from(self.channels)) == 0
+    }
 }
 
 // ---- Screen mirroring (docs/protocol/mirror.md) ----
@@ -1365,12 +1580,20 @@ pub struct MirrorStart {
 
 impl MirrorStart {
     /// The screen without an app, or an app with a session of its own.
+    /// Numeric fields mirror [`WebcamStart`] / [`MirrorResize`]: a longer
+    /// side of 64-4096 px, 1-60 fps, 100 kbit/s-50 Mbit/s. Zero or
+    /// unbounded values previously passed and invite divide-by-zero
+    /// frame timing, zero-size encoder surfaces, and huge allocations.
     pub fn is_valid(&self) -> bool {
+        let numbers_ok = (64..=4096).contains(&self.max_size)
+            && (1..=60).contains(&self.fps)
+            && (100_000..=50_000_000).contains(&self.bitrate);
         let watch_ok = self
             .watch
             .as_ref()
             .is_none_or(|p| self.app.is_none() && (1..=media_limits::ID_BYTES).contains(&p.len()));
-        watch_ok
+        numbers_ok
+            && watch_ok
             && match &self.app {
                 None => self.session == mirror::SCREEN,
                 Some(app) => {
@@ -1443,6 +1666,24 @@ pub struct PhoneApps {
     pub apps: Vec<PhoneApp>,
 }
 
+impl PhoneApp {
+    /// A real package name, a bounded label, and an icon within
+    /// [`mirror::MAX_ICON_BYTES`] when present.
+    pub fn is_valid(&self) -> bool {
+        is_package_name(&self.pkg)
+            && !self.label.is_empty()
+            && self.label.chars().count() <= media_limits::TEXT_CHARS
+            && self.icon.as_ref().is_none_or(|i| !i.is_empty() && i.len() <= mirror::MAX_ICON_BYTES)
+    }
+}
+
+impl PhoneApps {
+    /// At most [`mirror::MAX_APPS`] apps, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.apps.len() <= mirror::MAX_APPS && self.apps.iter().all(PhoneApp::is_valid)
+    }
+}
+
 /// Body of `mirror.input`: the PC's mouse, keyboard, and gamepad on the mirrored
 /// screen. Positions are fractions of the screen (0 at the left or top, 1
 /// at the right or bottom), so they hold at any size.
@@ -1511,10 +1752,18 @@ pub fn mirror_input_envelope(
     session: u32,
 ) -> Result<crate::Envelope, crate::ProtocolError> {
     let mut env = crate::Envelope::new(types::MIRROR_INPUT, input)?;
-    if session != mirror::SCREEN
-        && let Some(ciborium::Value::Map(fields)) = env.b.as_mut()
-    {
-        fields.push((ciborium::Value::Text("session".into()), ciborium::Value::Integer(session.into())));
+    if session != mirror::SCREEN {
+        match env.b.as_mut() {
+            Some(ciborium::Value::Map(fields)) => {
+                fields.push((
+                    ciborium::Value::Text("session".into()),
+                    ciborium::Value::Integer(session.into()),
+                ));
+            }
+            // Silently dropping the session used to misdeliver app-window
+            // input to the main screen; fail loudly instead.
+            _ => return Err(crate::ProtocolError::BadMessage("mirror input body is not a map".into())),
+        }
     }
     Ok(env)
 }
@@ -1546,7 +1795,11 @@ impl MirrorInput {
                     && dy.abs() <= 100.0
             }
             MirrorInput::Key { key } => mirror_keys::ALL.contains(&key.as_str()),
-            MirrorInput::Text { text } => !text.is_empty() && text.len() <= mirror::MAX_TEXT_BYTES,
+            MirrorInput::Text { text } => {
+                !text.is_empty()
+                    && text.len() <= mirror::MAX_TEXT_BYTES
+                    && !text.chars().any(char::is_control)
+            }
             MirrorInput::Gamepad { .. } => true,
         }
     }
@@ -1567,7 +1820,9 @@ pub struct MirrorConfig {
 impl MirrorConfig {
     pub fn to_cbor(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let _ = ciborium::into_writer(self, &mut out);
+        // Serializing to a `Vec` cannot fail; fail loudly rather than
+        // silently returning a truncated config.
+        ciborium::into_writer(self, &mut out).expect("serializing a config to a Vec cannot fail");
         out
     }
 
@@ -1597,7 +1852,8 @@ pub struct MirrorAudioConfig {
 impl MirrorAudioConfig {
     pub fn to_cbor(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let _ = ciborium::into_writer(self, &mut out);
+        // See `MirrorConfig::to_cbor`.
+        ciborium::into_writer(self, &mut out).expect("serializing a config to a Vec cannot fail");
         out
     }
 
@@ -1611,6 +1867,10 @@ impl MirrorAudioConfig {
     }
 
     /// Bytes in one sample frame (a sample for each channel).
+    ///
+    /// Only call on a valid config: an invalid config with
+    /// `channels == 0` yields 0, which divides by zero in any caller
+    /// computing frame counts from byte counts.
     pub fn frame_bytes(&self) -> usize {
         2 * usize::from(self.channels)
     }
@@ -1731,7 +1991,8 @@ fn default_webcam_max_height() -> u32 {
 impl WebcamConfig {
     pub fn to_cbor(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let _ = ciborium::into_writer(self, &mut out);
+        // See `MirrorConfig::to_cbor`.
+        ciborium::into_writer(self, &mut out).expect("serializing a config to a Vec cannot fail");
         out
     }
 
@@ -1745,6 +2006,9 @@ impl WebcamConfig {
             && (1..=8192).contains(&self.height)
             && (self.camera == webcam::CAMERA_BACK || self.camera == webcam::CAMERA_FRONT)
             && (1..=120).contains(&self.fps)
+            // Short side of the camera's best stream: 240p to 8K. A zero
+            // value previously passed and could select a zero-height stream.
+            && (240..=4320).contains(&self.max_height)
     }
 }
 
@@ -1842,6 +2106,22 @@ pub struct CameraCaptureResultMeta {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+}
+
+impl CameraCaptureResultMeta {
+    /// Bounded request ID, a plain file name (never a path — the receiver
+    /// must still never join it to a directory unchecked), one of the
+    /// two documented MIME types, a non-empty size within
+    /// [`continuity_camera::MAX_IMAGE_BYTES`], and sane dimensions
+    /// (0 means unknown, matching the serde default).
+    pub fn is_valid(&self) -> bool {
+        (1..=continuity_camera::MAX_ID_BYTES).contains(&self.request_id.len())
+            && is_valid_file_name(&self.file_name)
+            && matches!(self.mime.as_str(), "image/jpeg" | "image/png")
+            && (1..=continuity_camera::MAX_IMAGE_BYTES).contains(&self.size)
+            && self.width <= 8192
+            && self.height <= 8192
+    }
 }
 
 // ---- Messages (docs/protocol/sms.md) ----
@@ -1958,6 +2238,61 @@ pub struct SmsThreads {
     pub threads: Vec<SmsThread>,
 }
 
+impl SmsThread {
+    /// Bounded IDs, addresses, and snippet; a thread photo within
+    /// [`sms::MAX_PHOTO_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 256
+            && self.addresses.iter().all(|a| (1..=64).contains(&a.trim().len()))
+            && self.names.iter().all(|n| n.chars().count() <= 256)
+            && self.snippet.chars().count() <= 4096
+            && self.photo.as_ref().is_none_or(|p| !p.is_empty() && p.len() <= sms::MAX_PHOTO_BYTES)
+    }
+}
+
+impl SmsPart {
+    /// Bounded ID and MIME type, and a part size within
+    /// [`sms::MAX_PART_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 256
+            && !self.mime.is_empty()
+            && self.mime.len() <= 128
+            && !self.mime.chars().any(char::is_control)
+            && self.size <= sms::MAX_PART_BYTES as u64
+    }
+}
+
+impl SmsMessage {
+    /// Bounded IDs/address, a body within [`sms::MAX_SEND_BYTES`], and
+    /// valid parts.
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 256
+            && !self.thread.is_empty()
+            && self.thread.len() <= 256
+            && self.address.len() <= 256
+            && self.body.len() <= sms::MAX_SEND_BYTES
+            && self.status.as_ref().is_none_or(|s| s.len() <= 64 && !s.chars().any(char::is_control))
+            && self.parts.iter().all(SmsPart::is_valid)
+    }
+}
+
+impl SmsThreadsGet {
+    /// A page request: 1 to [`sms::MAX_PAGE`].
+    pub fn is_valid(&self) -> bool {
+        (1..=sms::MAX_PAGE).contains(&self.limit)
+    }
+}
+
+impl SmsThreads {
+    /// One page of threads, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.threads.len() <= sms::MAX_PAGE as usize && self.threads.iter().all(SmsThread::is_valid)
+    }
+}
+
 /// Body of `sms.messages`: a conversation's messages before `before`
 /// (Unix milliseconds; the latest when missing), newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1972,6 +2307,20 @@ pub struct SmsMessagesGet {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmsMessages {
     pub messages: Vec<SmsMessage>,
+}
+
+impl SmsMessagesGet {
+    /// A bounded thread ID and a page request of 1 to [`sms::MAX_PAGE`].
+    pub fn is_valid(&self) -> bool {
+        !self.thread.is_empty() && self.thread.len() <= 256 && (1..=sms::MAX_PAGE).contains(&self.limit)
+    }
+}
+
+impl SmsMessages {
+    /// One page of messages, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.messages.len() <= sms::MAX_PAGE as usize && self.messages.iter().all(SmsMessage::is_valid)
+    }
 }
 
 /// An image attachment sent with `sms.send` (MMS).
@@ -2047,6 +2396,24 @@ impl SmsSend {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmsPartGet {
     pub id: String,
+}
+
+impl SmsPartGet {
+    /// A bounded part ID.
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty() && self.id.len() <= 256
+    }
+}
+
+impl SmsPartData {
+    /// A bounded MIME type and data within [`sms::MAX_PART_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        !self.mime.is_empty()
+            && self.mime.len() <= 128
+            && !self.mime.chars().any(char::is_control)
+            && !self.data.is_empty()
+            && self.data.len() <= sms::MAX_PART_BYTES
+    }
 }
 
 /// Answer to `sms.part`.
@@ -2203,6 +2570,34 @@ pub struct CallAction {
     pub digit: Option<String>,
 }
 
+impl CallAction {
+    /// The action must be one of the documented `calls::` actions, and
+    /// `digit` is present — and a single DTMF key — exactly for `dtmf`.
+    pub fn is_valid(&self) -> bool {
+        const ACTIONS: &[&str] = &[
+            calls::ANSWER,
+            calls::DECLINE,
+            calls::SILENCE,
+            calls::MUTE,
+            calls::UNMUTE,
+            calls::SPEAKER,
+            calls::EARPIECE,
+            calls::HOLD,
+            calls::UNHOLD,
+            calls::DTMF,
+            calls::VOLUME_UP,
+            calls::VOLUME_DOWN,
+        ];
+        (1..=calls::MAX_ID_BYTES).contains(&self.id.len())
+            && ACTIONS.contains(&self.action.as_str())
+            && if self.action == calls::DTMF {
+                self.digit.as_ref().is_some_and(|d| is_dtmf_digit(d))
+            } else {
+                self.digit.is_none()
+            }
+    }
+}
+
 /// Whether `digit` is a keypad key (`0`-`9`, `*`, `#`).
 pub fn is_dtmf_digit(digit: &str) -> bool {
     digit.len() == 1 && digit.chars().all(|c| c.is_ascii_digit() || c == '*' || c == '#')
@@ -2256,6 +2651,40 @@ pub struct CallLog {
     pub entries: Vec<CallLogEntry>,
 }
 
+impl CallLogEntry {
+    /// A bounded ID/number/name, a direction from the documented
+    /// `calls::DIR_*` set, and a photo within
+    /// [`calls::MAX_LOG_PHOTO_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        (1..=calls::MAX_ID_BYTES).contains(&self.id.len())
+            && self.number.len() <= calls::MAX_TEXT_BYTES
+            && self.name.as_ref().is_none_or(|n| n.len() <= calls::MAX_TEXT_BYTES)
+            && [
+                calls::DIR_INCOMING,
+                calls::DIR_OUTGOING,
+                calls::DIR_MISSED,
+                calls::DIR_REJECTED,
+            ]
+            .contains(&self.direction.as_str())
+            && self.photo.as_ref().is_none_or(|p| !p.is_empty() && p.len() <= calls::MAX_LOG_PHOTO_BYTES)
+    }
+}
+
+impl CallLogGet {
+    /// A page request: 1 to [`calls::MAX_LOG_PAGE`].
+    pub fn is_valid(&self) -> bool {
+        (1..=calls::MAX_LOG_PAGE).contains(&self.limit)
+    }
+}
+
+impl CallLog {
+    /// One page of entries, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.entries.len() <= calls::MAX_LOG_PAGE as usize
+            && self.entries.iter().all(CallLogEntry::is_valid)
+    }
+}
+
 /// Body of `call.log.changed`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallLogChanged {}
@@ -2274,8 +2703,19 @@ impl std::fmt::Debug for CallDial {
 }
 
 impl CallDial {
+    /// Digits, `+`, `*`, `#`, spaces, `-`, and parentheses only. Control
+    /// characters and the `;`/`,` pause/wait separators are rejected:
+    /// they let a peer inject dial-pause sequences rather than a plain
+    /// number. `*`/`#` are kept because the dial string may legitimately
+    /// contain them; whether the receiving dialer must further restrict
+    /// USSD/MMI codes is a receiver-side decision (see fix log).
     pub fn is_valid(&self) -> bool {
-        !self.number.trim().is_empty() && self.number.len() <= calls::MAX_TEXT_BYTES
+        !self.number.trim().is_empty()
+            && self.number.len() <= calls::MAX_TEXT_BYTES
+            && self.number.chars().all(|c| {
+                c.is_ascii_digit()
+                    || matches!(c, '+' | '*' | '#' | ' ' | '-' | '(' | ')')
+            })
     }
 }
 
@@ -2366,6 +2806,45 @@ impl std::fmt::Debug for ContactsListGet {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContactsList {
     pub contacts: Vec<Contact>,
+}
+
+impl ContactNumber {
+    /// A bounded number and label.
+    pub fn is_valid(&self) -> bool {
+        (1..=256).contains(&self.number.len())
+            && self.label.as_ref().is_none_or(|l| l.chars().count() <= 64 && !l.chars().any(char::is_control))
+    }
+}
+
+impl Contact {
+    /// A bounded ID/name, at most [`contacts::MAX_NUMBERS`] valid
+    /// numbers, and a photo within [`contacts::MAX_PHOTO_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        !self.id.is_empty()
+            && self.id.len() <= 256
+            && !self.name.is_empty()
+            && self.name.chars().count() <= 256
+            && self.numbers.len() <= contacts::MAX_NUMBERS
+            && self.numbers.iter().all(ContactNumber::is_valid)
+            && self.photo.as_ref().is_none_or(|p| !p.is_empty() && p.len() <= contacts::MAX_PHOTO_BYTES)
+    }
+}
+
+impl ContactsListGet {
+    /// A bounded query and a page request of 1 to [`contacts::MAX_PAGE`].
+    pub fn is_valid(&self) -> bool {
+        self.query.as_ref().is_none_or(|q| {
+            q.len() <= contacts::MAX_QUERY_BYTES && !q.chars().any(char::is_control)
+        }) && (1..=contacts::MAX_PAGE).contains(&self.limit)
+    }
+}
+
+impl ContactsList {
+    /// One page of contacts, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.contacts.len() <= contacts::MAX_PAGE as usize
+            && self.contacts.iter().all(Contact::is_valid)
+    }
 }
 
 /// Body of `contacts.changed`.
@@ -2465,6 +2944,23 @@ pub struct PhotoAlbumsList {
     pub albums: Vec<PhotoAlbum>,
 }
 
+impl PhotoAlbum {
+    /// A valid album ID and cover ID, and a bounded name.
+    pub fn is_valid(&self) -> bool {
+        is_valid_photo_id(&self.id)
+            && !self.name.is_empty()
+            && self.name.chars().count() <= 256
+            && self.cover.as_ref().is_none_or(|c| is_valid_photo_id(c))
+    }
+}
+
+impl PhotoAlbumsList {
+    /// Every album valid.
+    pub fn is_valid(&self) -> bool {
+        self.albums.iter().all(PhotoAlbum::is_valid)
+    }
+}
+
 /// Body of `photos.list`: photos and videos on the phone (or in `album`),
 /// newest first, after the item at (`before`, `before_id`) when given (the
 /// last item of the previous page), else from the latest.
@@ -2480,6 +2976,16 @@ pub struct PhotoListGet {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before_id: Option<String>,
     pub limit: u32,
+}
+
+impl PhotoListGet {
+    /// Valid album/before IDs and a page request of 1 to
+    /// [`photos::MAX_PAGE`].
+    pub fn is_valid(&self) -> bool {
+        self.album.as_ref().is_none_or(|a| is_valid_photo_id(a))
+            && self.before_id.as_ref().is_none_or(|b| is_valid_photo_id(b))
+            && (1..=photos::MAX_PAGE).contains(&self.limit)
+    }
 }
 
 impl std::fmt::Debug for PhotoListGet {
@@ -2532,10 +3038,34 @@ pub struct PhotoItems {
     pub items: Vec<PhotoItem>,
 }
 
+impl PhotoItem {
+    /// A valid ID and file name, and a valid album ID when present.
+    pub fn is_valid(&self) -> bool {
+        is_valid_photo_id(&self.id)
+            && is_valid_file_name(&self.name)
+            && self.album.as_ref().is_none_or(|a| is_valid_photo_id(a))
+    }
+}
+
+impl PhotoItems {
+    /// One page of items, each valid.
+    pub fn is_valid(&self) -> bool {
+        self.items.len() <= photos::MAX_PAGE as usize && self.items.iter().all(PhotoItem::is_valid)
+    }
+}
+
 /// Body of `photos.thumbs`: ask for small JPEG thumbnails for these IDs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhotoThumbsGet {
     pub ids: Vec<String>,
+}
+
+impl PhotoThumbsGet {
+    /// 1 to [`photos::MAX_THUMB_BATCH`] valid IDs.
+    pub fn is_valid(&self) -> bool {
+        (1..=photos::MAX_THUMB_BATCH).contains(&self.ids.len())
+            && self.ids.iter().all(|id| is_valid_photo_id(id))
+    }
 }
 
 /// One thumbnail in `photos.thumbs.list`.
@@ -2560,6 +3090,20 @@ pub struct PhotoThumbsList {
     pub thumbs: Vec<PhotoThumb>,
 }
 
+impl PhotoThumb {
+    /// A valid ID and data within [`photos::MAX_THUMB_BYTES`].
+    pub fn is_valid(&self) -> bool {
+        is_valid_photo_id(&self.id) && !self.data.is_empty() && self.data.len() <= photos::MAX_THUMB_BYTES
+    }
+}
+
+impl PhotoThumbsList {
+    /// Every thumbnail valid.
+    pub fn is_valid(&self) -> bool {
+        self.thumbs.iter().all(PhotoThumb::is_valid)
+    }
+}
+
 /// Body of `photos.get`: send one (`id`) or several (`ids`) photos or videos.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PhotoGet {
@@ -2570,15 +3114,24 @@ pub struct PhotoGet {
 }
 
 impl PhotoGet {
-    /// Requested item IDs in order (`ids` when non-empty, otherwise `[id]`).
+    /// Requested item IDs in order, deduplicated preserving first-seen
+    /// order. When both `id` and `ids` are set, both are honoured (`id`
+    /// first) instead of silently dropping `id` as before.
     pub fn requested_ids(&self) -> Vec<String> {
-        if !self.ids.is_empty() {
-            self.ids.clone()
-        } else if !self.id.is_empty() {
-            vec![self.id.clone()]
-        } else {
-            Vec::new()
+        let mut out: Vec<String> = Vec::new();
+        for id in std::iter::once(&self.id).chain(self.ids.iter()) {
+            if !id.is_empty() && !out.contains(id) {
+                out.push(id.to_owned());
+            }
         }
+        out
+    }
+
+    /// 1 to [`photos::MAX_GET_ITEMS`] requested IDs, each valid.
+    pub fn is_valid(&self) -> bool {
+        let ids = self.requested_ids();
+        (1..=photos::MAX_GET_ITEMS).contains(&ids.len())
+            && ids.iter().all(|id| is_valid_photo_id(id))
     }
 }
 
@@ -2600,6 +3153,36 @@ pub struct LinkOpen {
     /// Optional human-readable title (e.g. the active video's title from the sender's media player).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+}
+
+impl LinkOpen {
+    /// The URL must fit [`LINK_MAX_BYTES`], contain no control or
+    /// whitespace characters, and use one of the schemes the receiver
+    /// actually opens: `http://`/`https://` with a non-empty host part,
+    /// or a `geo:` URI with a non-empty remainder. `file://`,
+    /// `intent://`, and app-specific schemes are rejected. The title,
+    /// when present, is bounded and control-free. This mirrors the
+    /// receiver-side allowlist in core `actions::valid_link`.
+    pub fn is_valid(&self) -> bool {
+        if self.url.is_empty()
+            || self.url.len() > LINK_MAX_BYTES
+            || self.url.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            return false;
+        }
+        let lower = self.url.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
+        let scheme_ok = if lower.starts_with("http://") || lower.starts_with("https://") {
+            self.url.split("://").nth(1).is_some_and(|rest| !rest.is_empty())
+        } else if self.url.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("geo:")) {
+            !self.url[4..].is_empty()
+        } else {
+            false
+        };
+        scheme_ok
+            && self.title.as_ref().is_none_or(|t| {
+                t.chars().count() <= 256 && !t.chars().any(char::is_control)
+            })
+    }
 }
 
 /// Never prints the link or title (protocol v0 §11).
@@ -2830,6 +3413,17 @@ pub struct FilesAccept {
     pub have: Vec<u64>,
 }
 
+impl FilesAccept {
+    /// Valid against the offer it answers: one entry per offered file,
+    /// and no entry may claim more bytes than its file holds. A
+    /// mismatched `have` previously risked out-of-bounds indexing or
+    /// seeking past EOF on resume.
+    pub fn is_valid_for(&self, offer: &FilesOffer) -> bool {
+        self.have.len() == offer.files.len()
+            && self.have.iter().zip(offer.files.iter()).all(|(have, file)| *have <= file.size)
+    }
+}
+
 /// Body of `files.resume` and `files.cancel` control messages.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesControl {
@@ -2842,14 +3436,54 @@ impl FilesControl {
     }
 }
 
+/// Safe, non-executable document and media extensions that may be
+/// opened automatically on arrival. Mirrors core
+/// `handoff::SAFE_HANDOFF_EXTENSIONS`; keep the two lists in sync.
+pub const SAFE_HANDOFF_EXTENSIONS: &[&str] = &[
+    "pdf", "txt", "md", "rtf", "csv", "tsv", "json", "xml", "yaml", "yml", "doc", "docx", "xls", "xlsx",
+    "ppt", "pptx", "odt", "ods", "odp", "epub", "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "mp3",
+    "m4a", "wav", "flac", "ogg", "mp4", "mkv", "mov", "webm",
+];
+
+/// Returns `true` if `name` has a safe, non-executable document or media
+/// extension that may be opened with the default application on arrival.
+/// Mirrors core `handoff::is_safe_handoff_document`.
+pub fn is_safe_handoff_document(name: &str) -> bool {
+    let trimmed = name.trim().trim_end_matches(['.', ' ']);
+    let Some((_, ext)) = trimmed.rsplit_once('.') else {
+        return false;
+    };
+    let lower = ext.to_ascii_lowercase();
+    SAFE_HANDOFF_EXTENSIONS.contains(&lower.as_str())
+}
+
+/// Whether the stem (before the first `.`) is a Windows reserved device
+/// name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`),
+/// case-insensitive. On a Windows receiver such names do not refer to
+/// ordinary files.
+pub fn is_windows_reserved_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or("");
+    let upper = stem.to_ascii_uppercase();
+    matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (upper.len() == 4
+            && (upper.starts_with("COM") || upper.starts_with("LPT"))
+            && upper.as_bytes()[3].is_ascii_digit()
+            && upper.as_bytes()[3] != b'0')
+}
+
 /// Whether a name is a plain file name the spec allows (no path, no
-/// control characters, not `.` or `..`).
+/// control characters, not `.` or `..`). Also rejects Windows hazards
+/// for the cross-platform receivers: `:` (alternate-data-stream syntax),
+/// trailing `.`/space (stripped by Windows, so the name resolves to a
+/// different object), and reserved device names.
 pub fn is_valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= files::MAX_NAME_BYTES
         && name != "."
         && name != ".."
-        && !name.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+        && !name.ends_with(['.', ' '])
+        && !is_windows_reserved_name(name)
+        && !name.chars().any(|c| c == '/' || c == '\\' || c == ':' || c.is_control())
 }
 
 /// Whether a folder is 1-32 valid names joined by `/`, in at most
@@ -2880,7 +3514,17 @@ impl FilesOffer {
         } else {
             (1..=files::MAX_FILES).contains(&self.files.len()) && self.markers.is_empty()
         };
-        is_valid_transfer_id(&self.id) && files_ok && self.files.iter().all(FileEntry::is_valid)
+        // `open_on_arrival` is only valid for exactly one non-recording,
+        // folder-less file with a safe, non-executable document/media
+        // extension (mirroring core `handoff::is_safe_handoff_document`).
+        // The receiver must re-check this before opening; the flag alone
+        // must never trigger an open.
+        let open_ok = !self.open_on_arrival
+            || (!self.recording
+                && self.files.len() == 1
+                && self.files[0].folder.is_none()
+                && is_safe_handoff_document(&self.files[0].name));
+        is_valid_transfer_id(&self.id) && files_ok && open_ok && self.files.iter().all(FileEntry::is_valid)
     }
 
     pub fn total_size(&self) -> u64 {
@@ -3187,7 +3831,8 @@ impl RemoteInput {
     /// Encodes a datagram prefixed with [`remote::DATAGRAM_TAG`].
     pub fn to_datagram(&self) -> Vec<u8> {
         let mut out = vec![remote::DATAGRAM_TAG];
-        let _ = ciborium::into_writer(self, &mut out);
+        // See `MirrorConfig::to_cbor`: a `Vec` writer cannot fail.
+        ciborium::into_writer(self, &mut out).expect("serializing a datagram to a Vec cannot fail");
         out
     }
 
@@ -3855,6 +4500,9 @@ impl DeckPress {
 /// (`0..=100`) and/or mute state (`docs/protocol/deck.md` §2.5).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PcAudioSet {
+    /// Volume `0..=100`, plus the phone-as-speaker sentinels `200`
+    /// (stop playing this PC's audio on the phone) and `201` (start),
+    /// which the receiver handles as toggles, never as a volume level.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3897,7 +4545,9 @@ pub fn is_valid_storage_name(name: &str) -> bool {
     (1..=storage::MAX_NAME_BYTES).contains(&name.len())
         && name != "."
         && name != ".."
-        && !name.chars().any(|c| c == '/' || c == '\\' || c.is_control())
+        && !name.ends_with(['.', ' '])
+        && !is_windows_reserved_name(name)
+        && !name.chars().any(|c| c == '/' || c == '\\' || c == ':' || c.is_control())
 }
 
 /// Whether `path` is a valid non-empty relative storage path (`"DCIM/Camera"`,
@@ -3994,6 +4644,13 @@ pub struct StorageEntries {
     pub entries: Vec<StorageEntry>,
 }
 
+impl StorageEntries {
+    /// Every entry valid.
+    pub fn is_valid(&self) -> bool {
+        self.entries.iter().all(StorageEntry::is_valid)
+    }
+}
+
 /// Body of `storage.read` on a `storage/read` stream (`docs/protocol/storage.md` §4.1).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageRead {
@@ -4016,6 +4673,8 @@ impl std::fmt::Debug for StorageRead {
 impl StorageRead {
     pub fn is_valid(&self) -> bool {
         is_valid_storage_path(&self.path)
+            && self.length.is_none_or(|l| l > 0)
+            && self.offset.checked_add(self.length.unwrap_or(0)).is_some()
     }
 }
 
@@ -4060,11 +4719,31 @@ pub struct StorageWriteAccept {
     pub have: u64,
 }
 
+impl StorageWriteAccept {
+    /// The resumed offset cannot exceed the offered file size.
+    pub fn is_valid_for(&self, offered_size: u64) -> bool {
+        self.have <= offered_size
+    }
+}
+
 /// Body of `storage.write.done`: sent by the phone after committing the uploaded file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageWriteDone {
     pub size: u64,
     pub modified: i64,
+}
+
+impl StorageWriteDone {
+    /// A done message carries a non-negative modification time.
+    pub fn is_valid(&self) -> bool {
+        self.modified >= 0
+    }
+
+    /// Against the offered size: the committed size must match it, so a
+    /// truncated upload cannot be marked complete.
+    pub fn is_valid_for(&self, offered_size: u64) -> bool {
+        self.is_valid() && self.size == offered_size
+    }
 }
 
 /// Body of `storage.mkdir` (`docs/protocol/storage.md` §3.2).
@@ -4119,8 +4798,10 @@ impl std::fmt::Debug for StorageDelete {
 }
 
 impl StorageDelete {
+    /// The `confirmed` flag is a gate, not decoration: an unconfirmed
+    /// delete is invalid even when the path is well-formed.
     pub fn is_valid(&self) -> bool {
-        is_valid_storage_path(&self.path)
+        self.confirmed && is_valid_storage_path(&self.path)
     }
 }
 

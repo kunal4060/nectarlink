@@ -17,6 +17,10 @@ type HmacSha256 = Hmac<Sha256>;
 pub const SECRET_LEN: usize = 16;
 /// Length of the nonces used in the nearby (numeric comparison) flow.
 pub const NONCE_LEN: usize = 16;
+/// Length of a pairing proof: an HMAC-SHA256 output (see [`pair_proof`]).
+pub const PROOF_LEN: usize = 32;
+/// Length of a nonce commitment: a SHA-256 output (see [`commitment`]).
+pub const COMMITMENT_LEN: usize = 32;
 
 const PROOF_LABEL: &[u8] = b"nectarlink-pair-v0";
 const SAS_LABEL: &[u8] = b"nectarlink-sas-v0";
