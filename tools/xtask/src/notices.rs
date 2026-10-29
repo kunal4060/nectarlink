@@ -113,7 +113,10 @@ fn shipped_crates(metadata: &Value) -> Result<Vec<Crate>> {
     let mut seen = BTreeSet::from([start]);
     let mut queue = VecDeque::from([start]);
     while let Some(id) = queue.pop_front() {
-        let Some(node) = nodes.get(id) else { continue };
+        let Some(node) = nodes.get(id) else {
+            eprintln!("warning: no resolve node for {id}; its dependencies are not listed");
+            continue;
+        };
         for dep in node["deps"].as_array().into_iter().flatten() {
             // Only what's linked into the app: not build scripts or tests.
             let normal = dep["dep_kinds"].as_array().into_iter().flatten().any(|k| k["kind"].is_null());
@@ -133,17 +136,32 @@ fn shipped_crates(metadata: &Value) -> Result<Vec<Crate>> {
         .map(|p| {
             let dir =
                 Path::new(p["manifest_path"].as_str().unwrap_or_default()).parent().map(Path::to_path_buf);
-            let mut files: Vec<(String, String)> = dir
-                .and_then(|d| fs::read_dir(d).ok())
-                .into_iter()
-                .flatten()
-                .filter_map(|e| e.ok())
-                .filter(|e| e.path().is_file() && is_license_file(&e.file_name().to_string_lossy()))
-                .filter_map(|e| {
-                    Some((e.file_name().to_string_lossy().into_owned(), fs::read_to_string(e.path()).ok()?))
-                })
-                .collect();
+            let mut files: Vec<(String, String)> = Vec::new();
+            // The `license-file` metadata field points at the crate's
+            // license text even when it is not a top-level LICENSE file.
+            if let Some(license_file) = p["license_file"].as_str() {
+                let path = dir.as_ref().map(|d| d.join(license_file)).unwrap_or_else(|| PathBuf::from(license_file));
+                match fs::read_to_string(&path) {
+                    Ok(body) => files.push((license_file.to_owned(), body)),
+                    Err(e) => eprintln!(
+                        "warning: cannot read license-file {} for {}: {e}",
+                        path.display(),
+                        p["name"].as_str().unwrap_or_default()
+                    ),
+                }
+            }
+            // Walk the whole crate directory, not just its top level:
+            // license texts also live nested (e.g. under LICENSES/).
+            if let Some(dir) = &dir {
+                collect_license_files(dir, dir, &mut files);
+            } else {
+                eprintln!(
+                    "warning: no manifest directory for {}; its license files are not listed",
+                    p["name"].as_str().unwrap_or_default()
+                );
+            }
             files.sort();
+            files.dedup_by(|a, b| a.0 == b.0);
             Crate {
                 name: p["name"].as_str().unwrap_or_default().to_owned(),
                 version: p["version"].as_str().unwrap_or_default().to_owned(),
@@ -155,6 +173,35 @@ fn shipped_crates(metadata: &Value) -> Result<Vec<Crate>> {
         .collect();
     crates.sort_by(|a, b| (&a.name, &a.version).cmp(&(&b.name, &b.version)));
     Ok(crates)
+}
+
+/// License texts under `root` (relative paths, bodies): top-level
+/// license files plus anything under a `LICENSES/` directory, walked
+/// recursively. Unreadable files are warned about, not silently dropped.
+fn collect_license_files(root: &Path, dir: &Path, files: &mut Vec<(String, String)>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        eprintln!("warning: cannot read directory {}", dir.display());
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.is_dir() {
+            collect_license_files(root, &path, files);
+        } else if path.is_file() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = path.strip_prefix(root).unwrap_or(&path);
+            let under_licenses = rel
+                .components()
+                .any(|c| c.as_os_str().eq_ignore_ascii_case("LICENSES"));
+            if is_license_file(&name) || under_licenses {
+                match fs::read_to_string(&path) {
+                    Ok(body) => files.push((rel.to_string_lossy().replace('\\', "/"), body)),
+                    Err(e) => eprintln!("warning: cannot read license file {}: {e}", path.display()),
+                }
+            }
+        }
+    }
 }
 
 fn write_qt(text: &mut String, root: &Path) -> Result<()> {

@@ -92,6 +92,9 @@ jobs:
       - name: Build the installer
         shell: pwsh
         run: ./scripts/package.ps1 -Arch arm64
+      - name: Check it installs and uninstalls
+        shell: pwsh
+        run: ./scripts/smoke-installer.ps1
       - uses: actions/upload-artifact@v7
         with:
           name: windows-arm64

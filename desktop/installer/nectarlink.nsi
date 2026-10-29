@@ -256,10 +256,20 @@ Section "Uninstall"
   ${If} $0 == "${APP}"
     RMDir /r "$INSTDIR"
   ${Else}
+    ; The folder is not literally "Nectarlink", so only remove what the
+    ; installer staged: the exe, Qt runtime and QML/plugin trees, the
+    ; translation files, and the known staged files. Never RMDir the
+    ; folder itself here (a silent install can point anywhere).
     Delete "$INSTDIR\${EXE}"
     Delete "$INSTDIR\nectarlink_vcam.dll"
     Delete "$INSTDIR\AppxManifest.xml"
+    Delete "$INSTDIR\Qt6*.dll"
+    Delete "$INSTDIR\*.qm"
+    Delete "$INSTDIR\THIRD-PARTY-NOTICES.txt"
     RMDir /r "$INSTDIR\Assets"
+    RMDir /r "$INSTDIR\qml"
+    RMDir /r "$INSTDIR\platforms"
+    RMDir /r "$INSTDIR\translations"
     Delete "$INSTDIR\update.log"
     Delete "$INSTDIR\uninstall.exe"
   ${EndIf}

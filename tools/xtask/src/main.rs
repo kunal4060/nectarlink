@@ -110,10 +110,39 @@ fn validate(tokens: &Value) -> Result<()> {
     let status = themes.pointer("/bloom/status").context("missing bloom status")?;
     let seeds = themes.pointer("/bloom/seeds").and_then(Value::as_object).context("missing bloom seeds")?;
     for (seed, def) in seeds {
+        // A seed that is not a #RRGGBB color would reach Kotlin as a
+        // broken `Color(0xFF…)` literal; the palettes below were already
+        // checked, but the seed itself never was.
+        let seed_color = def.get("seed").and_then(Value::as_str).with_context(|| format!("bloom.{seed}: missing seed"))?;
+        if !is_hex_color(seed_color) {
+            bail!("bloom.{seed}.seed: {seed_color:?} is not a #RRGGBB color");
+        }
         for mode in ["light", "dark"] {
             let name = format!("bloom.{seed}.{mode}");
             check_palette(def.get(mode), &name)?;
             check_contrast(def.get(mode), status.get(mode), &name)?;
+        }
+    }
+    // The default seed must name a seed that exists, or the generated
+    // `DEFAULT_SEED` would point at nothing.
+    let default_seed = themes.pointer("/bloom/defaultSeed").and_then(Value::as_str).context("missing bloom defaultSeed")?;
+    if !seeds.contains_key(default_seed) {
+        bail!("bloom.defaultSeed: {default_seed:?} is not one of the bloom seeds");
+    }
+    // The honeycomb backdrop numbers reach Kotlin as float/long literals
+    // with no further check: an alpha outside 0..=1, a zero cell, or a
+    // non-positive duration/frame time would be nonsense at runtime.
+    let comb = themes.pointer("/hive/comb").and_then(Value::as_object).context("missing hive comb")?;
+    for key in ["lineAlphaDark", "lineAlphaLight", "glowAlphaDark", "glowAlphaLight"] {
+        let v = comb.get(key).and_then(Value::as_f64).with_context(|| format!("hive.comb.{key}: missing"))?;
+        if !(0.0..=1.0).contains(&v) {
+            bail!("hive.comb.{key}: {v} is not in 0..=1");
+        }
+    }
+    for key in ["cell", "breathSeconds", "pulseSeconds", "frameMs"] {
+        let v = comb.get(key).and_then(Value::as_f64).with_context(|| format!("hive.comb.{key}: missing"))?;
+        if v <= 0.0 {
+            bail!("hive.comb.{key}: {v} is not positive");
         }
     }
     // Fixed-palette themes carry their own status colors.
@@ -253,9 +282,30 @@ fn render_qml(tokens: &Value) -> Result<String> {
     ))
 }
 
-/// `#RRGGBB` as a Compose color literal.
+/// `#RRGGBB` as a Compose color literal. Callers only pass colors
+/// validate() already checked with `is_hex_color`, so the strip here
+/// cannot produce a broken literal.
 fn kotlin_color(hex: &str) -> String {
     format!("Color(0xFF{})", hex.trim_start_matches('#').to_ascii_uppercase())
+}
+
+/// A Rust string as a Kotlin string literal: a seed name with a quote,
+/// backslash, or control character must not break out of the literal.
+fn kotlin_string(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// A `Palette(...)` expression, its lines indented by `indent` spaces.
@@ -308,13 +358,13 @@ fn render_kotlin(tokens: &Value) -> Result<String> {
         "data class Seed(val color: Color, val light: Palette, val dark: Palette)".into(),
         String::new(),
         "object Tokens {".into(),
-        format!("    const val DEFAULT_SEED = \"{default_seed}\""),
+        format!("    const val DEFAULT_SEED = {}", kotlin_string(default_seed)),
         String::new(),
         "    val bloomSeeds: Map<String, Seed> = linkedMapOf(".into(),
     ]);
     for (name, def) in seeds {
         let seed = def.get("seed").and_then(Value::as_str).context("missing seed color")?;
-        out.push(format!("        \"{name}\" to Seed("));
+        out.push(format!("        {} to Seed(", kotlin_string(name)));
         out.push(format!("            color = {},", kotlin_color(seed)));
         out.push(format!("            light = {},", kotlin_palette(&def["light"], 12)?));
         out.push(format!("            dark = {},", kotlin_palette(&def["dark"], 12)?));

@@ -251,11 +251,30 @@ find_release() {
     if [ -n "$WANT_VERSION" ]; then
         VERSION="$WANT_VERSION"
     elif [ -n "${NECTARLINK_ASSETS_DIR:-}" ]; then
-        for f in "$NECTARLINK_ASSETS_DIR"/Nectarlink-*-linux-x86_64.tar.gz; do
-            [ -f "$f" ] || continue
-            VERSION="${f##*/Nectarlink-}"
-            VERSION="${VERSION%-linux-x86_64.tar.gz}"
-        done
+        # Derive the version from an asset matching the requested
+        # package: the tarball glob alone gives the wrong version when
+        # --package deb or rpm was asked for.
+        case "$PACKAGE" in
+            deb)
+                for f in "$NECTARLINK_ASSETS_DIR"/nectarlink_*.deb; do
+                    [ -f "$f" ] || continue
+                    VERSION="$(basename "$f" | sed -e 's/^nectarlink_//' -e 's/\.deb$//' -e 's/_[^_]*$//')"
+                done
+                ;;
+            rpm)
+                for f in "$NECTARLINK_ASSETS_DIR"/nectarlink-*.rpm; do
+                    [ -f "$f" ] || continue
+                    VERSION="$(basename "$f" | sed -e 's/^nectarlink-//' -e 's/\.rpm$//' -e 's/-[0-9][0-9]*\..*//')"
+                done
+                ;;
+            *)
+                for f in "$NECTARLINK_ASSETS_DIR"/Nectarlink-*-linux-"${ARCH}".tar.gz; do
+                    [ -f "$f" ] || continue
+                    VERSION="${f##*/Nectarlink-}"
+                    VERSION="${VERSION%-linux-${ARCH}.tar.gz}"
+                done
+                ;;
+        esac
     else
         fetch "https://api.github.com/repos/$REPO/releases/latest" "$WORK/release.json" \
             || fail "couldn't reach GitHub to find the latest release." "Check the internet connection and try again."

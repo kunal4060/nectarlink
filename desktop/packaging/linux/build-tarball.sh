@@ -172,6 +172,10 @@ for qm in "${SELF_DIR}"/nectarlink_*.qm; do
     [[ -f "${qm}" ]] && install -m 0644 "${qm}" "${PREFIX}/$(basename "${qm}")"
 done
 if [[ -d "${PREFIX}/lib" ]]; then
+    # Replace the link itself: redirecting into it would follow an
+    # existing symlink (e.g. a previous install's link, or a link to
+    # another program) and truncate that file instead.
+    rm -f "${BIN_LINK}"
     cat > "${BIN_LINK}" <<WRAPEOF
 #!/usr/bin/env sh
 export LD_LIBRARY_PATH="${PREFIX}/lib\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"

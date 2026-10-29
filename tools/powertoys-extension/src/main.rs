@@ -207,8 +207,15 @@ fn api_request(
     }
     stream.flush().map_err(|e| e.to_string())?;
 
+    // Cap the loopback response: an unbounded read lets a misbehaving or
+    // compromised local server balloon memory. Over-long bodies then fail
+    // JSON parsing below instead of being trusted.
+    const MAX_API_RESPONSE_BYTES: u64 = 1 << 20;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).map_err(|e| e.to_string())?;
+    stream.take(MAX_API_RESPONSE_BYTES + 1).read_to_string(&mut resp).map_err(|e| e.to_string())?;
+    if resp.len() as u64 > MAX_API_RESPONSE_BYTES {
+        return Err("Local API response exceeded 1 MiB".to_owned());
+    }
     let (_, json_body) = resp
         .split_once("\r\n\r\n")
         .ok_or_else(|| "malformed HTTP response from NectarLink Local API".to_owned())?;

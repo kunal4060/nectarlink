@@ -18,7 +18,7 @@ env:
   CARGO_TERM_COLOR: always
   QT_VERSION: "6.12.0"
   # The crates that build without Qt or the Android NDK.
-  CORE_CRATES: -p nectarlink-protocol -p nectarlink-core -p nectarlink-ffi -p nectarlink-cli -p xtask
+  CORE_CRATES: -p nectarlink-protocol -p nectarlink-core -p nectarlink-ffi -p nectarlink-cli -p nectarlink-adb -p xtask
 
 jobs:
   core:
@@ -199,6 +199,7 @@ jobs:
         run: |
           shellcheck -s sh desktop/packaging/linux/install.sh
           shellcheck desktop/packaging/linux/build-rpm.sh desktop/packaging/linux/test-install.sh
+          shellcheck desktop/packaging/linux/build-deb.sh desktop/packaging/linux/build-appimage.sh desktop/packaging/linux/build-tarball.sh
       - name: Install and remove each package with install.sh
         run: desktop/packaging/linux/test-install.sh
 
