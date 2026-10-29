@@ -15,8 +15,18 @@ Window {
     height: 56
     visible: dotRoot.opacity > 0.01
 
-    x: Math.round(Screen.virtualX + AppController.laserX * Math.max(1, Screen.width) - width / 2)
-    y: Math.round(Screen.virtualY + AppController.laserY * Math.max(1, Screen.height) - height / 2)
+    // Laser coordinates are fractions of the PRIMARY screen (see
+    // docs/protocol/remote.md): the origin and size must come from that
+    // screen, not from the virtual desktop origin plus one screen's size.
+    readonly property var primaryScreen: Qt.application.screens && Qt.application.screens.length > 0
+        ? Qt.application.screens[0] : null
+    readonly property real primaryX: primaryScreen ? primaryScreen.virtualX : Screen.virtualX
+    readonly property real primaryY: primaryScreen ? primaryScreen.virtualY : Screen.virtualY
+    readonly property real primaryW: primaryScreen ? primaryScreen.width : Screen.width
+    readonly property real primaryH: primaryScreen ? primaryScreen.height : Screen.height
+
+    x: Math.round(primaryX + AppController.laserX * Math.max(1, primaryW) - width / 2)
+    y: Math.round(primaryY + AppController.laserY * Math.max(1, primaryH) - height / 2)
 
     Item {
         id: dotRoot

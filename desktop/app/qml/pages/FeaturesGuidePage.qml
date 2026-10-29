@@ -21,21 +21,58 @@ Item {
     property string searchQuery: ""
     property string selectedArea: "all"
     property string activeDocKey: "overview"
+    // Chapter tab highlighted in the reader sheet, tracked separately
+    // from the opened document: feature docs are not chapters, so they
+    // leave no chapter tab highlighted instead of implying one is open.
+    property string activeChapterKey: "overview"
 
+    // Never show a missing toggle as ON: the map starts neutral and is
+    // filled from the backend below.
     property var deviceTogglesMap: ({
-        notifications: true,
-        clipboard: true,
-        files: true,
-        sms: true,
-        calls: true,
-        media: true,
+        notifications: false,
+        clipboard: false,
+        files: false,
+        sms: false,
+        calls: false,
+        media: false,
+        photos: false,
         storage: false,
         remote_input: false,
         pc_mirror: false
     })
 
+    // Online state per device id, from the DeviceList model's online
+    // role (the real link state), never from free-text capability
+    // reasons. Unknown ids fail closed to offline.
+    property var deviceOnlineById: ({})
+    function noteDeviceOnline(id, online) {
+        let next = Object.assign({}, deviceOnlineById)
+        next[id] = online
+        deviceOnlineById = next
+    }
+
+    function resetDeviceTogglesMap() {
+        deviceTogglesMap = ({
+            notifications: false,
+            clipboard: false,
+            files: false,
+            sms: false,
+            calls: false,
+            media: false,
+            photos: false,
+            storage: false,
+            remote_input: false,
+            pc_mirror: false
+        })
+    }
+
     function openDoc(key) {
         activeDocKey = key
+        let isChapter = false
+        for (let i = 0; i < guideChapters.length; i++) {
+            if (guideChapters[i].key === key) { isChapter = true; break }
+        }
+        activeChapterKey = isChapter ? key : ""
         AppController.openGuideDoc(key)
     }
 
@@ -45,36 +82,55 @@ Item {
         let count = DeviceList.count
         if (count <= 0) {
             deviceOnline = false
+            guide.deviceId = ""
+            guide.deviceName = ""
+            resetDeviceTogglesMap()
             return
         }
-        let targetId = guide.deviceId.length > 0 ? guide.deviceId : (DeviceList.deviceIdAt(0) || "")
-        if (guide.deviceId.length === 0 && targetId.length > 0) {
+        // Validate the selected device against the current list: a
+        // device that is no longer present must not keep its stale
+        // toggles and name on screen.
+        let targetId = guide.deviceId
+        let targetName = guide.deviceName
+        let found = false
+        for (let i = 0; i < count; i++) {
+            if (DeviceList.deviceIdAt(i) === targetId) {
+                found = true
+                targetName = DeviceList.deviceNameAt(i) || targetName
+                break
+            }
+        }
+        if (!found) {
+            targetId = DeviceList.deviceIdAt(0) || ""
+            targetName = DeviceList.deviceNameAt(0) || "Phone"
             guide.deviceId = targetId
-            guide.deviceName = DeviceList.deviceNameAt(0) || "Phone"
+            guide.deviceName = targetName
         }
-        if (targetId !== "") {
-            let st = AppController.featureState(targetId, "files")
-            let reason = st ? (st.reason || "") : ""
-            deviceOnline = reason.toLowerCase().indexOf("offline") === -1
-            let list = AppController.deviceToggles(targetId)
-            let next = {
-                notifications: true,
-                clipboard: true,
-                files: true,
-                sms: true,
-                calls: true,
-                media: true,
-                storage: false,
-                remote_input: false,
-                pc_mirror: false
-            }
-            for (let i = 0; i < list.length; i++) {
-                let entry = list[i]
-                if (entry && entry.name !== undefined)
-                    next[entry.name] = Boolean(entry.on)
-            }
-            deviceTogglesMap = next
+        if (targetId === "") {
+            deviceOnline = false
+            resetDeviceTogglesMap()
+            return
         }
+        deviceOnline = deviceOnlineById[targetId] === true
+        let list = AppController.deviceToggles(targetId) || []
+        let next = {
+            notifications: false,
+            clipboard: false,
+            files: false,
+            sms: false,
+            calls: false,
+            media: false,
+            photos: false,
+            storage: false,
+            remote_input: false,
+            pc_mirror: false
+        }
+        for (let i = 0; i < list.length; i++) {
+            let entry = list[i]
+            if (entry && entry.name !== undefined)
+                next[entry.name] = Boolean(entry.on)
+        }
+        deviceTogglesMap = next
     }
 
     onDeviceIdChanged: syncSelectedDevice()
@@ -85,6 +141,26 @@ Item {
         function onHasDevicesChanged() { guide.syncSelectedDevice() }
         function onCapsRevisionChanged() { guide.syncSelectedDevice() }
         function onTogglesRevisionChanged() { guide.syncSelectedDevice() }
+        function onGuideDocOpenChanged() {
+            if (AppController.guideDocOpen)
+                readerSheet.open()
+            else
+                readerSheet.close()
+        }
+    }
+
+    // Hidden: record each device's online role so syncSelectedDevice
+    // can read it without a capability-matrix guess.
+    Repeater {
+        model: DeviceList
+        delegate: Item {
+            required property string deviceId
+            required property bool online
+            visible: false
+            Component.onCompleted: guide.noteDeviceOnline(deviceId, online)
+            onOnlineChanged: guide.noteDeviceOnline(deviceId, online)
+            onDeviceIdChanged: guide.noteDeviceOnline(deviceId, online)
+        }
     }
 
     readonly property var guideChapters: [
@@ -516,9 +592,12 @@ Item {
         }
         if (item.prefKey && item.prefKey !== "") {
             let on = Boolean(Preferences[item.prefKey])
-            return on
-                ? { label: qsTr("Ready on PC"), tone: "available", visible: true }
-                : { label: qsTr("Off in Settings"), tone: "off", visible: true }
+            if (!on)
+                return { label: qsTr("Off in Settings"), tone: "off", visible: true }
+            // A PC preference is not "Ready" with no phone to use it with.
+            if (!guide.hasConnectedPhone)
+                return { label: qsTr("No phone connected"), tone: "neutral", visible: true }
+            return { label: qsTr("Ready on PC"), tone: "available", visible: true }
         }
         if (item.pcLocal && item.toggleKey === "storage") {
             if (!guide.hasConnectedPhone)
@@ -549,6 +628,9 @@ Item {
                     return { label: qsTr("Needs Assist"), tone: "basic", visible: true }
                 return { label: qsTr("Needs phone permission"), tone: "warn", visible: true }
             }
+            // Unknown or missing capability state must not fall through
+            // to a green "Ready" badge.
+            return { label: qsTr("Unknown"), tone: "neutral", visible: true }
         }
         return { label: qsTr("Ready"), tone: "available", visible: true }
     }
@@ -996,12 +1078,16 @@ Item {
     // Power levels, Troubleshooting, and FAQ
     Sheet {
         id: readerSheet
-        opened: AppController.guideDocOpen
+        // No `opened:` binding: Sheet.close() assigns opened = false,
+        // which would break the binding, so Esc/scrim dismiss would stop
+        // syncing with the backend. The Connections block above opens
+        // and closes the sheet from guideDocOpen instead.
         cardWidth: 640
         onOpenedChanged: {
             if (!opened && AppController.guideDocOpen)
                 AppController.closeGuideDoc()
         }
+        onDismissed: AppController.closeGuideDoc()
 
         ColumnLayout {
             width: parent.width
@@ -1051,7 +1137,7 @@ Item {
                     model: guide.guideChapters
                     delegate: Rectangle {
                         required property var modelData
-                        readonly property bool activeTab: guide.activeDocKey === modelData.key
+                        readonly property bool activeTab: guide.activeChapterKey === modelData.key
                         implicitWidth: tabTxt.implicitWidth + 20
                         implicitHeight: 28
                         radius: 14

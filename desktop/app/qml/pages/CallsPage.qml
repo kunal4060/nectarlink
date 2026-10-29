@@ -18,7 +18,24 @@ Item {
 
     signal textRequested(string number, string name)
 
-    readonly property var callLog: { try { return JSON.parse(PhoneCall.callLog) } catch (e) { return [] } }
+    readonly property var callLog: {
+        try {
+            const parsed = JSON.parse(PhoneCall.callLog)
+            return Array.isArray(parsed) ? parsed : []
+        } catch (e) {
+            return []
+        }
+    }
+    readonly property bool callLogParseFailed: {
+        const raw = PhoneCall.callLog
+        if (!raw || raw.length === 0)
+            return false
+        try {
+            return !Array.isArray(JSON.parse(raw))
+        } catch (e) {
+            return true
+        }
+    }
     readonly property var contacts: { try { return JSON.parse(PhoneCall.contacts) } catch (e) { return [] } }
     readonly property string query: search.text.trim().toLocaleLowerCase()
 
@@ -54,9 +71,10 @@ Item {
 
     // A stable color for a contact (in Bloom).
     function hueOf(name) {
+        const s = (typeof name === "string") ? name : ""
         let h = 0
-        for (let i = 0; i < name.length; i++)
-            h = (h * 31 + name.charCodeAt(i)) % 360
+        for (let i = 0; i < s.length; i++)
+            h = (h * 31 + s.charCodeAt(i)) % 360
         return h / 360
     }
 
@@ -84,7 +102,9 @@ Item {
         const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
         if (date.toDateString() === yesterday.toDateString())
             return qsTr("Yesterday")
-        if (now - date < 6 * 24 * 3600 * 1000)
+        // A future timestamp (clock skew) is not "Tue": fall through to
+        // the short date instead of showing a weekday name.
+        if (date <= now && now - date < 6 * 24 * 3600 * 1000)
             return date.toLocaleDateString(Qt.locale(), "ddd")
         return date.toLocaleDateString(Qt.locale(), Locale.ShortFormat)
     }
@@ -118,8 +138,12 @@ Item {
 
     function consumePendingDial() {
         if (AppController.pendingDial.length > 0) {
-            dialInput.text = AppController.pendingDial
+            const pending = AppController.pendingDial
             AppController.pendingDial = ""
+            // What the user already typed wins: a pending dial must
+            // never clobber it (and is dropped, not left to apply later).
+            if (dialInput.text.length === 0)
+                dialInput.text = pending
         }
     }
 
@@ -138,6 +162,10 @@ Item {
     Component.onCompleted: load()
     onDeviceIdChanged: {
         selectedContact = null
+        // Otherwise the old search filters the new phone's list, and a
+        // stale number can be mislabelled with the new phone's contact.
+        dialInput.text = ""
+        search.text = ""
         load()
     }
 
@@ -368,7 +396,9 @@ Item {
                     visible: PhoneCall.logStatus === "ready" && page.shownCalls.length === 0
                     role: "body"
                     muted: true
-                    text: page.query.length > 0 ? qsTr("No calls match.") : qsTr("No recent calls.")
+                    text: page.callLogParseFailed
+                        ? qsTr("Couldn't load recent calls.")
+                        : page.query.length > 0 ? qsTr("No calls match.") : qsTr("No recent calls.")
                 }
             }
         }
@@ -505,7 +535,7 @@ Item {
                             }
                             Avatar {
                                 anchors.fill: parent
-                                visible: !page.selectedContact || page.selectedContact.photo.length === 0
+                                visible: !page.selectedContact || (page.selectedContact.photo || "").length === 0
                                 name: page.selectedContact ? page.selectedContact.name : ""
                                 hue: page.selectedContact ? page.hueOf(page.selectedContact.name) : -1
                             }
@@ -724,9 +754,19 @@ Item {
                                 Behavior on scale { enabled: !Theme.reduceMotion; SpringAnimation { spring: Theme.springSnappy; damping: Theme.dampingSnappy } }
 
                                 function tapDigit(ch) {
-                                    dialInput.text = dialInput.text + ch
-                                    if (PhoneCall.active && PhoneCall.controls)
+                                    // During a live call on THIS device
+                                    // the digit is DTMF only: appending
+                                    // it would leave IVR/PIN digits in
+                                    // the dialer after hangup. And a
+                                    // keypad tap must never inject DTMF
+                                    // into another device's live call
+                                    // (the card itself is already gated
+                                    // on PhoneCall.device === page.deviceId).
+                                    if (PhoneCall.active && PhoneCall.device === page.deviceId && PhoneCall.controls) {
                                         PhoneCall.press(ch)
+                                        return
+                                    }
+                                    dialInput.text = dialInput.text + ch
                                 }
 
                                 Keys.onPressed: (event) => {

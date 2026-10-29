@@ -10,6 +10,28 @@ Item {
     property bool active: true
     property bool confirmClearAll: false
     property bool deviceMenuOpen: false
+    // Pending per-entry action behind the confirmation bar below.
+    property string pendingEntryId: ""
+    property string pendingEntryTitle: ""
+    property string pendingEntryDeviceId: ""
+    property string pendingEntryDeviceName: ""
+    property string pendingEntryMode: ""  // "remove" or "send"
+    // Pagination guard: loadMore() has no backend loading flag, so a
+    // cooldown keeps scroll + button from stacking requests.
+    property bool loadMoreCooldown: false
+    Timer {
+        id: loadMoreCooldownTimer
+        interval: 1500
+        repeat: false
+        onTriggered: page.loadMoreCooldown = false
+    }
+    function requestLoadMore() {
+        if (page.loadMoreCooldown)
+            return
+        page.loadMoreCooldown = true
+        loadMoreCooldownTimer.restart()
+        TimelineModel.loadMore()
+    }
 
     onActiveChanged: if (!active) deviceMenuOpen = false
 
@@ -17,12 +39,14 @@ Item {
 
     Shortcut {
         sequence: "Esc"
-        enabled: page.active && (page.deviceMenuOpen || page.confirmClearAll)
+        enabled: page.active && (page.deviceMenuOpen || page.confirmClearAll || page.pendingEntryMode.length > 0)
         onActivated: {
             if (page.deviceMenuOpen)
                 page.deviceMenuOpen = false
             else if (page.confirmClearAll)
                 page.confirmClearAll = false
+            else if (page.pendingEntryMode.length > 0)
+                page.pendingEntryMode = ""
         }
     }
 
@@ -40,11 +64,18 @@ Item {
         if (TimelineModel.deviceFilter.length === 0 || DeviceList.count <= 0)
             return qsTr("All devices")
         const row = DeviceList.rowOf(TimelineModel.deviceFilter)
-        return row >= 0 ? DeviceList.deviceNameAt(row) : qsTr("All devices")
+        // A filter for a device that no longer exists is not "All".
+        return row >= 0 ? DeviceList.deviceNameAt(row) : qsTr("Unknown device")
     }
 
     Connections {
         target: TimelineModel
+        function onCountChanged() {
+            // New items arrived, so any in-flight load finished: the
+            // cooldown can lift (it also lifts on its own timer).
+            page.loadMoreCooldown = false
+            loadMoreCooldownTimer.stop()
+        }
         function onHasAnyChanged() {
             if (!TimelineModel.hasAny) {
                 page.confirmClearAll = false
@@ -68,6 +99,11 @@ Item {
                 page.deviceMenuOpen = false
                 if (TimelineModel.deviceFilter.length > 0)
                     TimelineModel.deviceFilter = ""
+            } else if (TimelineModel.deviceFilter.length > 0
+                       && DeviceList.rowOf(TimelineModel.deviceFilter) < 0) {
+                // The filtered device is gone: clear the filter instead
+                // of showing its stale name over every device's entries.
+                TimelineModel.deviceFilter = ""
             }
         }
     }
@@ -367,6 +403,69 @@ Item {
                 }
             }
         }
+
+        // Confirmation bar for a per-entry Remove / Send again. Send
+        // again names the original device explicitly: the old code
+        // passed "" and the backend silently retargeted to another
+        // online phone when the original was offline.
+        Rectangle {
+            width: parent.width
+            height: entryConfirmRow.height + 20
+            visible: page.pendingEntryMode.length > 0
+            radius: Theme.radiusMd
+            color: Theme.graphite ? "transparent" : Theme.surfaceContainerHigh
+            border.width: 1
+            border.color: Theme.outlineVariant
+
+            Item {
+                id: entryConfirmRow
+                x: 14
+                anchors.verticalCenter: parent.verticalCenter
+                width: parent.width - 28
+                height: Math.max(entryConfirmLabel.height, entryConfirmBtns.height)
+
+                Txt {
+                    id: entryConfirmLabel
+                    anchors.left: parent.left
+                    anchors.right: entryConfirmBtns.left
+                    anchors.rightMargin: 12
+                    anchors.verticalCenter: parent.verticalCenter
+                    role: "bodySmall"
+                    wrapMode: Text.WordWrap
+                    text: page.pendingEntryMode === "send"
+                        ? qsTr("Send \"%1\" again to %2?").arg(page.pendingEntryTitle).arg(page.pendingEntryDeviceName)
+                        : qsTr("Remove \"%1\" from the timeline?").arg(page.pendingEntryTitle)
+                }
+                Row {
+                    id: entryConfirmBtns
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 8
+                    Button {
+                        variant: "text"
+                        size: "sm"
+                        text: qsTr("Cancel")
+                        onClicked: page.pendingEntryMode = ""
+                    }
+                    Button {
+                        variant: "tonal"
+                        size: "sm"
+                        iconPath: page.pendingEntryMode === "send" ? Icons.send : Icons.trash
+                        text: page.pendingEntryMode === "send" ? qsTr("Send again") : qsTr("Remove")
+                        onClicked: {
+                            const mode = page.pendingEntryMode
+                            const id = page.pendingEntryId
+                            const deviceId = page.pendingEntryDeviceId
+                            page.pendingEntryMode = ""
+                            if (mode === "remove")
+                                TimelineModel.removeEntry(id)
+                            else if (mode === "send")
+                                TimelineModel.sendAgain(id, deviceId)
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Empty state
@@ -426,7 +525,7 @@ Item {
 
         onContentYChanged: {
             if (TimelineModel.hasMore && contentHeight > height && contentY + height >= contentHeight - 260)
-                TimelineModel.loadMore()
+                page.requestLoadMore()
         }
 
         delegate: Column {
@@ -587,14 +686,27 @@ Item {
                         size: "sm"
                         iconPath: Icons.send
                         text: qsTr("Send again")
-                        onClicked: TimelineModel.sendAgain(rowRoot.entryId, "")
+                        Accessible.name: qsTr("Send %1 again to %2").arg(rowRoot.title).arg(rowRoot.deviceName)
+                        onClicked: {
+                            page.pendingEntryMode = "send"
+                            page.pendingEntryId = rowRoot.entryId
+                            page.pendingEntryTitle = rowRoot.title
+                            page.pendingEntryDeviceId = rowRoot.deviceId
+                            page.pendingEntryDeviceName = rowRoot.deviceName
+                        }
                     }
                     IconButton {
                         anchors.verticalCenter: parent.verticalCenter
                         width: 30; height: 30
                         iconPath: Icons.close
                         label: qsTr("Remove from timeline")
-                        onClicked: TimelineModel.removeEntry(rowRoot.entryId)
+                        onClicked: {
+                            page.pendingEntryMode = "remove"
+                            page.pendingEntryId = rowRoot.entryId
+                            page.pendingEntryTitle = rowRoot.title
+                            page.pendingEntryDeviceId = rowRoot.deviceId
+                            page.pendingEntryDeviceName = rowRoot.deviceName
+                        }
                     }
                 }
             }
@@ -609,7 +721,7 @@ Item {
                 variant: "tonal"
                 size: "sm"
                 text: qsTr("Load more")
-                onClicked: TimelineModel.loadMore()
+                onClicked: page.requestLoadMore()
             }
         }
     }

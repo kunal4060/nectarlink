@@ -66,13 +66,19 @@ FocusScope {
         }
     }
 
+    // Never show a missing toggle as ON: the map starts neutral and is
+    // filled from the backend below. "photos" is a real device toggle
+    // (default on, gates files.recent_photos); "Find my phone" is not a
+    // toggle at all (it needs only the phone's ring permission), so it
+    // is not listed as something switched on by default.
     property var deviceTogglesMap: ({
-        notifications: true,
-        clipboard: true,
-        files: true,
-        sms: true,
-        calls: true,
-        media: true,
+        notifications: false,
+        clipboard: false,
+        files: false,
+        sms: false,
+        calls: false,
+        media: false,
+        photos: false,
         storage: false,
         remote_input: false,
         pc_mirror: false
@@ -84,8 +90,7 @@ FocusScope {
         "Send files",
         "Now playing",
         "Messages and Calls",
-        "Photos",
-        "Find my phone"
+        "Photos"
     ]
 
     readonly property var optInLabels: [
@@ -114,28 +119,63 @@ FocusScope {
         "Reopen it from Settings or the Command Palette."
     ]
 
+    function resetDeviceTogglesMap() {
+        deviceTogglesMap = ({
+            notifications: false,
+            clipboard: false,
+            files: false,
+            sms: false,
+            calls: false,
+            media: false,
+            photos: false,
+            storage: false,
+            remote_input: false,
+            pc_mirror: false
+        })
+    }
+
     function refreshDeviceToggles() {
         let _rev = AppController.togglesRevision
         let count = DeviceList.count
         if (count <= 0) {
             activeDeviceId = ""
             activeDeviceName = ""
+            resetDeviceTogglesMap()
             return
         }
-        let id = DeviceList.deviceIdAt(0) || ""
-        let name = DeviceList.deviceNameAt(0) || "Your phone"
+        // The device this walkthrough is for (bound by MainWindow to the
+        // current device), not blindly the first device: with two phones
+        // paired, Step 4 used to edit the wrong phone's toggles.
+        let id = ""
+        let name = ""
+        if (walkthrough.deviceId.length > 0) {
+            for (let i = 0; i < count; i++) {
+                if (DeviceList.deviceIdAt(i) === walkthrough.deviceId) {
+                    id = walkthrough.deviceId
+                    name = DeviceList.deviceNameAt(i) || walkthrough.deviceName || "Your phone"
+                    break
+                }
+            }
+        }
+        if (id === "") {
+            id = DeviceList.deviceIdAt(0) || ""
+            name = DeviceList.deviceNameAt(0) || "Your phone"
+        }
         activeDeviceId = id
         activeDeviceName = name
-        if (id === "")
+        if (id === "") {
+            resetDeviceTogglesMap()
             return
-        let list = AppController.deviceToggles(id)
+        }
+        let list = AppController.deviceToggles(id) || []
         let next = {
-            notifications: true,
-            clipboard: true,
-            files: true,
-            sms: true,
-            calls: true,
-            media: true,
+            notifications: false,
+            clipboard: false,
+            files: false,
+            sms: false,
+            calls: false,
+            media: false,
+            photos: false,
             storage: false,
             remote_input: false,
             pc_mirror: false
@@ -154,12 +194,32 @@ FocusScope {
         return Boolean(deviceTogglesMap[name])
     }
 
+    property string highTrustPendingKey: ""
+    property string highTrustPendingLabel: ""
+
+    // High-trust toggles need an explicit confirmation when turned ON
+    // (turning them off stays one click). The custom Toggle never flips
+    // itself, so declining leaves the switch exactly where it was.
+    function requestDeviceToggle(name, on) {
+        if (on && (name === "pc_mirror" || name === "remote_input" || name === "storage")) {
+            highTrustPendingKey = name
+            highTrustPendingLabel = name === "pc_mirror" ? qsTr("Screen mirroring")
+                : name === "remote_input" ? qsTr("Remote input") : qsTr("Share PC folders")
+            highTrustConfirmSheet.open()
+            return
+        }
+        setDeviceToggleValue(name, on)
+    }
+
     function setDeviceToggleValue(name, on) {
+        // With no active device the backend call below never happens, so
+        // flipping the local map would show a toggle as on that is not.
+        if (activeDeviceId === "")
+            return
         let next = Object.assign({}, deviceTogglesMap)
         next[name] = on
         deviceTogglesMap = next
-        if (activeDeviceId !== "")
-            AppController.setDeviceToggle(activeDeviceId, name, on)
+        AppController.setDeviceToggle(activeDeviceId, name, on)
         if (honeycombCanvas)
             honeycombCanvas.requestPaint()
     }
@@ -172,6 +232,20 @@ FocusScope {
             return JSON.parse(raw)
         } catch (e) {
             return []
+        }
+    }
+
+    // The backend returned something, but it is not JSON: the summary
+    // must say so instead of pretending the check never ran.
+    readonly property bool doctorParseFailed: {
+        const raw = AppController.doctorChecks
+        if (!raw || raw === "")
+            return false
+        try {
+            JSON.parse(raw)
+            return false
+        } catch (e) {
+            return true
         }
     }
 
@@ -188,6 +262,8 @@ FocusScope {
     readonly property string doctorSummaryLabel: {
         if (AppController.doctorBusy)
             return "Checking firewall and local network..."
+        if (doctorParseFailed)
+            return "Check result couldn't be read — run it again."
         if (parsedDoctorChecks.length === 0)
             return Qt.platform.os === "linux"
                 ? "Run a quick check to verify your firewall and local discovery."
@@ -259,7 +335,10 @@ FocusScope {
 
     Keys.onPressed: event => {
         if (event.key === Qt.Key_Escape) {
-            skipWalkthrough()
+            // Esc steps back; it must never silently mark first-run
+            // setup complete. Skipping is an explicit button + confirm.
+            if (step > 0)
+                goBack()
             event.accepted = true
         } else if (event.key === Qt.Key_Right && (event.modifiers & Qt.AltModifier)) {
             goNext()
@@ -327,7 +406,7 @@ FocusScope {
                 size: "sm"
                 visible: walkthrough.step < walkthrough.totalSteps - 1
                 Accessible.name: "Skip setup walkthrough"
-                onClicked: walkthrough.skipWalkthrough()
+                onClicked: skipConfirmSheet.open()
             }
         }
 
@@ -1059,7 +1138,12 @@ FocusScope {
                                                 anchors.right: parent.right
                                                 anchors.leftMargin: 10
                                                 anchors.rightMargin: 10
-                                                text: walkthrough.adbCommand
+                                                // With no version the command would name
+                                                // "Nectarlink--android.apk", which does not
+                                                // exist; say so instead of showing it.
+                                                text: AppController.version.length > 0
+                                                    ? walkthrough.adbCommand
+                                                    : qsTr("App version unknown — download the APK from GitHub Releases.")
                                                 role: "code"
                                                 size: 12
                                                 elide: Text.ElideRight
@@ -1069,6 +1153,7 @@ FocusScope {
                                         Button {
                                             id: copyAdbBtn
                                             property bool copied: false
+                                            enabled: AppController.version.length > 0
                                             text: copied ? "Copied" : "Copy command"
                                             iconPath: copied ? Icons.check : Icons.copy
                                             variant: "tonal"
@@ -1340,7 +1425,8 @@ FocusScope {
                                                     { key: "files", label: qsTr("Send files") },
                                                     { key: "media", label: qsTr("Now playing") },
                                                     { key: "sms", label: qsTr("Messages") },
-                                                    { key: "calls", label: qsTr("Calls") }
+                                                    { key: "calls", label: qsTr("Calls") },
+                                                    { key: "photos", label: qsTr("Photos") }
                                                 ]
 
                                                 delegate: RowLayout {
@@ -1357,7 +1443,7 @@ FocusScope {
                                                     Toggle {
                                                         label: modelData.label
                                                         checked: walkthrough.isDeviceToggleOn(modelData.key)
-                                                        onToggled: next => walkthrough.setDeviceToggleValue(modelData.key, next)
+                                                        onToggled: next => walkthrough.requestDeviceToggle(modelData.key, next)
                                                     }
                                                 }
                                             }
@@ -1408,7 +1494,7 @@ FocusScope {
                                                     Toggle {
                                                         label: modelData.label
                                                         checked: walkthrough.isDeviceToggleOn(modelData.key)
-                                                        onToggled: next => walkthrough.setDeviceToggleValue(modelData.key, next)
+                                                        onToggled: next => walkthrough.requestDeviceToggle(modelData.key, next)
                                                     }
                                                 }
                                             }
@@ -1766,6 +1852,79 @@ FocusScope {
                 size: "md"
                 Accessible.name: walkthrough.step === walkthrough.totalSteps - 1 ? "Finish walkthrough" : "Next step"
                 onClicked: walkthrough.goNext()
+            }
+        }
+    }
+
+    Sheet {
+        id: skipConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Skip setup?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("You can reopen setup later from Settings or the Command Palette.")
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Keep going"); onClicked: skipConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Skip setup")
+                    onClicked: {
+                        skipConfirmSheet.close()
+                        walkthrough.skipWalkthrough()
+                    }
+                }
+            }
+        }
+    }
+
+    Sheet {
+        id: highTrustConfirmSheet
+        cardWidth: 440
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Allow %1?").arg(walkthrough.highTrustPendingLabel); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: walkthrough.highTrustPendingKey === "pc_mirror"
+                    ? qsTr("Your phone will be able to view this PC's screen.")
+                    : walkthrough.highTrustPendingKey === "remote_input"
+                        ? qsTr("Your phone will be able to control this PC's keyboard and mouse.")
+                        : qsTr("Your phone will be able to access shared folders on this PC.")
+            }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("This applies to %1.").arg(walkthrough.activeDeviceName || qsTr("your phone"))
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: highTrustConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Allow")
+                    onClicked: {
+                        const key = walkthrough.highTrustPendingKey
+                        highTrustConfirmSheet.close()
+                        if (key.length > 0)
+                            walkthrough.setDeviceToggleValue(key, true)
+                    }
+                }
             }
         }
     }

@@ -48,17 +48,10 @@ Item {
             }
         }
 
-        Card {
-            width: parent.width
-            padding: 24
-            visible: page.status === "ready"
-            PairingPanel {
-                width: parent.width
-                cancellable: false
-                running: page.visible && page.status === "ready"
-            }
-        }
-
+        // NOTE: no pairing card here on purpose. The MainWindow loader
+        // shows this page only while the core is not ready, so a card
+        // visible only when status is "ready" could never be seen;
+        // first-run pairing lives in the walkthrough instead.
         Spinner {
             anchors.horizontalCenter: parent.horizontalCenter
             visible: page.status === "starting"

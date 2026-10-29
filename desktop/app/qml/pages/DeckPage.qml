@@ -27,6 +27,33 @@ Item {
     readonly property var currentTiles: currentPage.tiles || []
     property int draggedTileIndex: -1
 
+    // Pending privileged test (grid + editor Test route through here).
+    property string confirmTestTileId: ""
+    property string confirmTestTileLabel: ""
+    // Actions that reach outside the app (lock, run, launch, type, keys)
+    // need a confirm before a test fires them.
+    function isPrivilegedTileKind(kind) {
+        return ["lock_pc", "run_command", "launch_app", "type_text", "shortcut"].indexOf(kind) >= 0
+    }
+    function confirmTestTile(id, kind, label) {
+        if (isPrivilegedTileKind(kind)) {
+            confirmTestTileId = id
+            confirmTestTileLabel = label
+            testConfirmSheet.open()
+        } else {
+            DeckController.testTile(id)
+        }
+    }
+    // The saved kind of a tile (the editor Test button must gate on the
+    // saved tile, since Test runs the saved version, not the edits).
+    function savedKindFor(id) {
+        for (let i = 0; i < currentTiles.length; i++) {
+            if (currentTiles[i].id === id)
+                return currentTiles[i].kind || ""
+        }
+        return ""
+    }
+
     onPagesListChanged: {
         if (currentPageIndex >= pagesList.length)
             currentPageIndex = Math.max(0, pagesList.length - 1)
@@ -337,7 +364,7 @@ Item {
                         size: "sm"
                         iconPath: Icons.trash
                         text: qsTr("Delete page")
-                        onClicked: DeckController.removePage(page.currentPage.id)
+                        onClicked: deletePageConfirmSheet.open()
                     }
                 }
             }
@@ -448,10 +475,10 @@ Item {
                                     opacity: tileHover.hovered || testHover.hovered || testBtn.activeFocus ? 1 : 0.55
                                     Accessible.role: Accessible.Button
                                     Accessible.name: qsTr("Test %1").arg(tileSlot.modelData.label)
-                                    Accessible.onPressAction: DeckController.testTile(tileSlot.modelData.id)
+                                    Accessible.onPressAction: page.confirmTestTile(tileSlot.modelData.id, tileSlot.modelData.kind, tileSlot.modelData.label)
                                     Keys.onPressed: (event) => {
                                         if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
-                                            DeckController.testTile(tileSlot.modelData.id)
+                                            page.confirmTestTile(tileSlot.modelData.id, tileSlot.modelData.kind, tileSlot.modelData.label)
                                             event.accepted = true
                                         }
                                     }
@@ -464,7 +491,7 @@ Item {
                                     }
                                     HoverHandler { id: testHover; cursorShape: Qt.PointingHandCursor }
                                     TapHandler {
-                                        onTapped: DeckController.testTile(tileSlot.modelData.id)
+                                        onTapped: page.confirmTestTile(tileSlot.modelData.id, tileSlot.modelData.kind, tileSlot.modelData.label)
                                     }
                                 }
                             }
@@ -617,11 +644,22 @@ Item {
             tileIcon = DeckController.defaultIconFor(kind)
             tileColor = DeckController.defaultColorFor(kind)
             errorText = ""
-            if (kind === "shortcut" && paramValue.length === 0) {
+            // Always reset to the kind's defaults: keeping the previous
+            // kind's key/modifiers would save a shortcut that types the
+            // old kind's parameter (e.g. a URL as a hotkey). selectKind
+            // only runs from the kind chips, never when opening an
+            // existing tile for editing.
+            modCtrl = false
+            modAlt = false
+            modShift = false
+            modWin = false
+            if (kind === "shortcut") {
                 paramValue = "c"
                 modCtrl = true
-            } else if (kind === "open_url" && paramValue.length === 0) {
+            } else if (kind === "open_url") {
                 paramValue = "https://"
+            } else {
+                paramValue = ""
             }
         }
 
@@ -916,17 +954,16 @@ Item {
                         size: "sm"
                         iconPath: Icons.trash
                         text: qsTr("Delete")
-                        onClicked: {
-                            DeckController.removeTile(page.currentPage.id, editorSheet.tileId)
-                            editorSheet.close()
-                        }
+                        onClicked: deleteTileConfirmSheet.open()
                     }
                     Button {
                         variant: "tonal"
                         size: "sm"
                         iconPath: Icons.bolt
-                        text: qsTr("Test")
-                        onClicked: DeckController.testTile(editorSheet.tileId)
+                        // Test runs the SAVED tile, not the edits in this
+                        // sheet; say so instead of implying a live preview.
+                        text: qsTr("Test saved version")
+                        onClicked: page.confirmTestTile(editorSheet.tileId, page.savedKindFor(editorSheet.tileId), editorSheet.tileLabel)
                     }
                 }
 
@@ -973,18 +1010,37 @@ Item {
     Sheet {
         id: pageNameSheet
         property bool isNew: true
+        property string errorText: ""
         cardWidth: 380
 
         function submitPageName() {
             const trimmed = pageNameInput.text.trim()
             if (trimmed.length === 0) return
+            pageNameSheet.errorText = ""
             if (pageNameSheet.isNew) {
-                DeckController.addPage(trimmed)
-                page.currentPageIndex = page.pagesList.length - 1
+                // addPage returns the new page's id: select that page,
+                // not "the last one" (which breaks when a page was just
+                // deleted or the list order changes).
+                const id = DeckController.addPage(trimmed)
+                let found = -1
+                for (let i = 0; i < page.pagesList.length; i++) {
+                    if (page.pagesList[i].id === id) { found = i; break }
+                }
+                if (found >= 0) {
+                    page.currentPageIndex = found
+                    pageNameSheet.close()
+                } else {
+                    pageNameSheet.errorText = qsTr("Couldn't create the page — try again.")
+                }
             } else {
                 DeckController.renamePage(page.currentPage.id, trimmed)
+                if (page.pagesList[page.currentPageIndex]
+                        && page.pagesList[page.currentPageIndex].name === trimmed) {
+                    pageNameSheet.close()
+                } else {
+                    pageNameSheet.errorText = qsTr("Couldn't rename the page — try again.")
+                }
             }
-            pageNameSheet.close()
         }
 
         Column {
@@ -1022,6 +1078,15 @@ Item {
                 }
             }
 
+            Txt {
+                visible: pageNameSheet.errorText.length > 0
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "bodySmall"
+                color: Theme.error
+                text: pageNameSheet.errorText
+            }
+
             Row {
                 anchors.right: parent.right
                 spacing: 8
@@ -1030,6 +1095,106 @@ Item {
                     variant: "fill"
                     text: pageNameSheet.isNew ? qsTr("Create") : qsTr("Save")
                     onClicked: pageNameSheet.submitPageName()
+                }
+            }
+        }
+    }
+
+    // ---- Delete Page Confirmation Sheet ----
+    Sheet {
+        id: deletePageConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Delete page?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("This deletes \"%1\" and its %2 tile(s). This cannot be undone.")
+                    .arg(page.currentPage.name).arg(page.currentTiles.length)
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: deletePageConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Delete")
+                    onClicked: {
+                        DeckController.removePage(page.currentPage.id)
+                        deletePageConfirmSheet.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Delete Tile Confirmation Sheet ----
+    // NOTE: removeTile returns void and the bridge refreshes, so QML
+    // cannot verify the removal: the editor still closes on confirm,
+    // but a failed removal leaves the tile visibly in place.
+    Sheet {
+        id: deleteTileConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Delete tile?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("This deletes \"%1\". This cannot be undone.").arg(editorSheet.tileLabel)
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: deleteTileConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Delete")
+                    onClicked: {
+                        DeckController.removeTile(page.currentPage.id, editorSheet.tileId)
+                        deleteTileConfirmSheet.close()
+                        editorSheet.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- Privileged Test Confirmation Sheet ----
+    Sheet {
+        id: testConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Run this action?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("Testing \"%1\" runs it on this PC right now.").arg(page.confirmTestTileLabel)
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: testConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Run")
+                    onClicked: {
+                        const id = page.confirmTestTileId
+                        testConfirmSheet.close()
+                        if (id.length > 0)
+                            DeckController.testTile(id)
+                    }
                 }
             }
         }

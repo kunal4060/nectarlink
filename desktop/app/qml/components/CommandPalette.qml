@@ -32,7 +32,9 @@ Item {
             return
         const idx = Math.max(0, Math.min(selectedIndex, items.length - 1))
         const item = items[idx]
-        if (item && item.id)
+        // Disabled items must not run from any path (keyboard, tap, or
+        // accessibility): the row only dims them, it does not block them.
+        if (item && item.id && item.enabled !== false)
             AppController.runCommandPalette(item.id)
     }
 
@@ -266,6 +268,8 @@ Item {
                         Accessible.role: Accessible.ListItem
                         Accessible.name: (modelData.title || "") + (modelData.subtitle ? ", " + modelData.subtitle : "")
                         Accessible.onPressAction: {
+                            if (!row.isEnabled)
+                                return
                             palette.selectedIndex = row.index
                             AppController.runCommandPalette(row.modelData.id)
                         }
@@ -281,6 +285,8 @@ Item {
 
                         TapHandler {
                             onTapped: {
+                                if (!row.isEnabled)
+                                    return
                                 palette.selectedIndex = row.index
                                 AppController.runCommandPalette(row.modelData.id)
                             }

@@ -13,7 +13,36 @@ Item {
     property string deviceId
     property string deviceName
 
-    readonly property var albums: { try { return JSON.parse(Photos.albums) } catch (e) { return [] } }
+    readonly property var albums: {
+        try {
+            const parsed = JSON.parse(Photos.albums)
+            return Array.isArray(parsed) ? parsed : []
+        } catch (e) {
+            return []
+        }
+    }
+    // A present-but-unreadable payload must be reported, not rendered
+    // as an empty album list / a viewer that silently vanishes.
+    readonly property bool albumsParseFailed: {
+        const raw = Photos.albums
+        if (!raw || raw.length === 0)
+            return false
+        try {
+            return !Array.isArray(JSON.parse(raw))
+        } catch (e) {
+            return true
+        }
+    }
+    readonly property bool viewedItemParseFailed: {
+        if (Photos.revision < 0 || viewerIndex < 0 || viewerIndex >= Photos.count)
+            return false
+        try {
+            JSON.parse(Photos.itemAt(viewerIndex))
+            return false
+        } catch (e) {
+            return true
+        }
+    }
     readonly property var photosFeature: AppController.capsRevision >= 0 && page.deviceId.length > 0
         ? AppController.featureState(page.deviceId, "files.recent_photos") : ({})
 
@@ -55,7 +84,9 @@ Item {
     }
 
     function sameDay(a, b) {
-        if (!a || !b || Math.abs(a - b) >= 86400000) return false
+        if (!a || !b) return false
+        // Calendar comparison alone defines "same day": the old 24-hour
+        // guard split one 25-hour DST day into two groups.
         const da = new Date(a)
         const db = new Date(b)
         return da.getDate() === db.getDate()
@@ -191,17 +222,28 @@ Item {
         load()
     }
 
+    Connections {
+        target: Photos
+        function onCountChanged() {
+            // The library shrank below the viewed item (album switch
+            // already resets, but a refresh can too): close the viewer
+            // instead of pointing it past the end.
+            if (page.viewerIndex >= Photos.count)
+                page.viewerIndex = -1
+        }
+    }
+
     visible: active
 
     // Keyboard shortcuts for viewer navigation and selection.
     Shortcut {
         sequence: "Left"
-        enabled: page.active && page.viewerIndex > 0
+        enabled: page.active && page.viewerIndex > 0 && page.viewedItem !== null
         onActivated: page.stepViewer(-1)
     }
     Shortcut {
         sequence: "Right"
-        enabled: page.active && page.viewerIndex >= 0 && page.viewerIndex + 1 < Photos.count
+        enabled: page.active && page.viewerIndex >= 0 && page.viewedItem !== null && page.viewerIndex + 1 < Photos.count
         onActivated: page.stepViewer(1)
     }
     Shortcut {
@@ -221,9 +263,12 @@ Item {
             || (page.selectedCount === 1 && !page.singleSelectedIsVideo)
         )
         onActivated: {
-            if (page.viewerIndex >= 0 && page.viewedItem)
+            // A viewer open on a video must not win over the single
+            // selected image: copy the viewer item only when it is not
+            // a video, otherwise fall through to the selection.
+            if (page.viewerIndex >= 0 && page.viewedItem && !page.viewedItem.isVideo)
                 Photos.copyItem(page.viewedItem.id)
-            else if (page.selectedCount === 1)
+            else if (page.selectedCount === 1 && !page.singleSelectedIsVideo)
                 Photos.copyItem(page.selectedIds[0])
         }
     }
@@ -239,11 +284,11 @@ Item {
         property var pendingIds: []
         title: qsTr("Save to folder")
         onAccepted: {
-            if (pendingIds.length > 0) {
+            // Keep the selection: a failed save (backend error toast)
+            // must stay retryable without re-finding the items. There
+            // is no save-completed signal to clear on success instead.
+            if (pendingIds.length > 0)
                 Photos.saveItems(pendingIds, selectedFolder.toString())
-                if (page.viewerIndex < 0)
-                    page.clearSelection()
-            }
         }
     }
 
@@ -355,6 +400,16 @@ Item {
                             Photos.selectAlbum(modelData.id)
                         }
                     }
+                }
+
+                Txt {
+                    visible: page.albumsParseFailed
+                    width: parent.width - 36
+                    x: 18
+                    role: "bodySmall"
+                    color: Theme.error
+                    wrapMode: Text.WordWrap
+                    text: qsTr("Couldn't load albums.")
                 }
             }
         }
@@ -506,7 +561,7 @@ Item {
                     visible: !gridPane.compactBar || page.selectedCount === 0
                     variant: "text"
                     size: "sm"
-                    text: qsTr("Select all")
+                    text: Photos.count > 500 ? qsTr("Select first 500") : qsTr("Select all")
                     onClicked: page.selectAllLoaded()
                 }
             }
@@ -551,8 +606,9 @@ Item {
                         ? qsTr("Save (%1)").arg(page.selectedCount)
                         : qsTr("Save")
                     onClicked: {
+                        // Keep the selection so a failed save can be
+                        // retried; see saveToFolderPicker above.
                         Photos.saveItems(page.selectedIds, "")
-                        page.clearSelection()
                     }
                 }
 
@@ -735,7 +791,7 @@ Item {
     // ---- In-app Photo & Video Viewer Overlay ----
     Rectangle {
         id: viewer
-        readonly property bool opened: page.viewerIndex >= 0 && page.viewedItem !== null
+        readonly property bool opened: page.viewerIndex >= 0 && (page.viewedItem !== null || page.viewedItemParseFailed)
         anchors.fill: parent
         visible: opacity > 0
         opacity: opened ? 1.0 : 0.0
@@ -747,6 +803,27 @@ Item {
 
         // Absorb background clicks.
         TapHandler { onTapped: {} }
+
+        // The item's payload failed to parse: say so instead of
+        // silently closing the viewer.
+        Column {
+            anchors.centerIn: parent
+            spacing: 12
+            visible: page.viewedItemParseFailed
+            Txt {
+                anchors.horizontalCenter: parent.horizontalCenter
+                role: "body"
+                color: Theme.error
+                text: qsTr("Couldn't load this photo.")
+            }
+            Button {
+                anchors.horizontalCenter: parent.horizontalCenter
+                variant: "tonal"
+                size: "sm"
+                text: qsTr("Dismiss")
+                onClicked: page.viewerIndex = -1
+            }
+        }
 
         // Viewer top bar.
         Item {
@@ -1274,14 +1351,20 @@ Item {
                 onPressed: (ev) => {
                     pressPos = Qt.point(ev.x, ev.y)
                     dragStarted = false
-                    if (!tile.isVideo && tile.fullUrl.length === 0)
+                    // Selection gestures must not download full-resolution
+                    // originals: prefetch only for a plain open press.
+                    if (!tile.isVideo && tile.fullUrl.length === 0
+                            && !page.selectMode && page.selectedCount === 0
+                            && (ev.modifiers & (Qt.ControlModifier | Qt.ShiftModifier)) === 0)
                         Photos.ensureFull(tile.itemId)
                 }
                 onPositionChanged: (ev) => {
                     if (pressed && !dragStarted
                         && Math.hypot(ev.x - pressPos.x, ev.y - pressPos.y) > Qt.styleHints.startDragDistance) {
-                        dragStarted = true
-                        Photos.startDrag(tile.itemId)
+                        // A failed stage must not swallow the click that
+                        // follows: only treat the drag as started when the
+                        // backend actually started one.
+                        dragStarted = Photos.startDrag(tile.itemId)
                     }
                 }
                 onClicked: (ev) => {

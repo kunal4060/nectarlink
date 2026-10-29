@@ -14,6 +14,12 @@ Item {
     property string deviceName
     // Writing to someone new (no conversation open).
     property bool composing: false
+    // A new conversation's send is in flight: the draft is kept until the
+    // backend opens the new thread, so a failed send stays retryable.
+    property bool pendingNewConversation: false
+    // The file picker chose a file that could not be staged at all, so
+    // the attachment bar (which only shows staged errors) cannot show it.
+    property bool attachDialogFailed: false
 
     readonly property var threads: { try { return JSON.parse(Messages.threads) } catch (e) { return [] } }
     readonly property var messages: { try { return JSON.parse(Messages.messages) } catch (e) { return [] } }
@@ -62,17 +68,25 @@ Item {
         ]
         onAccepted: {
             if (selectedFile.toString().length > 0) {
-                Messages.attachFile(selectedFile.toString())
+                // Like the drag-and-drop path, a failed stage must be
+                // visible instead of silently dropping the attachment.
+                attachDialogFailed = !Messages.attachFile(selectedFile.toString())
                 composer.focusText()
             }
         }
     }
 
-    // Back to the list: nothing open.
+    // Back to the list: nothing open. The draft and any staged attachment
+    // belong to the conversation being left and must not leak into the
+    // next one opened.
     function closeChat() {
         Messages.closeThread()
         composing = false
         toField.text = ""
+        input.text = ""
+        Messages.clearAttachment()
+        pendingNewConversation = false
+        attachDialogFailed = false
     }
 
     // A stable color for a contact (in Bloom).
@@ -131,6 +145,13 @@ Item {
         function onThreadChanged() {
             if (Messages.thread.length > 0) {
                 page.composing = false
+                // A thread switch (or the new thread opening after a
+                // send) ends the previous draft: clear it and any staged
+                // attachment instead of carrying them into this thread.
+                input.text = ""
+                Messages.clearAttachment()
+                pendingNewConversation = false
+                attachDialogFailed = false
                 Qt.callLater(() => composer.focusText())
             }
         }
@@ -176,9 +197,20 @@ Item {
         Messages.closeThread()
         composing = true
         toField.text = ""
+        input.text = ""
+        Messages.clearAttachment()
+        pendingNewConversation = false
+        attachDialogFailed = false
         toField.forceActiveFocus()
     }
-    onDeviceIdChanged: { composing = false; load() }
+    onDeviceIdChanged: {
+        composing = false
+        input.text = ""
+        Messages.clearAttachment()
+        pendingNewConversation = false
+        attachDialogFailed = false
+        load()
+    }
 
     // "14:05", "Yesterday", "Tue", or a date.
     function shortTime(ms) {
@@ -541,7 +573,7 @@ Item {
                 visible: !page.composing && !!page.openThread && !!page.openThread.isChat
                 iconPath: Icons.trash
                 label: qsTr("Remove conversation from PC")
-                onClicked: if (page.openThread) Messages.deleteChatThread(page.openThread.id)
+                onClicked: if (page.openThread) deleteConfirmSheet.open()
             }
             // New message: who to.
             Row {
@@ -751,6 +783,21 @@ Item {
             }
         }
 
+        // A picked file that could not be staged at all leaves no staged
+        // attachment for the bar above to report, so say so here instead
+        // of silently dropping the user's pick.
+        Txt {
+            visible: page.attachDialogFailed && !Messages.hasAttachment && (!!page.openThread || page.composing)
+            anchors.left: composer.left
+            anchors.right: composer.right
+            anchors.bottom: composer.top
+            anchors.bottomMargin: 8
+            role: "bodySmall"
+            color: Theme.error
+            wrapMode: Text.WordWrap
+            text: qsTr("Couldn't attach that file.")
+        }
+
         // Staged MMS image attachment preview card.
         Rectangle {
             id: attachmentBar
@@ -832,13 +879,25 @@ Item {
             function send() {
                 if (!canSend)
                     return
-                if (page.composing)
-                    Messages.sendTo(toField.text, input.text)
-                else
+                if (page.composing) {
+                    // Resolve a typed name the way the Return handler
+                    // does, and never send a raw name or padded number.
+                    let to = toField.text.trim()
+                    if (page.recipientMatches.length > 0 && !/\d/.test(to))
+                        to = page.recipientMatches[0].number
+                    Messages.sendTo(to, input.text)
+                    // Keep the draft until the backend opens the new
+                    // thread (onThreadChanged clears it then). send/sendTo
+                    // are void with no success signal, so clearing now
+                    // would destroy the message on a failed send; for an
+                    // open thread the failed message stays in the list
+                    // marked "Not sent", so only the new-conversation
+                    // case needs this protection.
+                    pendingNewConversation = true
+                } else {
                     Messages.send(input.text)
-                input.text = ""
-                page.composing = false
-                toField.text = ""
+                    input.text = ""
+                }
             }
             anchors.left: parent.left
             anchors.right: parent.right
@@ -1146,8 +1205,11 @@ Item {
         readonly property bool newDay: {
             if (!previous)
                 return true
-            if (Math.abs(message.date - previous.date) < 600000)
-                return false
+            // Calendar days first: two messages 5 minutes apart across
+            // midnight are different days, even though the old 10-minute
+            // rule returned false before ever comparing dates. Within
+            // one day the separator is per message group regardless of
+            // gap (the old code returned false there too).
             const d1 = new Date(previous.date)
             const d2 = new Date(message.date)
             return d1.getFullYear() !== d2.getFullYear() || d1.getMonth() !== d2.getMonth() || d1.getDate() !== d2.getDate()
@@ -1281,14 +1343,19 @@ Item {
                                     role: "caption"
                                     color: bubble.mine ? Theme.primaryContainerContent : Theme.surfaceContentVariant
                                     opacity: 0.8
-                                    text: (audioPill.modelData.size || "") + (audioPill.modelData.url && audioPill.modelData.url.length > 0 ? qsTr(" · Click to play") : qsTr(" · Loading…"))
+                                    text: (audioPill.modelData.size || "") + (audioPill.audioPlayable ? qsTr(" · Click to play") : qsTr(" · Loading…"))
                                 }
                             }
                         }
-                        HoverHandler { cursorShape: audioPill.modelData.url && audioPill.modelData.url.length > 0 ? Qt.PointingHandCursor : Qt.ArrowCursor }
+                        // Voice-note audio is always a cached local file
+                        // from the backend; never hand any other scheme to
+                        // the OS (a crafted message must not open a remote
+                        // URL or an app handler from a tap here).
+                        readonly property bool audioPlayable: (audioPill.modelData.url || "").indexOf("file:") === 0
+                        HoverHandler { cursorShape: audioPill.audioPlayable ? Qt.PointingHandCursor : Qt.ArrowCursor }
                         TapHandler {
                             onTapped: {
-                                if (audioPill.modelData.url && audioPill.modelData.url.length > 0)
+                                if (audioPill.audioPlayable)
                                     Qt.openUrlExternally(audioPill.modelData.url)
                             }
                         }
@@ -1376,6 +1443,39 @@ Item {
     }
 
     // Inline lightbox preview for MMS image attachments.
+    Sheet {
+        id: deleteConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Delete conversation?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: page.openThread
+                    ? qsTr("This removes \"%1\" from this PC. It cannot be undone.").arg(page.openThread.title)
+                    : qsTr("This removes the conversation from this PC. It cannot be undone.")
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: deleteConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Delete")
+                    onClicked: {
+                        if (page.openThread)
+                            Messages.deleteChatThread(page.openThread.id)
+                        deleteConfirmSheet.close()
+                    }
+                }
+            }
+        }
+    }
+
     Sheet {
         id: msgImagePreviewSheet
         property string imageUrl: ""

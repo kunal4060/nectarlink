@@ -51,6 +51,11 @@ Window {
     property real activeTransferRate: 0
     property bool activeTransferIncoming: false
     property bool transferJustFinished: false
+    // Title of the transfer that just finished, snapshotted before the
+    // active fields are cleared so the completion state can name it.
+    property string finishedTransferTitle: ""
+    // Two-step transfer cancel: first tap arms, second tap cancels.
+    property bool transferCancelArmed: false
 
     // ---- Transient notification toast (only when a new phone notification arrives) ----
     property bool notificationToastActive: false
@@ -79,15 +84,28 @@ Window {
         id: transferDoneTimer
         interval: 3200
         repeat: false
-        onTriggered: islandWin.transferJustFinished = false
+        onTriggered: {
+            islandWin.transferJustFinished = false
+            islandWin.finishedTransferTitle = ""
+        }
     }
 
+    // Backstop only: recomputeTransfer() snapshots the finished title and
+    // sets the flag itself; this covers the case where the active count
+    // drops without a repeater change reaching recomputeTransfer() first.
     property int lastActiveTransfers: TransferList.active
     onLastActiveTransfersChanged: {
-        if (lastActiveTransfers === 0 && activeTransferTitle.length > 0) {
+        if (lastActiveTransfers === 0 && !transferJustFinished && finishedTransferTitle.length > 0) {
             transferJustFinished = true
             transferDoneTimer.restart()
         }
+    }
+
+    Timer {
+        id: transferCancelDisarmTimer
+        interval: 3000
+        repeat: false
+        onTriggered: islandWin.transferCancelArmed = false
     }
 
     function recomputeMedia() {
@@ -141,12 +159,32 @@ Window {
             }
         }
         if (found) {
+            // A new transfer inside the previous one's 3.2 s completion
+            // window must not inherit the finished state (full ring,
+            // hidden Cancel).
+            transferJustFinished = false
+            transferDoneTimer.stop()
+            // The arm belongs to one transfer: a different id disarms it,
+            // but progress ticks on the same transfer must not.
+            if (activeTransferId.length > 0 && activeTransferId !== found.transferId) {
+                transferCancelArmed = false
+                transferCancelDisarmTimer.stop()
+            }
             activeTransferId = found.transferId
             activeTransferTitle = found.title
             activeTransferProgress = Math.max(0, Math.min(1, found.progress || 0))
             activeTransferRate = found.rate || 0
             activeTransferIncoming = found.incoming
         } else if (!transferJustFinished) {
+            // Snapshot the finished title before clearing: the secondary
+            // label reads it while the completion state shows.
+            transferCancelArmed = false
+            transferCancelDisarmTimer.stop()
+            if (activeTransferId.length > 0) {
+                finishedTransferTitle = activeTransferTitle
+                transferJustFinished = true
+                transferDoneTimer.restart()
+            }
             activeTransferId = ""
             activeTransferTitle = ""
             activeTransferProgress = 0
@@ -237,7 +275,7 @@ Window {
         }
         if (mode === "transfer") {
             if (transferJustFinished && TransferList.active === 0)
-                return activeTransferTitle
+                return finishedTransferTitle
             const pct = Math.round(activeTransferProgress * 100) + "%"
             const spd = formatRate(activeTransferRate)
             const base = spd.length > 0 ? (pct + " · " + spd) : pct
@@ -295,6 +333,12 @@ Window {
                 onArtistChanged: islandWin.recomputeMedia()
                 onArtChanged: islandWin.recomputeMedia()
                 onDeviceIdChanged: islandWin.recomputeMedia()
+                onPositionChanged: islandWin.recomputeMedia()
+                onDurationChanged: islandWin.recomputeMedia()
+                onCanNextChanged: islandWin.recomputeMedia()
+                onCanPreviousChanged: islandWin.recomputeMedia()
+                onCanPlayChanged: islandWin.recomputeMedia()
+                onCanPauseChanged: islandWin.recomputeMedia()
             }
         }
 
@@ -816,8 +860,11 @@ Window {
                     spacing: 6
 
                     // ---- Call controls: Answer (when ringing), Mute, Speaker, Hang up ----
+                    // Answer needs only a tracked call; gating it on canEnd
+                    // (the narrower "calls.control Available" gate) hid it
+                    // for calls that can still be answered.
                     Rectangle {
-                        visible: islandWin.mode === "call" && PhoneCall.ringing && PhoneCall.canEnd
+                        visible: islandWin.mode === "call" && PhoneCall.ringing
                         width: 32; height: 32; radius: 16
                         color: "#22C55E"
                         Icon {
@@ -842,6 +889,20 @@ Window {
                         }
                         HoverHandler { cursorShape: Qt.PointingHandCursor }
                         TapHandler { onTapped: PhoneCall.setMute(!PhoneCall.muted) }
+                    }
+
+                    Rectangle {
+                        visible: islandWin.mode === "call" && !PhoneCall.ringing && PhoneCall.controls
+                        width: 30; height: 30; radius: 15
+                        color: PhoneCall.speaker ? Qt.rgba(1, 1, 1, 0.26) : Qt.rgba(1, 1, 1, 0.12)
+                        Icon {
+                            anchors.centerIn: parent
+                            width: 14; height: 14
+                            path: Icons.speaker
+                            color: "#FFFFFF"
+                        }
+                        HoverHandler { cursorShape: Qt.PointingHandCursor }
+                        TapHandler { onTapped: PhoneCall.setSpeakerOn(!PhoneCall.speaker) }
                     }
 
                     Rectangle {
@@ -915,12 +976,22 @@ Window {
                         }
                     }
 
-                    // ---- Transfer cancel button ----
+                    // ---- Transfer cancel button (two-step: first tap arms) ----
+                    Txt {
+                        visible: islandWin.transferCancelArmed
+                        anchors.verticalCenter: parent.verticalCenter
+                        size: 11
+                        color: "#FFFFFF"
+                        text: qsTr("Tap ✕ again to cancel")
+                    }
+
                     Rectangle {
                         visible: islandWin.mode === "transfer" && !islandWin.transferJustFinished && islandWin.activeTransferId.length > 0
                         width: 28; height: 28; radius: 14
                         anchors.verticalCenter: parent.verticalCenter
-                        color: expCancelHover.hovered ? Qt.rgba(1, 0.3, 0.3, 0.28) : Qt.rgba(1, 1, 1, 0.10)
+                        color: islandWin.transferCancelArmed
+                            ? Qt.rgba(1, 0.3, 0.3, 0.45)
+                            : (expCancelHover.hovered ? Qt.rgba(1, 0.3, 0.3, 0.28) : Qt.rgba(1, 1, 1, 0.10))
                         Icon {
                             anchors.centerIn: parent
                             width: 13; height: 13
@@ -929,7 +1000,16 @@ Window {
                         }
                         HoverHandler { id: expCancelHover; cursorShape: Qt.PointingHandCursor }
                         TapHandler {
-                            onTapped: TransferList.cancel(islandWin.activeTransferId)
+                            onTapped: {
+                                if (islandWin.transferCancelArmed) {
+                                    transferCancelDisarmTimer.stop()
+                                    islandWin.transferCancelArmed = false
+                                    TransferList.cancel(islandWin.activeTransferId)
+                                } else {
+                                    islandWin.transferCancelArmed = true
+                                    transferCancelDisarmTimer.restart()
+                                }
+                            }
                         }
                     }
                 }

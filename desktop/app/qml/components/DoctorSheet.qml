@@ -125,6 +125,7 @@ Sheet {
                             anchors.verticalCenter: parent.verticalCenter
                             spacing: 6
                             visible: row.hasFix
+                                && (row.modelData.fix === "firewall" || sheet.fixLabel(row.modelData.fix).length > 0)
 
                             Button {
                                 visible: row.modelData.fix === "firewall"
@@ -136,6 +137,11 @@ Sheet {
                             }
                             Button {
                                 id: fixButton
+                                // Firewall rows have their own dedicated
+                                // button above, and an unknown fix has no
+                                // label: neither may render as a blank
+                                // clickable button.
+                                visible: row.modelData.fix !== "firewall" && sheet.fixLabel(row.modelData.fix).length > 0
                                 enabled: !AppController.doctorBusy
                                 variant: row.modelData.outcome === "fail" ? "fill" : "tonal"
                                 size: "sm"

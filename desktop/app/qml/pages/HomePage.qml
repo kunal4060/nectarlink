@@ -29,10 +29,45 @@ Item {
         if (!AppController.localsendEnabled || !AppController.localsendPeersJson || AppController.localsendPeersJson.length === 0)
             return []
         try {
-            return JSON.parse(AppController.localsendPeersJson)
+            const parsed = JSON.parse(AppController.localsendPeersJson)
+            return Array.isArray(parsed) ? parsed : []
         } catch (e) {
             return []
         }
+    }
+
+    // The peers JSON was present but unreadable (or not an array): the
+    // LocalSend card must say so instead of vanishing as if no devices
+    // were nearby.
+    readonly property bool localsendParseFailed: {
+        if (!AppController.localsendEnabled || !AppController.localsendPeersJson || AppController.localsendPeersJson.length === 0)
+            return false
+        try {
+            return !Array.isArray(JSON.parse(AppController.localsendPeersJson))
+        } catch (e) {
+            return true
+        }
+    }
+
+    // Undo bar ownership: the feed's dismiss-all sets this to its own
+    // device, so another phone's feed never shows a foreign Undo bar.
+    // Empty means "dismissed from elsewhere" and still shows the bar.
+    property string undoDeviceId: ""
+    // Pending destructive confirmations (one sheet serves them all).
+    property string confirmClearKind: ""
+    property string confirmClearClipId: ""
+    property string confirmCancelAllDeviceId: ""
+    property string confirmCancelAllDeviceName: ""
+    property int confirmCancelAllCount: 0
+
+    function isCurrentDeviceValid() {
+        if (page.currentDeviceId.length === 0)
+            return false
+        for (let i = 0; i < DeviceList.count; i++) {
+            if (DeviceList.deviceIdAt(i) === page.currentDeviceId)
+                return true
+        }
+        return false
     }
 
     // The send queue as a model that's updated in place, so its rows keep
@@ -41,6 +76,19 @@ Item {
     // row per file.
     ListModel { id: sendQueueModel }
     property int sendQueueWaiting: 0
+    // Waiting/sending rows for the device on screen only (the card and
+    // its Cancel-all belong to that device, not the global queue).
+    property int queueWaitingHere: 0
+
+    function recountQueueWaiting() {
+        let n = 0
+        for (let i = 0; i < sendQueueModel.count; i++) {
+            const r = sendQueueModel.get(i)
+            if (r.deviceId === page.currentDeviceId && (r.status === "waiting" || r.status === "sending"))
+                n++
+        }
+        queueWaitingHere = n
+    }
 
     function syncSendQueue() {
         let items = []
@@ -52,13 +100,17 @@ Item {
         }
         const rows = items
             .filter(item => !(item.status === "sending" && item.live))
-            .map(item => ({
-                queueId: String(item.id || ""),
+            .map((item, idx) => ({
+                // Rows without a backend id get a synthetic one so two
+                // id-less rows can never address each other's item; their
+                // Retry/Cancel actions stay disabled (see the delegate).
+                queueId: item.id ? String(item.id) : ("local-" + idx),
                 kind: String(item.kind || ""),
                 icon: String(item.icon || ""),
                 title: String(item.title || ""),
                 status: String(item.status || "waiting"),
                 reason: String(item.reason || ""),
+                deviceId: String(item.deviceId || ""),
                 deviceName: String(item.deviceName || ""),
                 totalBytes: Number(item.totalBytes || 0),
                 progress: Number(item.progress || 0)
@@ -81,6 +133,7 @@ Item {
             }
         }
         sendQueueWaiting = rows.filter(row => row.status === "waiting" || row.status === "sending").length
+        recountQueueWaiting()
     }
 
     Connections {
@@ -102,7 +155,10 @@ Item {
     FileDialog {
         id: localsendFilePicker
         property string targetDeviceId: ""
-        title: qsTr("Send files via LocalSend")
+        property string targetDeviceName: ""
+        title: targetDeviceName.length > 0
+            ? qsTr("Send files to %1").arg(targetDeviceName)
+            : qsTr("Send files via LocalSend")
         fileMode: FileDialog.OpenFiles
         onAccepted: {
             if (targetDeviceId.length > 0 && selectedFiles.length > 0)
@@ -118,7 +174,10 @@ Item {
         if (AppController.currentDevice !== current)
             AppController.currentDevice = current
     }
-    onCurrentDeviceIdChanged: AppController.watchHomeSummary(visible ? currentDeviceId : "")
+    onCurrentDeviceIdChanged: {
+        AppController.watchHomeSummary(visible ? currentDeviceId : "")
+        recountQueueWaiting()
+    }
     onVisibleChanged: AppController.watchHomeSummary(visible ? currentDeviceId : "")
     Component.onDestruction: AppController.watchHomeSummary("")
     Connections {
@@ -231,6 +290,9 @@ Item {
         let parts = []
         for (let i = 0; i < cutouts.length; i++) {
             const c = cutouts[i]
+            // A non-finite cutout would emit literal "NaN" into the SVG path.
+            if (!Number.isFinite(c.x) || !Number.isFinite(c.y) || !Number.isFinite(c.w) || !Number.isFinite(c.h))
+                continue
             const rx = ox + c.x * w
             const ry = oy + c.y * h
             const rw = c.w * w
@@ -530,7 +592,8 @@ Item {
 
             LocalSendCard {
                 width: column.width
-                visible: DeviceList.count === 0 && AppController.localsendEnabled && page.localsendPeers.length > 0
+                visible: DeviceList.count === 0 && AppController.localsendEnabled
+                    && (page.localsendPeers.length > 0 || page.localsendParseFailed)
             }
         }
     }
@@ -541,9 +604,13 @@ Item {
     DropArea {
         id: drop
         anchors.fill: parent
-        enabled: page.currentCanReceive
+        // The Binding below keeps the last device when no device is on
+        // screen (RestoreNone), so also require the id to still exist.
+        enabled: page.currentCanReceive && page.isCurrentDeviceValid()
         onEntered: (drag) => drag.accepted = drag.hasUrls
         onDropped: (drag) => {
+            if (!page.isCurrentDeviceValid())
+                return
             if (drag.hasUrls) {
                 const urls = drag.urls.map(url => url.toString())
                 if ((drag.modifiers & Qt.ShiftModifier) && urls.length === 1)
@@ -656,7 +723,33 @@ Item {
         readonly property bool canAnimateHero: !Theme.reduceMotion && !page.resizing && home.visible && page.visible
                                                && Qt.application.state === Qt.ApplicationActive
         property bool ringing: false
-        Timer { id: ringTimeout; interval: 30000; onTriggered: home.ringing = false }
+        Timer {
+            id: ringTimeout
+            interval: 30000
+            onTriggered: {
+                home.ringing = false
+                // The UI stopping must stop the phone too: without this
+                // the phone can keep ringing after the tile goes quiet.
+                // The explicit stop is idempotent if it already stopped.
+                AppController.ring(home.deviceId, false)
+            }
+        }
+        // Continuity Camera sessions are global, but the status string
+        // names the device it is for: only that device's tile may show
+        // (and cancel) the session as its own.
+        readonly property bool continuityBusyHere: AppController.continuityCameraBusy
+            && home.name.length > 0
+            && AppController.continuityCameraStatus.indexOf(home.name) >= 0
+        // Rows of the send queue belonging to this device.
+        readonly property int queueCountHere: {
+            let _c = sendQueueModel.count
+            let n = 0
+            for (let i = 0; i < sendQueueModel.count; i++) {
+                if (sendQueueModel.get(i).deviceId === home.deviceId)
+                    n++
+            }
+            return n
+        }
 
         spacing: Theme.gutter
         readonly property real sideWidth: Math.round(Math.min(450, Math.max(320, home.width * 0.34)))
@@ -745,12 +838,16 @@ Item {
                         readonly property real innerH: Math.max(20, height - bezel * 2)
                         readonly property real defaultCorner: width * 0.14
                         readonly property real rTl: home.screenData && home.screenData.corners
+                            && Number.isFinite(home.screenData.corners.tl)
                             ? Math.max(3, home.screenData.corners.tl * width) : defaultCorner
                         readonly property real rTr: home.screenData && home.screenData.corners
+                            && Number.isFinite(home.screenData.corners.tr)
                             ? Math.max(3, home.screenData.corners.tr * width) : defaultCorner
                         readonly property real rBr: home.screenData && home.screenData.corners
+                            && Number.isFinite(home.screenData.corners.br)
                             ? Math.max(3, home.screenData.corners.br * width) : defaultCorner
                         readonly property real rBl: home.screenData && home.screenData.corners
+                            && Number.isFinite(home.screenData.corners.bl)
                             ? Math.max(3, home.screenData.corners.bl * width) : defaultCorner
                         readonly property var phonePalette: Theme.phonePalette(home.deviceId)
                         // Hive keeps its own honey here too, whatever the phone's colors.
@@ -1317,6 +1414,11 @@ Item {
                     sideAlwaysAvailable: true
                     onSideClicked: {
                         clipboardSearch.text = ""
+                        // Capture the device the sheet was opened from:
+                        // its Send actions must go there even if the user
+                        // switches devices while the sheet is open.
+                        clipboardSheet.deviceId = home.deviceId
+                        clipboardSheet.deviceName = home.name
                         clipboardSheet.open()
                     }
                 }
@@ -1363,11 +1465,11 @@ Item {
                 onAccepted: TransferList.send(home.deviceId, [selectedFolder.toString()])
             }
 
-            // ---- Waiting to send ----
+            // ---- Waiting to send (this device's rows only) ----
             Card {
                 id: sendQueueCard
                 width: parent.width
-                visible: sendQueueModel.count > 0
+                visible: home.queueCountHere > 0
                 opacity: visible ? 1 : 0
                 Behavior on opacity {
                     enabled: !Theme.reduceMotion && !page.resizing
@@ -1388,8 +1490,8 @@ Item {
                             anchors.verticalCenter: parent.verticalCenter
                             role: "label"
                             muted: true
-                            text: page.sendQueueWaiting > 0
-                                  ? qsTr("Waiting to send · %1").arg(page.sendQueueWaiting)
+                            text: page.queueWaitingHere > 0
+                                  ? qsTr("Waiting to send · %1").arg(page.queueWaitingHere)
                                   : qsTr("Waiting to send")
                         }
                         Row {
@@ -1405,11 +1507,16 @@ Item {
                                 onClicked: TransferList.clearFinishedQueue()
                             }
                             Button {
-                                visible: TransferList.waitingCount > 0
+                                visible: page.queueWaitingHere > 0
                                 variant: "text"
                                 size: "sm"
                                 text: qsTr("Cancel all")
-                                onClicked: TransferList.cancelAllQueued("")
+                                onClicked: {
+                                    page.confirmCancelAllDeviceId = home.deviceId
+                                    page.confirmCancelAllDeviceName = home.name
+                                    page.confirmCancelAllCount = page.queueWaitingHere
+                                    cancelAllConfirmSheet.open()
+                                }
                             }
                         }
                     }
@@ -1430,6 +1537,11 @@ Item {
                                 id: queueRow
                                 required property var model
                                 width: sendQueueList.width
+                                // Rows for other devices are hidden (and
+                                // take no space) instead of being mixed
+                                // into this device's card.
+                                visible: (queueRow.model.deviceId || "") === home.deviceId
+                                height: visible ? implicitHeight : 0
                                 implicitHeight: queueItemCol.height + 18
 
                                 readonly property string itemStatus: queueRow.model.status || "waiting"
@@ -1537,11 +1649,13 @@ Item {
                                         spacing: 4
                                         IconButton {
                                             visible: queueRow.isFailedOrExpired
+                                            enabled: !(queueRow.model.queueId || "").startsWith("local-")
                                             iconPath: Icons.refresh
                                             label: qsTr("Retry")
                                             onClicked: TransferList.retryQueueItem(queueRow.model.queueId)
                                         }
                                         IconButton {
+                                            enabled: !(queueRow.model.queueId || "").startsWith("local-")
                                             iconPath: Icons.close
                                             label: queueRow.isFailedOrExpired ? qsTr("Dismiss") : qsTr("Cancel")
                                             onClicked: TransferList.cancelQueueItem(queueRow.model.queueId)
@@ -1613,7 +1727,7 @@ Item {
             // ---- LocalSend nearby ----
             LocalSendCard {
                 width: parent.width
-                visible: AppController.localsendEnabled && page.localsendPeers.length > 0
+                visible: AppController.localsendEnabled && (page.localsendPeers.length > 0 || page.localsendParseFailed)
             }
 
             // ---- Notifications ----
@@ -1657,15 +1771,21 @@ Item {
                             size: "sm"
                             iconPath: Icons.close
                             text: qsTr("Clear all")
-                            onClicked: NotificationList.dismissAll(home.deviceId)
+                            onClicked: {
+                        page.undoDeviceId = home.deviceId
+                        NotificationList.dismissAll(home.deviceId)
+                    }
                         }
                     }
                     // Calm inline Undo bar after dismissing a notification or app group.
+                    // Another phone's feed never shows this phone's Undo bar;
+                    // an empty owner means "dismissed from elsewhere".
                     Rectangle {
                         id: undoBanner
                         width: parent.width
                         height: undoRow.height + 16
                         visible: NotificationList.undoLabel.length > 0
+                            && (page.undoDeviceId.length === 0 || page.undoDeviceId === home.deviceId)
                         radius: Theme.radiusMd
                         color: Theme.graphite ? "transparent" : Theme.surfaceContainerHigh
                         border.width: Theme.graphite ? 1 : 0
@@ -1682,6 +1802,8 @@ Item {
                             function onUndoLabelChanged() {
                                 if (NotificationList.undoLabel.length > 0)
                                     undoTimer.restart()
+                                else
+                                    page.undoDeviceId = ""
                             }
                         }
                         Row {
@@ -2204,19 +2326,24 @@ Item {
                     queueableWhenOffline: true
                     accented: true
                     title: qsTr("Continuity Camera")
-                    subtitle: AppController.continuityCameraBusy
+                    // The session is global, but only the device named in
+                    // the status string may show (and cancel) it as its own;
+                    // other devices' tiles keep offering Scan. Starting a
+                    // session from here is unchanged (the backend picks
+                    // the device); per-device scoping needs backend work.
+                    subtitle: home.continuityBusyHere
                               ? AppController.continuityCameraStatus
                               : ""
                     iconPath: Icons.camera
                     feature: home.feature("camera.continuity")
-                    active: AppController.continuityCameraBusy
+                    active: home.continuityBusyHere
                     onClicked: AppController.startContinuityCamera("photo")
-                    sideIcon: AppController.continuityCameraBusy ? Icons.close : Icons.scan
-                    sideLabel: AppController.continuityCameraBusy
+                    sideIcon: home.continuityBusyHere ? Icons.close : Icons.scan
+                    sideLabel: home.continuityBusyHere
                                ? qsTr("Cancel")
                                : qsTr("Scan document")
                     onSideClicked: {
-                        if (AppController.continuityCameraBusy)
+                        if (home.continuityBusyHere)
                             AppController.cancelContinuityCamera()
                         else
                             AppController.startContinuityCamera("scan")
@@ -2252,7 +2379,10 @@ Item {
                 width: parent.width
                 readonly property var remoteInputFeature: home.feature("mirroring.control")
                 readonly property bool available: remoteInputFeature.state === "available"
-                readonly property bool canStart: home.online
+                // Start requires the capability gate too: online-only let
+                // the button show while the LockChip said remote input
+                // was locked.
+                readonly property bool canStart: home.online && typeOnPhoneCard.available
                 readonly property bool activeHere: Mirror.keyboardDevice === home.deviceId
                 property string lastSent: ""
 
@@ -2314,7 +2444,9 @@ Item {
                                         ? (typeOnPhoneCard.lastSent.length > 0
                                             ? qsTr("Sent: %1").arg(typeOnPhoneCard.lastSent)
                                             : qsTr("Listening for keys"))
-                                        : qsTr("When connected")
+                                        : (home.online && !typeOnPhoneCard.available
+                                            ? qsTr("Remote input unavailable")
+                                            : qsTr("When connected"))
                                 }
                             }
                         }
@@ -2637,7 +2769,10 @@ Item {
                     variant: "text"
                     size: "sm"
                     text: qsTr("Clear history")
-                    onClicked: NotificationList.clearHistory()
+                    onClicked: {
+                        page.confirmClearKind = "notifications"
+                        clearConfirmSheet.open()
+                    }
                 }
             }
             Txt {
@@ -2742,8 +2877,91 @@ Item {
     }
 
     Sheet {
+        id: cancelAllConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt { text: qsTr("Cancel all waiting sends?"); role: "headline" }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("This cancels %1 waiting send(s) to %2. This cannot be undone.")
+                    .arg(page.confirmCancelAllCount).arg(page.confirmCancelAllDeviceName)
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Keep sending"); onClicked: cancelAllConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Cancel all")
+                    onClicked: {
+                        const id = page.confirmCancelAllDeviceId
+                        cancelAllConfirmSheet.close()
+                        if (id.length > 0)
+                            TransferList.cancelAllQueued(id)
+                    }
+                }
+            }
+        }
+    }
+
+    Sheet {
+        id: clearConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt {
+                text: page.confirmClearKind === "clip"
+                    ? qsTr("Delete this clip?")
+                    : page.confirmClearKind === "clipboard"
+                        ? qsTr("Clear clipboard history?")
+                        : qsTr("Clear notification history?")
+                role: "headline"
+            }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: page.confirmClearKind === "clip"
+                    ? qsTr("This clip will be removed. This cannot be undone.")
+                    : qsTr("This cannot be undone.")
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: clearConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: page.confirmClearKind === "clip" ? qsTr("Delete") : qsTr("Clear")
+                    onClicked: {
+                        const kind = page.confirmClearKind
+                        const clipId = page.confirmClearClipId
+                        clearConfirmSheet.close()
+                        if (kind === "notifications")
+                            NotificationList.clearHistory()
+                        else if (kind === "clipboard")
+                            AppController.clearClipboardHistory()
+                        else if (kind === "clip" && clipId.length > 0)
+                            AppController.deleteClipboardHistory(clipId)
+                    }
+                }
+            }
+        }
+    }
+
+    Sheet {
         id: clipboardSheet
         cardWidth: 560
+        // The device the sheet was opened from; Send/Open actions use
+        // this, not whatever device is current when the button is tapped.
+        property string deviceId: ""
+        property string deviceName: ""
         readonly property var items: {
             if (!clipboardSheet.opened)
                 return []
@@ -2759,7 +2977,14 @@ Item {
             Item {
                 width: parent.width
                 height: Math.max(clipboardTitle.height, clearClipboard.height)
-                Txt { id: clipboardTitle; anchors.verticalCenter: parent.verticalCenter; text: qsTr("Clipboard history"); role: "headline" }
+                Txt {
+                    id: clipboardTitle
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: clipboardSheet.deviceName.length > 0
+                        ? qsTr("Clipboard history · %1").arg(clipboardSheet.deviceName)
+                        : qsTr("Clipboard history")
+                    role: "headline"
+                }
                 Button {
                     id: clearClipboard
                     anchors.right: parent.right
@@ -2768,7 +2993,10 @@ Item {
                     variant: "text"
                     size: "sm"
                     text: qsTr("Clear history")
-                    onClicked: AppController.clearClipboardHistory()
+                    onClicked: {
+                        page.confirmClearKind = "clipboard"
+                        clearConfirmSheet.open()
+                    }
                 }
             }
             Txt {
@@ -2928,24 +3156,26 @@ Item {
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 4
                                 IconButton {
-                                    visible: page.currentDeviceId.length > 0
+                                    visible: clipboardSheet.deviceId.length > 0
                                              && clipRow.modelData.kind === "text"
                                              && Boolean(clipRow.modelData.text)
                                              && AppController.isHandoffText(clipRow.modelData.text)
                                     iconPath: Icons.globe
                                     label: qsTr("Open on phone")
                                     onClicked: {
+                                        const target = clipboardSheet.deviceId
                                         clipboardSheet.close()
-                                        AppController.openLinkOnPhone(page.currentDeviceId, clipRow.modelData.text)
+                                        AppController.openLinkOnPhone(target, clipRow.modelData.text)
                                     }
                                 }
                                 IconButton {
-                                    visible: page.currentDeviceId.length > 0
+                                    visible: clipboardSheet.deviceId.length > 0
                                     iconPath: Icons.send
                                     label: qsTr("Send to phone")
                                     onClicked: {
+                                        const target = clipboardSheet.deviceId
                                         clipboardSheet.close()
-                                        AppController.sendClipboardHistory(page.currentDeviceId, clipRow.modelData.id)
+                                        AppController.sendClipboardHistory(target, clipRow.modelData.id)
                                     }
                                 }
                                 IconButton {
@@ -2962,7 +3192,11 @@ Item {
                                 IconButton {
                                     iconPath: Icons.trash
                                     label: qsTr("Delete")
-                                    onClicked: AppController.deleteClipboardHistory(clipRow.modelData.id)
+                                    onClicked: {
+                                        page.confirmClearKind = "clip"
+                                        page.confirmClearClipId = clipRow.modelData.id
+                                        clearConfirmSheet.open()
+                                    }
                                 }
                             }
                         }
@@ -3006,7 +3240,10 @@ Item {
         readonly property bool available: (feature.state === "available"
                                            || feature.state === "partial"
                                            || (playableWhenAddonMissing && feature.state === "locked" && feature.action === "enableAddon")
-                                           || (queueableWhenOffline && (!tile.deviceOnline || feature.state === "unknown") && feature.state !== "locked" && feature.state !== "unsupported"))
+                                           // Offline queueing only when actually offline: an
+                                           // online tile with unknown capability state must
+                                           // not be clickable before the gate is known.
+                                           || (queueableWhenOffline && !tile.deviceOnline && feature.state !== "locked" && feature.state !== "unsupported"))
 
         height: (tile.subtitle.length > 0 || !tile.available) ? 96 : 82
         activeFocusOnTab: available
@@ -3421,9 +3658,11 @@ Item {
                 role: "bodySmall"
                 muted: true
                 wrapMode: Text.WordWrap
-                text: AppController.localsendReceiving
-                    ? qsTr("Listening for LocalSend devices on your Wi‑Fi network.")
-                    : qsTr("LocalSend port 53317 is busy on this PC (another LocalSend app may be running).")
+                text: page.localsendParseFailed
+                    ? qsTr("Couldn't load nearby devices. Try Refresh.")
+                    : AppController.localsendReceiving
+                        ? qsTr("Listening for LocalSend devices on your Wi‑Fi network.")
+                        : qsTr("LocalSend port 53317 is busy on this PC (another LocalSend app may be running).")
             }
             Repeater {
                 model: page.localsendPeers
@@ -3483,6 +3722,7 @@ Item {
                             text: qsTr("Send files")
                             onClicked: {
                                 localsendFilePicker.targetDeviceId = peerRow.modelData.id
+                                localsendFilePicker.targetDeviceName = peerRow.modelData.alias || peerRow.modelData.name || ""
                                 localsendFilePicker.open()
                             }
                         }
@@ -3554,6 +3794,12 @@ Item {
                     variant: "tonal"
                     iconPath: Icons.photo
                     text: qsTr("Open externally")
+                    // Only web and image-data URLs may leave the app: a
+                    // crafted notification image must not open an app
+                    // handler or local file from this button.
+                    visible: imagePreviewSheet.imageUrl.indexOf("http://") === 0
+                        || imagePreviewSheet.imageUrl.indexOf("https://") === 0
+                        || imagePreviewSheet.imageUrl.indexOf("data:image/") === 0
                     onClicked: Qt.openUrlExternally(imagePreviewSheet.imageUrl)
                 }
                 Button {

@@ -53,8 +53,15 @@ QtObject {
     readonly property var bloomSeeds: Tokens.data.themes.bloom.seeds
     // Colors made from the desktop wallpaper (or null until they're known),
     // in the shape of a preset seed.
-    readonly property var wallpaperSeed: AppController.wallpaperColors !== ""
-        ? JSON.parse(AppController.wallpaperColors) : null
+    readonly property var wallpaperSeed: {
+        if (AppController.wallpaperColors === "")
+            return null
+        try {
+            return JSON.parse(AppController.wallpaperColors)
+        } catch (e) {
+            return null
+        }
+    }
     // Material You color scheme extracted from the currently playing media artwork.
     readonly property var artworkSeed: {
         if (MediaList.activeColors === "")
@@ -70,8 +77,16 @@ QtObject {
     readonly property bool artworkAmbientActive: false
     readonly property bool ambientBlurActive: glass
     // Material You color schemes from paired phones (`[{ id, key, name, label, hasAccent, scheme }]`).
-    readonly property var phoneSeeds: AppController.phoneColors !== ""
-        ? JSON.parse(AppController.phoneColors) : []
+    readonly property var phoneSeeds: {
+        if (AppController.phoneColors === "")
+            return []
+        try {
+            const parsed = JSON.parse(AppController.phoneColors)
+            return Array.isArray(parsed) ? parsed : []
+        } catch (e) {
+            return []
+        }
+    }
     readonly property bool isPhoneSeed: Preferences.seed === "phone" || Preferences.seed.startsWith("phone:")
     readonly property var activePhoneSeed: {
         if (!isPhoneSeed)

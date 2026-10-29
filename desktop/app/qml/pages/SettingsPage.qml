@@ -28,7 +28,14 @@ Item {
     ]
 
     // The languages the app speaks besides the system's ({ code, name }).
-    readonly property var languages: { try { return JSON.parse(Preferences.languages()) } catch (e) { return [] } }
+    readonly property var languages: {
+        try {
+            const parsed = JSON.parse(Preferences.languages())
+            return Array.isArray(parsed) ? parsed : []
+        } catch (e) {
+            return []
+        }
+    }
     readonly property var activeCategoryObj: {
         for (let i = 0; i < categories.length; i++) {
             if (categories[i].id === page.currentSection)
@@ -73,6 +80,111 @@ Item {
         default: return (a || "").replace(/_/g, " ")
         }
     }
+
+    // Transient shortcut feedback ("already in use", "can't be used").
+    property string hotkeyHint: ""
+    Timer {
+        id: hotkeyHintTimer
+        interval: 2500
+        repeat: false
+        onTriggered: page.hotkeyHint = ""
+    }
+    function showHotkeyHint(msg) {
+        page.hotkeyHint = msg
+        hotkeyHintTimer.restart()
+    }
+
+    // Canonicalise free-typed text ("ctrl+alt+c", "Ctrl + Alt + C") to
+    // the formatKeyCombo form, or "" when it is not a valid shortcut
+    // (needs a modifier and an A-Z / 0-9 / F1-F12 / Space key).
+    function normalizeHotkey(text) {
+        const parts = String(text || "").split("+").map(p => p.trim()).filter(p => p.length > 0)
+        if (parts.length < 2)
+            return ""
+        const mods = []
+        let key = ""
+        for (let i = 0; i < parts.length; i++) {
+            const p = parts[i].toLowerCase()
+            if (p === "ctrl" || p === "control") { if (mods.indexOf("Ctrl") < 0) mods.push("Ctrl") }
+            else if (p === "alt") { if (mods.indexOf("Alt") < 0) mods.push("Alt") }
+            else if (p === "shift") { if (mods.indexOf("Shift") < 0) mods.push("Shift") }
+            else if (p === "super" || p === "win" || p === "meta") {
+                const meta = Qt.platform.os === "linux" ? "Super" : "Win"
+                if (mods.indexOf(meta) < 0) mods.push(meta)
+            }
+            else if (key.length === 0) key = parts[i]
+            else return ""
+        }
+        if (mods.length === 0 || key.length === 0)
+            return ""
+        const k = key.toLowerCase()
+        let keyName = ""
+        if (k === "space") keyName = "Space"
+        else if (/^[a-z0-9]$/.test(k)) keyName = k.toUpperCase()
+        else if (/^f([1-9]|1[0-2])$/.test(k)) keyName = "F" + parseInt(k.slice(1), 10)
+        else return ""
+        const order = ["Ctrl", "Alt", "Shift", "Super", "Win"]
+        mods.sort((a, b) => order.indexOf(a) - order.indexOf(b))
+        return mods.join("+") + "+" + keyName
+    }
+
+    function isHotkeyTaken(combo, exceptStored) {
+        const all = [Preferences.commandPaletteHotkey, Preferences.shelfHotkey,
+                     Preferences.continuityPhotoHotkey, Preferences.continuityScanHotkey]
+        for (let i = 0; i < all.length; i++) {
+            if (all[i] === combo && all[i] !== exceptStored)
+                return true
+        }
+        return false
+    }
+
+    // Free-typed edit commit: store the normalised combo, or revert the
+    // field to the stored preference when invalid or already in use.
+    function applyHotkeyEdit(field, prefKey, stored) {
+        const norm = page.normalizeHotkey(field.text)
+        if (norm.length === 0) {
+            field.text = stored
+            return
+        }
+        if (page.isHotkeyTaken(norm, stored)) {
+            field.text = stored
+            page.showHotkeyHint(qsTr("That shortcut is already in use."))
+            return
+        }
+        field.text = norm
+        Preferences[prefKey] = norm
+    }
+
+    // DCIM → Pictures destination ("" when it cannot be computed) and
+    // whether an identical rule already exists.
+    function dcimDestination() {
+        const rec = Preferences.recordingsFolder || ""
+        if (rec.indexOf("/") < 0 && rec.indexOf("\\") < 0)
+            return ""
+        const parent = rec.replace(/[\\\/][^\\\/]+[\\\/]?$/, "")
+        if (parent.length === 0)
+            return ""
+        return parent + "/Pictures/Phone Camera"
+    }
+    function dcimRuleExists(dest) {
+        if (dest.length === 0)
+            return false
+        try {
+            const rules = JSON.parse(Preferences.folderSyncRulesJson || "[]")
+            for (let i = 0; i < rules.length; i++) {
+                if (rules[i].phoneFolder === "DCIM/Camera" && rules[i].pcFolder === dest)
+                    return true
+            }
+        } catch (e) {
+        }
+        return false
+    }
+
+    // Pending destructive confirmations (one sheet serves them all).
+    property string pendingClearKind: ""
+    property string pendingRemoveKind: ""
+    property string pendingRemoveId: ""
+    property string pendingRemoveLabel: ""
 
     function formatKeyCombo(event) {
         if (event.key === Qt.Key_Control || event.key === Qt.Key_Shift
@@ -142,9 +254,11 @@ Item {
     }
 
     function formatRetentionBytes(bytes) {
-        const b = Number(bytes || 0)
+        const b = Number(bytes)
         const locale = Qt.locale()
-        if (b <= 0)
+        // A non-numeric value used to fall through every comparison and
+        // render as "NaN TB".
+        if (!Number.isFinite(b) || b <= 0)
             return qsTr("%1 B").arg(0)
         if (b < 1024)
             return qsTr("%1 B").arg(b)
@@ -1415,7 +1529,13 @@ Item {
                                     onClicked: {
                                         hotspotSheet.deviceId = deviceCard.deviceId
                                         hotspotSheet.row = hotspotRow
-                                        hotspotSheet.networks = JSON.parse(AppController.wifiNetworks() || "[]")
+                                        // A malformed networks payload must not
+                                        // keep the sheet from opening at all.
+                                        try {
+                                            hotspotSheet.networks = JSON.parse(AppController.wifiNetworks() || "[]")
+                                        } catch (e) {
+                                            hotspotSheet.networks = []
+                                        }
                                         hotspotSheet.open()
                                     }
                                 }
@@ -1742,7 +1862,16 @@ Item {
                                     size: "sm"
                                     enabled: !Webcam.addonBusy
                                     text: Webcam.addonRegistered ? qsTr("Remove") : qsTr("Set up")
-                                    onClicked: Webcam.addonRegistered ? Webcam.removeAddon() : Webcam.setupAddon()
+                                    onClicked: {
+                                        if (Webcam.addonRegistered) {
+                                            page.pendingRemoveKind = "vcam"
+                                            page.pendingRemoveId = ""
+                                            page.pendingRemoveLabel = qsTr("Virtual camera")
+                                            removeConfirmSheet.open()
+                                        } else {
+                                            Webcam.setupAddon()
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1837,10 +1966,21 @@ Item {
                             title: qsTr("Resolution")
                             Segmented {
                                 // 4K only when the phone's camera in use can stream it.
-                                options: [
-                                    { value: "720", label: "720p" },
-                                    { value: "1080", label: "1080p" }
-                                ].concat(Webcam.uhd ? [{ value: "2160", label: "4K" }] : [])
+                                // The current height is appended when it
+                                // matches no listed option, so the control
+                                // always shows a selection.
+                                options: {
+                                    const opts = [
+                                        { value: "720", label: "720p" },
+                                        { value: "1080", label: "1080p" }
+                                    ]
+                                    if (Webcam.uhd)
+                                        opts.push({ value: "2160", label: "4K" })
+                                    const cur = String(Webcam.height)
+                                    if (Webcam.height > 0 && !opts.some(o => o.value === cur))
+                                        opts.push({ value: cur, label: cur + "p" })
+                                    return opts
+                                }
                                 value: String(Webcam.height)
                                 onPicked: (value) => Webcam.setResolution(Number(value))
                             }
@@ -2213,9 +2353,14 @@ Item {
                                 }
                                 ListRow {
                                     width: parent.width
-                                    visible: Boolean(backupDelegate.modelData.enabled)
+                                    // Always shown: hiding it until backup
+                                    // is enabled left no way to pick the
+                                    // folder first, and an empty folder
+                                    // rendered as a blank title.
                                     iconPath: Icons.folder
-                                    title: backupDelegate.modelData.folder
+                                    title: (backupDelegate.modelData.folder || "").length > 0
+                                        ? backupDelegate.modelData.folder
+                                        : qsTr("Choose a folder first")
                                     description: qsTr("Backup folder")
                                     Row {
                                         spacing: 8
@@ -2291,7 +2436,14 @@ Item {
                                     size: "sm"
                                     iconPath: Icons.plus
                                     text: qsTr("Add DCIM → Pictures")
-                                    onClicked: Preferences.addFolderSyncRule("", "DCIM/Camera", Preferences.recordingsFolder.replace(/[\\\/][^\\\/]+[\\\/]?$/, "") + "/Pictures/Phone Camera", false)
+                                    // An empty device id is a backend no-op,
+                                    // and an identical rule would duplicate:
+                                    // both disable the button instead of
+                                    // silently doing nothing (or doubling).
+                                    enabled: DeviceList.count > 0
+                                        && page.dcimDestination().length > 0
+                                        && !page.dcimRuleExists(page.dcimDestination())
+                                    onClicked: Preferences.addFolderSyncRule(DeviceList.deviceIdAt(0), "DCIM/Camera", page.dcimDestination(), false)
                                 }
                             }
                         }
@@ -2315,7 +2467,12 @@ Item {
                                             size: "sm"
                                             iconPath: Icons.trash
                                             text: qsTr("Remove")
-                                            onClicked: Preferences.removeFolderSyncRule(syncRuleDelegate.modelData.id)
+                                            onClicked: {
+                                                page.pendingRemoveKind = "folder"
+                                                page.pendingRemoveId = syncRuleDelegate.modelData.id
+                                                page.pendingRemoveLabel = syncRuleDelegate.modelData.phoneFolder + " → " + syncRuleDelegate.modelData.pcFolder
+                                                removeConfirmSheet.open()
+                                            }
                                         }
                                         Toggle {
                                             anchors.verticalCenter: parent.verticalCenter
@@ -2400,12 +2557,18 @@ Item {
                                             Keys.onPressed: (event) => {
                                                 const combo = page.formatKeyCombo(event)
                                                 if (combo.length > 0) {
-                                                    text = combo
-                                                    Preferences.commandPaletteHotkey = combo
+                                                    if (page.isHotkeyTaken(combo, Preferences.commandPaletteHotkey))
+                                                        page.showHotkeyHint(qsTr("That shortcut is already in use."))
+                                                    else {
+                                                        text = combo
+                                                        Preferences.commandPaletteHotkey = combo
+                                                    }
                                                     event.accepted = true
+                                                } else if (event.modifiers !== 0) {
+                                                    page.showHotkeyHint(qsTr("That key can't be used as a shortcut."))
                                                 }
                                             }
-                                            onEditingFinished: Preferences.commandPaletteHotkey = text.trim()
+                                            onEditingFinished: page.applyHotkeyEdit(paletteHotkeyInput, "commandPaletteHotkey", Preferences.commandPaletteHotkey)
                                             Accessible.name: qsTr("Command palette shortcut")
                                         }
                                     }
@@ -2475,12 +2638,18 @@ Item {
                                             Keys.onPressed: (event) => {
                                                 const combo = page.formatKeyCombo(event)
                                                 if (combo.length > 0) {
-                                                    text = combo
-                                                    Preferences.shelfHotkey = combo
+                                                    if (page.isHotkeyTaken(combo, Preferences.shelfHotkey))
+                                                        page.showHotkeyHint(qsTr("That shortcut is already in use."))
+                                                    else {
+                                                        text = combo
+                                                        Preferences.shelfHotkey = combo
+                                                    }
                                                     event.accepted = true
+                                                } else if (event.modifiers !== 0) {
+                                                    page.showHotkeyHint(qsTr("That key can't be used as a shortcut."))
                                                 }
                                             }
-                                            onEditingFinished: Preferences.shelfHotkey = text.trim()
+                                            onEditingFinished: page.applyHotkeyEdit(shelfHotkeyInput, "shelfHotkey", Preferences.shelfHotkey)
                                             Accessible.name: qsTr("Shelf shortcut")
                                         }
                                     }
@@ -2546,12 +2715,18 @@ Item {
                                             Keys.onPressed: (event) => {
                                                 const combo = page.formatKeyCombo(event)
                                                 if (combo.length > 0) {
-                                                    text = combo
-                                                    Preferences.continuityPhotoHotkey = combo
+                                                    if (page.isHotkeyTaken(combo, Preferences.continuityPhotoHotkey))
+                                                        page.showHotkeyHint(qsTr("That shortcut is already in use."))
+                                                    else {
+                                                        text = combo
+                                                        Preferences.continuityPhotoHotkey = combo
+                                                    }
                                                     event.accepted = true
+                                                } else if (event.modifiers !== 0) {
+                                                    page.showHotkeyHint(qsTr("That key can't be used as a shortcut."))
                                                 }
                                             }
-                                            onEditingFinished: Preferences.continuityPhotoHotkey = text.trim()
+                                            onEditingFinished: page.applyHotkeyEdit(photoHotkeyInput, "continuityPhotoHotkey", Preferences.continuityPhotoHotkey)
                                             Accessible.name: qsTr("Take photo shortcut")
                                         }
                                     }
@@ -2621,17 +2796,31 @@ Item {
                                             Keys.onPressed: (event) => {
                                                 const combo = page.formatKeyCombo(event)
                                                 if (combo.length > 0) {
-                                                    text = combo
-                                                    Preferences.continuityScanHotkey = combo
+                                                    if (page.isHotkeyTaken(combo, Preferences.continuityScanHotkey))
+                                                        page.showHotkeyHint(qsTr("That shortcut is already in use."))
+                                                    else {
+                                                        text = combo
+                                                        Preferences.continuityScanHotkey = combo
+                                                    }
                                                     event.accepted = true
+                                                } else if (event.modifiers !== 0) {
+                                                    page.showHotkeyHint(qsTr("That key can't be used as a shortcut."))
                                                 }
                                             }
-                                            onEditingFinished: Preferences.continuityScanHotkey = text.trim()
+                                            onEditingFinished: page.applyHotkeyEdit(scanHotkeyInput, "continuityScanHotkey", Preferences.continuityScanHotkey)
                                             Accessible.name: qsTr("Scan document shortcut")
                                         }
                                     }
                                 }
                             }
+                        }
+                        Txt {
+                            visible: page.hotkeyHint.length > 0
+                            width: parent.width
+                            role: "bodySmall"
+                            color: Theme.error
+                            wrapMode: Text.WordWrap
+                            text: page.hotkeyHint
                         }
                     }
                 }
@@ -2685,7 +2874,12 @@ Item {
                                             size: "sm"
                                             iconPath: Icons.trash
                                             text: qsTr("Remove")
-                                            onClicked: Preferences.removeAutomationRule(autoRuleDelegate.modelData.id)
+                                            onClicked: {
+                                                page.pendingRemoveKind = "automation"
+                                                page.pendingRemoveId = autoRuleDelegate.modelData.id
+                                                page.pendingRemoveLabel = page.formatTrigger(autoRuleDelegate.modelData.trigger) + " → " + page.formatAction(autoRuleDelegate.modelData.actionKind)
+                                                removeConfirmSheet.open()
+                                            }
                                         }
                                         Toggle {
                                             anchors.verticalCenter: parent.verticalCenter
@@ -2790,7 +2984,16 @@ Item {
                                 size: "sm"
                                 text: qsTr("Save")
                                 onClicked: {
-                                    Preferences.saveObs(parseInt(obsPortEdit.text) || Preferences.obsPort(),
+                                    // An invalid port used to be silently
+                                    // replaced by the stored port (the
+                                    // backend toasts, but the field kept
+                                    // showing the bad value). Revert the
+                                    // field so what is shown is stored.
+                                    const port = parseInt(obsPortEdit.text)
+                                    const valid = Number.isFinite(port) && port >= 1024 && port <= 65535
+                                    if (!valid)
+                                        obsPortEdit.text = String(Preferences.obsPort())
+                                    Preferences.saveObs(valid ? port : Preferences.obsPort(),
                                                         obsPasswordEdit.text, obsPasswordEdit.text.length > 0)
                                     obsPasswordEdit.text = ""
                                     obsCard.hasPassword = Preferences.obsHasPassword()
@@ -2800,7 +3003,18 @@ Item {
                                 size: "sm"
                                 variant: "tonal"
                                 text: qsTr("Test connection")
-                                onClicked: Preferences.testObs()
+                                onClicked: {
+                                    // Test must test the displayed port,
+                                    // not the previously saved one: save
+                                    // it first (without touching the
+                                    // saved password), then test.
+                                    const port = parseInt(obsPortEdit.text)
+                                    if (!Number.isFinite(port) || port < 1024 || port > 65535)
+                                        obsPortEdit.text = String(Preferences.obsPort())
+                                    else
+                                        Preferences.saveObs(port, "", false)
+                                    Preferences.testObs()
+                                }
                             }
                             Button {
                                 size: "sm"
@@ -2861,8 +3075,8 @@ Item {
                                         size: "sm"
                                         text: qsTr("Clear")
                                         onClicked: {
-                                            AppController.clearClipboardHistory()
-                                            AppController.refreshDataRetention()
+                                            page.pendingClearKind = "clipboard"
+                                            clearConfirmSheet.open()
                                         }
                                     }
                                     Toggle {
@@ -2915,7 +3129,10 @@ Item {
                                         variant: "text"
                                         size: "sm"
                                         text: qsTr("Clear")
-                                        onClicked: AppController.clearNotificationHistory()
+                                        onClicked: {
+                                            page.pendingClearKind = "notifications"
+                                            clearConfirmSheet.open()
+                                        }
                                     }
                                     Toggle {
                                         anchors.verticalCenter: parent.verticalCenter
@@ -2952,8 +3169,8 @@ Item {
                                     size: "sm"
                                     text: qsTr("Clear")
                                     onClicked: {
-                                        TimelineModel.clearAll()
-                                        AppController.refreshDataRetention()
+                                        page.pendingClearKind = "timeline"
+                                        clearConfirmSheet.open()
                                     }
                                 }
                                 Button {
@@ -3008,7 +3225,10 @@ Item {
                                          || Number(page.retentionSummary.cachedSmsMessages || 0) > 0
                                          || Number(page.retentionSummary.messageAttachmentBytes || 0) > 0
                                 text: qsTr("Clear")
-                                onClicked: AppController.clearMessageCache()
+                                onClicked: {
+                                    page.pendingClearKind = "messages"
+                                    clearConfirmSheet.open()
+                                }
                             }
                         }
                         Divider { width: parent.width }
@@ -3039,7 +3259,10 @@ Item {
                                     size: "sm"
                                     visible: Number(page.retentionSummary.photoThumbFiles || 0) > 0
                                     text: qsTr("Clear")
-                                    onClicked: AppController.clearPhotoThumbnails()
+                                    onClicked: {
+                                        page.pendingClearKind = "photos"
+                                        clearConfirmSheet.open()
+                                    }
                                 }
                             }
 
@@ -3076,7 +3299,10 @@ Item {
                                     size: "sm"
                                     visible: Number(page.retentionSummary.receivedFileRecords || 0) > 0
                                     text: qsTr("Clear")
-                                    onClicked: AppController.clearReceivedFileHistory()
+                                    onClicked: {
+                                        page.pendingClearKind = "received"
+                                        clearConfirmSheet.open()
+                                    }
                                 }
                             }
                         }
@@ -3347,7 +3573,13 @@ Item {
                     if (sec === "camera") sec = "camera_audio"
                     else if (sec === "clipboard") sec = "files_sync"
                     else if (sec === "surfaces" || sec === "automation") sec = "shortcuts"
-                    page.currentSection = sec
+                    // An unknown section used to render an empty pane;
+                    // fall back to the first category instead.
+                    let known = false
+                    for (let i = 0; i < page.categories.length; i++) {
+                        if (page.categories[i].id === sec) { known = true; break }
+                    }
+                    page.currentSection = known ? sec : page.categories[0].id
                 }
             }
         }
@@ -3518,6 +3750,103 @@ Item {
     }
 
     Sheet {
+        id: clearConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt {
+                text: page.pendingClearKind === "clipboard" ? qsTr("Clear clipboard history?")
+                    : page.pendingClearKind === "notifications" ? qsTr("Clear notification history?")
+                    : page.pendingClearKind === "timeline" ? qsTr("Clear Timeline?")
+                    : page.pendingClearKind === "messages" ? qsTr("Clear cached messages?")
+                    : page.pendingClearKind === "photos" ? qsTr("Clear photo thumbnails?")
+                    : qsTr("Clear received-file history?")
+                role: "headline"
+            }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: qsTr("This cannot be undone.")
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: clearConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Clear")
+                    onClicked: {
+                        const kind = page.pendingClearKind
+                        clearConfirmSheet.close()
+                        if (kind === "clipboard")
+                            AppController.clearClipboardHistory()
+                        else if (kind === "notifications")
+                            AppController.clearNotificationHistory()
+                        else if (kind === "timeline")
+                            TimelineModel.clearAll()
+                        else if (kind === "messages")
+                            AppController.clearMessageCache()
+                        else if (kind === "photos")
+                            AppController.clearPhotoThumbnails()
+                        else if (kind === "received")
+                            AppController.clearReceivedFileHistory()
+                        // Only clipboard and Timeline refreshed before, so
+                        // the others left stale counts behind.
+                        AppController.refreshDataRetention()
+                    }
+                }
+            }
+        }
+    }
+
+    Sheet {
+        id: removeConfirmSheet
+        cardWidth: 400
+        Column {
+            width: parent.width
+            spacing: 14
+            Txt {
+                text: page.pendingRemoveKind === "vcam" ? qsTr("Remove virtual camera?")
+                    : page.pendingRemoveKind === "automation" ? qsTr("Remove automation rule?")
+                    : qsTr("Remove folder sync rule?")
+                role: "headline"
+            }
+            Txt {
+                width: parent.width
+                wrapMode: Text.WordWrap
+                role: "body"
+                muted: true
+                text: page.pendingRemoveKind === "vcam"
+                    ? qsTr("Restoring it later needs the one-time admin setup again.")
+                    : qsTr("This removes \"%1\". This cannot be undone.").arg(page.pendingRemoveLabel)
+            }
+            Row {
+                anchors.right: parent.right
+                spacing: 8
+                Button { variant: "text"; text: qsTr("Cancel"); onClicked: removeConfirmSheet.close() }
+                Button {
+                    variant: "fill"
+                    text: qsTr("Remove")
+                    onClicked: {
+                        const kind = page.pendingRemoveKind
+                        const id = page.pendingRemoveId
+                        removeConfirmSheet.close()
+                        if (kind === "folder" && id.length > 0)
+                            Preferences.removeFolderSyncRule(id)
+                        else if (kind === "automation" && id.length > 0)
+                            Preferences.removeAutomationRule(id)
+                        else if (kind === "vcam")
+                            Webcam.removeAddon()
+                    }
+                }
+            }
+        }
+    }
+
+    Sheet {
         id: clearEverythingSheet
         cardWidth: 420
         Column {
@@ -3545,6 +3874,7 @@ Item {
                     text: qsTr("Clear everything")
                     onClicked: {
                         AppController.clearEverything()
+                        AppController.refreshDataRetention()
                         clearEverythingSheet.close()
                     }
                 }

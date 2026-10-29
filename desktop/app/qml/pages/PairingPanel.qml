@@ -21,12 +21,25 @@ Item {
 
     onRunningChanged: {
         showNearby = false
-        if (running && state_ !== "comparing" && state_ !== "confirmed" && state_ !== "connecting")
+        if (running && state_ !== "comparing" && state_ !== "confirmed" && state_ !== "connecting") {
             Pairing.start()
+        } else if (!running) {
+            // Leaving the panel (walkthrough Back/Next/Skip/Done, sheet
+            // close) must end hosting: otherwise the PC stays in pairing
+            // mode until the core 5-minute TTL, and a phone reaching code
+            // comparison meanwhile has no visible comparison UI until
+            // its 120 s SAS timeout fails it. cancel() only returns to
+            // Idle; it never removes an already-paired device.
+            Pairing.cancel()
+        }
     }
     Component.onCompleted: {
         if (running && state_ !== "comparing" && state_ !== "confirmed" && state_ !== "connecting")
             Pairing.start()
+    }
+    Component.onDestruction: {
+        if (running)
+            Pairing.cancel()
     }
 
     // Leave the success message up briefly, then close.

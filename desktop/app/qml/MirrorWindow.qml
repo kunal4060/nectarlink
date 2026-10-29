@@ -19,6 +19,25 @@ Window {
     readonly property string deviceName: info.name || ""
     readonly property string phase: info.phase || ""
     readonly property bool canControl: info.canControl === true
+    // A control request already sent to the phone, awaiting its answer.
+    // Cleared when control is granted; the hint banner shows the pending
+    // state instead of looking identical to "never asked".
+    property bool controlRequestPending: false
+
+    function requestControlOnce() {
+        if (!controlRequestPending) {
+            controlRequestPending = true
+            Mirror.requestControl(win.mirrorKey)
+        }
+    }
+
+    onCanControlChanged: {
+        if (canControl) {
+            controlRequestPending = false
+        } else {
+            mirrorTouchArea.releaseTouch()
+        }
+    }
 
     visible: true
     title: info.app ? qsTr("%1 · %2").arg(info.title).arg(deviceName)
@@ -100,6 +119,7 @@ Window {
     onClosing: {
         if (info.app && sized)
             Mirror.saveGeometry(mirrorKey, x, y, width, height)
+        mirrorTouchArea.releaseTouch()
         Mirror.stop(mirrorKey)
     }
 
@@ -127,10 +147,10 @@ Window {
         DropArea {
             id: mirrorDropArea
             anchors.fill: parent
-            enabled: win.phase === "showing"
-            onEntered: (drag) => {
-                Mirror.syncClipboardOnFocus(win.mirrorKey)
-            }
+            // Drops only while controllable: merely hovering over the
+            // window must not sync the PC clipboard to the phone, and an
+            // actual drop still syncs explicitly below.
+            enabled: win.phase === "showing" && win.canControl
             onDropped: (drop) => {
                 const urls = []
                 if (drop.urls) {
@@ -161,18 +181,29 @@ Window {
 
         // The mouse: left is a finger, right is Back, middle is Home.
         MouseArea {
+            id: mirrorTouchArea
             anchors.fill: parent
             enabled: win.phase === "showing"
             acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
             cursorShape: win.canControl ? Qt.PointingHandCursor : Qt.ArrowCursor
             property bool down: false
             property double lastMove: 0
+            property real lastTouchX: 0
+            property real lastTouchY: 0
+            // Always lift the finger, even if control was revoked since
+            // the press: a gated "up" leaves the touch stuck down on the
+            // phone. Safe to call when nothing is down.
+            function releaseTouch() {
+                if (!down) return
+                down = false
+                Mirror.touch(win.mirrorKey, "up", lastTouchX, lastTouchY)
+            }
             onPressed: (mouse) => {
                 video.forceActiveFocus()
                 if (!win.canControl) {
                     hintClose.closed = false
                     hintPulse.restart()
-                    Mirror.requestControl(win.mirrorKey)
+                    win.requestControlOnce()
                     return
                 }
                 const p = video.at(mouse.x, mouse.y)
@@ -180,6 +211,8 @@ Window {
                 if (mouse.button === Qt.MiddleButton) { Mirror.press(win.mirrorKey, "home"); return }
                 if (!p.inside) return
                 down = true
+                lastTouchX = p.x
+                lastTouchY = p.y
                 Mirror.touch(win.mirrorKey, "down", p.x, p.y)
             }
             onPositionChanged: (mouse) => {
@@ -189,19 +222,18 @@ Window {
                 if (now - lastMove < 16) return
                 lastMove = now
                 const p = video.at(mouse.x, mouse.y)
+                lastTouchX = p.x
+                lastTouchY = p.y
                 Mirror.touch(win.mirrorKey, "move", p.x, p.y)
             }
             onReleased: (mouse) => {
-                if (!down) return
-                down = false
-                if (!win.canControl) return
-                const p = video.at(mouse.x, mouse.y)
-                Mirror.touch(win.mirrorKey, "up", p.x, p.y)
+                releaseTouch()
             }
+            onCanceled: releaseTouch()
             onWheel: (wheel) => {
                 if (!win.canControl) {
                     hintClose.closed = false
-                    Mirror.requestControl(win.mirrorKey)
+                    win.requestControlOnce()
                     return
                 }
                 const p = video.at(wheel.x, wheel.y)
@@ -305,6 +337,9 @@ Window {
         radius: 20
         color: Qt.rgba(0, 0, 0, 0.68)
         visible: win.phase === "showing" && video.frameSize.width > 0
+        // Faded out (opacity 0) is not gone: without this the invisible
+        // toolbar still hit-tests and swallows clicks meant for the phone.
+        enabled: toolbar.opacity > 0
         readonly property bool toolbarHasFocus: copyShotBtn.activeFocus || saveShotBtn.activeFocus
             || recordBtn.activeFocus || stayAwakeBtn.activeFocus || screenOffBtn.activeFocus || soundBtn.activeFocus
         opacity: topZoneHover.hovered || toolbarHover.hovered || toolbarWakeTimer.running
@@ -445,7 +480,12 @@ Window {
         anchors.margins: 12
         height: Math.max(hint.implicitHeight + 20, 48)
         radius: Theme.radiusMd
-        visible: win.phase === "showing" && video.frameSize.width > 0 && !win.canControl && !win.info.app && !hintClose.closed
+        // App windows used to get no banner at all while a control request
+        // was pending, so a denied press looked like nothing happened.
+        // They show the banner only while a request is pending; full-screen
+        // mirrors show it whenever control is not granted.
+        visible: win.phase === "showing" && video.frameSize.width > 0 && !win.canControl && !hintClose.closed
+            && (win.info.app ? win.controlRequestPending : true)
         color: Qt.rgba(0, 0, 0, 0.72)
 
         SequentialAnimation {
@@ -477,7 +517,9 @@ Window {
             wrapMode: Text.WordWrap
             role: "bodySmall"
             color: "white"
-            text: qsTr("To control the phone, turn on Control from your PC in NectarLink's settings on the phone.")
+            text: win.controlRequestPending
+                ? qsTr("Control request sent — waiting for the phone to allow it.")
+                : qsTr("To control the phone, turn on Control from your PC in NectarLink's settings on the phone.")
         }
         Button {
             id: notifyPhoneBtn
@@ -486,8 +528,9 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
             variant: "tonal"
             size: "sm"
-            text: qsTr("Notify phone")
-            onClicked: Mirror.requestControl(win.mirrorKey)
+            enabled: !win.controlRequestPending
+            text: win.controlRequestPending ? qsTr("Request sent") : qsTr("Notify phone")
+            onClicked: win.requestControlOnce()
         }
         IconButton {
             id: hintClose
