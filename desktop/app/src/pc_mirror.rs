@@ -106,7 +106,11 @@ mod imp {
             if openh264_enc_api().is_none() {
                 return false;
             }
-            let has_x11 = std::env::var_os("DISPLAY").is_some() && x11_api().is_some();
+            // Actually open the display instead of trusting DISPLAY +
+            // a loadable library: a set DISPLAY with no server used to
+            // count as available.
+            let has_x11 = std::env::var_os("DISPLAY").is_some()
+                && with_x11_display(|_, _| Some(())).is_some();
             has_x11 || is_wayland_screencast_available()
         }
     }
@@ -116,7 +120,11 @@ mod imp {
         ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| s.watching)
     }
 
-    /// Stops a phone watching one of this PC's players; screen sharing goes on.
+    /// Stops a phone watching one of this PC's players. That ends the
+    /// session: there is only one capture thread, and a watching session
+    /// is it, so there is no separate screen-sharing session to "go on"
+    /// (the old doc comment claimed otherwise; the sole caller is the
+    /// Play-on-phone toggle-off path, which wants the stream stopped).
     pub fn stop_watching() {
         let peer =
             ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().filter(|s| s.watching).map(|s| s.peer);
@@ -127,7 +135,34 @@ mod imp {
 
     /// Starts or replaces the active PC-to-phone screen mirror stream for `peer`.
     pub fn start(peer: DeviceId, options: MirrorStart) {
-        stop_all();
+        // Stop the old session synchronously (bounded wait) instead of
+        // stop_all()'s fire-and-forget mirror_stop: the old stop used to
+        // arrive after the new session's Config, tearing down the new
+        // stream on the phone.
+        let old_peer = {
+            let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.take().map(|s| {
+                s.stop.store(true, Ordering::SeqCst);
+                s.peer
+            })
+        };
+        if let Some(old) = old_peer {
+            win::input::release_held_buttons();
+            crate::input_share::leave_remote();
+            if let Some(node) = core_host::node() {
+                node.set_pc_mirror_session_allowed(old, false);
+                let runtime = &core_host::host().runtime;
+                let _ = runtime.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        node.mirror_stop(old, nectarlink_core::MIRROR_SCREEN),
+                    )
+                    .await
+                });
+            }
+            core_host::host().hub.changed(crate::state::Changes::REMOTE);
+            core_host::refresh_capabilities();
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let force_keyframe = Arc::new(AtomicBool::new(false));
         {
@@ -142,10 +177,17 @@ mod imp {
         core_host::host().hub.changed(crate::state::Changes::REMOTE);
         core_host::refresh_capabilities();
 
-        std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("nectarlink-pc-mirror".into())
             .spawn(move || run_capture_loop(peer, options, stop, force_keyframe))
-            .ok();
+        {
+            // A swallowed spawn failure used to leave a phantom
+            // "sharing" session with no frames ever sent.
+            tracing::error!(error = %e, "can't start the PC mirror capture thread");
+            cleanup_session_for(peer);
+            core_host::host().hub.changed(crate::state::Changes::REMOTE);
+            core_host::refresh_capabilities();
+        }
     }
 
     /// Stops PC-to-phone mirroring if `peer` matches the active viewer.
@@ -209,7 +251,14 @@ mod imp {
         if session != nectarlink_core::MIRROR_SCREEN {
             return;
         }
-        if active_peer() != Some(*peer) || is_watching() {
+        // Check peer and watching under one lock: the old code took
+        // ACTIVE twice, so the session could change between the checks.
+        // (enter_remote's bool is only "clipboard sync triggered", not
+        // a success flag, so there is nothing to check there.)
+        let session_ok = ACTIVE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|s| {
+            s.peer == *peer && !s.watching
+        });
+        if !session_ok {
             return;
         }
         let remote_input_on = core_host::node()
@@ -281,8 +330,15 @@ mod imp {
     /// Converts a top-down 32-bit BGRA image (`width * height * 4` bytes) into
     /// BT.709 limited-range NV12 (`width * height * 3 / 2` bytes).
     pub(crate) fn bgra_to_nv12(bgra: &[u8], width: usize, height: usize, nv12: &mut Vec<u8>) {
+        // A short buffer or odd dimensions used to panic on indexing
+        // (and odd heights under-allocated the UV plane). Fail clean
+        // instead of killing the capture thread.
+        if width == 0 || height == 0 || bgra.len() < width * height * 4 {
+            nv12.clear();
+            return;
+        }
         let y_size = width * height;
-        let uv_size = y_size / 2;
+        let uv_size = y_size.div_ceil(2);
         nv12.resize(y_size + uv_size, 0);
         let (y_plane, uv_plane) = nv12.split_at_mut(y_size);
 
@@ -482,6 +538,11 @@ mod imp {
         }
 
         unsafe fn drain(&mut self, out: &mut Vec<(bool, Vec<u8>)>) -> windows::core::Result<()> {
+            // Progress guard: Ok-without-a-sample and a STREAM_CHANGE
+            // whose new type can't be read both used to fall through to
+            // another ProcessOutput forever, busy-looping at 100% CPU
+            // and never polling the stop flag or closing the session.
+            let mut no_progress = 0u32;
             loop {
                 // SAFETY: MFT output draining with allocated or MFT-provided sample.
                 unsafe {
@@ -506,6 +567,17 @@ mod imp {
 
                     match res {
                         Ok(()) => {
+                            if sample.is_none() {
+                                no_progress += 1;
+                                if no_progress > 1000 {
+                                    // Give up this drain: the caller
+                                    // keeps polling the stop flag, and
+                                    // the next frame retries the encoder.
+                                    return Ok(());
+                                }
+                                continue;
+                            }
+                            no_progress = 0;
                             if let Some(sample) = sample {
                                 let clean = sample
                                     .GetUINT32(&MFSampleExtension_CleanPoint)
@@ -546,7 +618,9 @@ mod imp {
                         }
                         Err(e) if e.code() == MF_E_TRANSFORM_NEED_MORE_INPUT => return Ok(()),
                         Err(e) if e.code() == MF_E_TRANSFORM_STREAM_CHANGE => {
+                            let mut progressed = false;
                             if let Ok(cur_out) = self.transform.GetOutputAvailableType(0, 0) {
+                                progressed = true;
                                 self.transform.SetOutputType(0, Some(&cur_out), 0)?;
                                 if let Ok(len) = cur_out.GetBlobSize(&MF_MT_MPEG_SEQUENCE_HEADER)
                                     && len > 0
@@ -556,6 +630,16 @@ mod imp {
                                         self.seq_header = buf;
                                     }
                                 }
+                            }
+                            if !progressed {
+                                // The new type can't be read: retrying
+                                // unchanged would spin forever.
+                                no_progress += 1;
+                                if no_progress > 1000 {
+                                    return Ok(());
+                                }
+                            } else {
+                                no_progress = 0;
                             }
                         }
                         Err(e) => return Err(e),
@@ -960,6 +1044,7 @@ mod imp {
                         if layer.p_bs_buf.is_null()
                             || layer.p_nal_length_in_byte.is_null()
                             || layer.i_nal_count <= 0
+                            || layer.i_nal_count > 64
                         {
                             continue;
                         }
@@ -968,7 +1053,9 @@ mod imp {
                             layer.i_nal_count as usize,
                         );
                         let total_bytes: usize = nal_lens.iter().map(|&n| n.max(0) as usize).sum();
-                        if total_bytes == 0 {
+                        // A corrupt encoder state must not turn a slice
+                        // length into a heap over-read: bound the frame.
+                        if total_bytes == 0 || total_bytes > 32 * 1024 * 1024 {
                             continue;
                         }
                         let layer_bytes = std::slice::from_raw_parts(layer.p_bs_buf, total_bytes);
@@ -990,6 +1077,7 @@ mod imp {
                         if layer.p_bs_buf.is_null()
                             || layer.p_nal_length_in_byte.is_null()
                             || layer.i_nal_count <= 0
+                            || layer.i_nal_count > 64
                         {
                             continue;
                         }
@@ -998,7 +1086,7 @@ mod imp {
                             layer.i_nal_count as usize,
                         );
                         let total_bytes: usize = nal_lens.iter().map(|&n| n.max(0) as usize).sum();
-                        if total_bytes == 0 {
+                        if total_bytes == 0 || total_bytes > 32 * 1024 * 1024 {
                             continue;
                         }
                         let layer_bytes = std::slice::from_raw_parts(layer.p_bs_buf, total_bytes);
@@ -1424,7 +1512,9 @@ mod imp {
         dst_w: u32,
         dst_h: u32,
         child: Option<std::process::Child>,
-        latest_frame: Arc<Mutex<Option<Vec<u8>>>>,
+        /// Last frame with when it arrived: a dead pipeline must not
+        /// keep serving its final frame as if it were live.
+        latest_frame: Arc<Mutex<Option<(Instant, Vec<u8>)>>>,
     }
 
     #[cfg(target_os = "linux")]
@@ -1619,7 +1709,7 @@ mod imp {
             let mut child = cmd.spawn().ok()?;
 
             let mut stdout = child.stdout.take()?;
-            let latest_frame: Arc<Mutex<Option<Vec<u8>>>> = Arc::new(Mutex::new(None));
+            let latest_frame: Arc<Mutex<Option<(Instant, Vec<u8>)>>> = Arc::new(Mutex::new(None));
             let frame_slot = Arc::clone(&latest_frame);
             let frame_bytes = (dst_w as usize) * (dst_h as usize) * 4;
 
@@ -1631,7 +1721,8 @@ mod imp {
                         for chunk in buf.as_chunks_mut::<4>().0 {
                             chunk[3] = 0xFF;
                         }
-                        *frame_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(buf.clone());
+                        *frame_slot.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((Instant::now(), buf.clone()));
                     }
                 })
                 .ok()?;
@@ -1684,9 +1775,19 @@ mod imp {
             };
             let deadline = Instant::now() + wait;
             loop {
-                if let Some(frame) = self.latest_frame.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+                // A frame older than 2 s is frozen, not live: a dead
+                // pipeline used to serve its last frame forever while
+                // the phone showed it as a live stream.
+                let fresh = self
+                    .latest_frame
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .filter(|(at, _)| at.elapsed() < Duration::from_secs(2))
+                    .map(|(_, frame)| frame.clone());
+                if let Some(frame) = fresh {
                     bgra.clear();
-                    bgra.extend_from_slice(frame);
+                    bgra.extend_from_slice(&frame);
                     return Some((self.src_w, self.src_h));
                 }
                 if Instant::now() >= deadline {
@@ -1729,13 +1830,29 @@ mod imp {
     }
 
     #[cfg(target_os = "linux")]
+    /// When portal negotiation last failed: renegotiating on every
+    /// capture tick re-requested the portal dialog after every
+    /// dismissal/denial (dialog spam). Back off for 30 s instead.
+    #[cfg(target_os = "linux")]
+    static LAST_PORTAL_FAILURE: Mutex<Option<Instant>> = Mutex::new(None);
+
     fn capture_screen_wayland(dst_w: u32, dst_h: u32, bgra: &mut Vec<u8>) -> Option<(u32, u32)> {
         if !is_wayland_screencast_available() {
             return None;
         }
         let mut guard = WAYLAND_CASTER.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
+            let backed_off = LAST_PORTAL_FAILURE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(30));
+            if backed_off {
+                return None;
+            }
             *guard = WaylandScreenCaster::start(dst_w, dst_h);
+            if guard.is_none() {
+                *LAST_PORTAL_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+            }
         }
         let caster = guard.as_mut()?;
         let res = caster.capture(dst_w, dst_h, bgra);
@@ -1810,7 +1927,21 @@ mod imp {
             }
 
             let bytes_per_line = (*img).bytes_per_line.max(0) as usize;
-            let bpp = ((*img).bits_per_pixel.max(24) as usize) / 8;
+            // A 16-bpp visual used to be read as 3 bytes/pixel, running
+            // past each row and off the image on the last row. Only
+            // 24/32-bpp visuals are BGRA-shaped; anything else is
+            // refused rather than misread.
+            let raw_bpp = (*img).bits_per_pixel;
+            if raw_bpp != 24 && raw_bpp != 32 {
+                if let Some(destroy) = (*img).f.destroy_image {
+                    let _ = destroy(img);
+                } else {
+                    libc::free((*img).data.cast());
+                    let _ = (api.free)(img.cast());
+                }
+                return None;
+            }
+            let bpp = (raw_bpp as usize) / 8;
             let needed = (dst_w as usize) * (dst_h as usize) * 4;
             bgra.resize(needed, 0);
 
@@ -1822,8 +1953,13 @@ mod imp {
                 for x in 0..dst_w {
                     let sx = ((u64::from(x) * u64::from(src_w)) / u64::from(dst_w)).min(u64::from(src_w - 1))
                         as usize;
-                    let px = src_row.add(sx * bpp);
                     let dst_idx = dst_row_offset + (x as usize) * 4;
+                    // Stay inside the source row even on a short stride.
+                    if sx * bpp + 2 >= bytes_per_line {
+                        bgra[dst_idx + 3] = 0xFF;
+                        continue;
+                    }
+                    let px = src_row.add(sx * bpp);
                     bgra[dst_idx] = *px;
                     bgra[dst_idx + 1] = *px.add(1);
                     bgra[dst_idx + 2] = *px.add(2);
@@ -2096,8 +2232,20 @@ mod imp {
             }
         }
 
+        // Only tear down the caster if no newer session has taken over:
+        // WAYLAND_CASTER is process-wide, and an exiting old session
+        // used to kill a restarted session's gst-launch child outright.
         #[cfg(target_os = "linux")]
-        stop_wayland_screencast();
+        {
+            let newer = ACTIVE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .is_some_and(|s| !Arc::ptr_eq(&s.stop, stop));
+            if !newer {
+                stop_wayland_screencast();
+            }
+        }
         tracing::info!(%peer, "stopped sharing this PC's screen");
         crate::input_share::leave_remote();
         sender.close();
@@ -2116,6 +2264,7 @@ mod imp {
     /// (capturing the sound doesn't depend on them), for as long as this lives;
     /// then as before.
     struct SoundToPhone {
+        peer: DeviceId,
         was_on: bool,
         was_target: Option<DeviceId>,
         /// This muted the speakers (they weren't already).
@@ -2128,6 +2277,7 @@ mod imp {
                 && win::audio::speaker_state().is_some_and(|(_, muted)| !muted)
                 && win::audio::set_speaker_mute(true).is_ok();
             let sound = SoundToPhone {
+                peer,
                 was_on: crate::pc_audio_stream::is_enabled(),
                 was_target: crate::pc_audio_stream::target(),
                 muted,
@@ -2140,6 +2290,13 @@ mod imp {
 
     impl Drop for SoundToPhone {
         fn drop(&mut self) {
+            // Only restore if this session still owns audio routing: an
+            // old session dropping after a restart used to reset the
+            // new session's target, stop its audio, and unmute the PC
+            // speakers mid-watch.
+            if crate::pc_audio_stream::target() != Some(self.peer) {
+                return;
+            }
             crate::pc_audio_stream::set_target(self.was_target);
             crate::pc_audio_stream::set_enabled(self.was_on);
             // Unmuted only if this muted it.
@@ -2153,6 +2310,23 @@ mod imp {
         let removed = {
             let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
             if guard.as_ref().is_some_and(|s| Arc::ptr_eq(&s.stop, stop)) {
+                guard.take().is_some()
+            } else {
+                false
+            }
+        };
+        if removed {
+            core_host::host().hub.changed(crate::state::Changes::REMOTE);
+            core_host::refresh_capabilities();
+        }
+    }
+
+    /// Removes the ACTIVE entry for `peer` (used when its capture thread
+    /// never started, so no session stop Arc exists to match on).
+    fn cleanup_session_for(peer: DeviceId) {
+        let removed = {
+            let mut guard = ACTIVE.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.as_ref().is_some_and(|s| s.peer == peer) {
                 guard.take().is_some()
             } else {
                 false
@@ -2299,6 +2473,10 @@ mod imp {
     }
 
     pub fn stop_watching() {}
+
+    pub fn is_capture_available() -> bool {
+        false
+    }
 
     pub fn start(_peer: DeviceId, _options: MirrorStart) {}
 

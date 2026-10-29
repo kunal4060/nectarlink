@@ -394,7 +394,9 @@ impl cxx_qt::Initialize for qobject::Preferences {
         self.as_mut().set_recordings_folder_is_default(settings.recordings_folder.is_none());
         self.as_mut().rust_mut().custom_recordings_folder = settings.recordings_folder.clone();
         self.as_mut().set_recordings_format(QString::from(settings.recordings_format.as_str()));
-        self.as_mut().set_timeline_retention_days(settings.timeline_retention_days as i32);
+        self.as_mut().set_timeline_retention_days(
+            i32::try_from(settings.timeline_retention_days).unwrap_or(i32::MAX),
+        );
         self.as_mut().set_continuity_photo_hotkey(QString::from(&settings.continuity_photo_hotkey));
         self.as_mut().set_continuity_scan_hotkey(QString::from(&settings.continuity_scan_hotkey));
         self.as_mut().set_command_palette_hotkey(QString::from(&settings.command_palette_hotkey));
@@ -619,21 +621,28 @@ impl cxx_qt::Initialize for qobject::Preferences {
                 let token_path = crate::local_api::token_file_path();
                 p.as_mut()
                     .set_local_api_token_path(QString::from(&token_path.to_string_lossy().into_owned()));
-                let settings = p.current_settings();
-                let _ = settings.save(&core_host::host().data_dir);
-                crate::local_api::sync_from_settings();
-                save_in_background(settings);
+                // Sequenced only: a direct save here bypassed
+                // save_in_background's ordering and could overwrite newer
+                // state (or be overwritten by an older queued save).
+                save_in_background(p.current_settings());
             })
             .release();
         self.as_mut()
             .on_local_api_port_changed(|mut p| {
+                // An out-of-range port used to be silently rewritten in the
+                // saved file while the UI kept showing it — and a
+                // privileged port (<1024) could be saved, then fail to bind
+                // as non-admin with the API silently dead. Correct the
+                // property instead; the re-fired handler then saves it.
+                let port = p.local_api_port;
+                if !(1024..=65535).contains(&port) {
+                    p.as_mut().set_local_api_port(i32::from(crate::settings::DEFAULT_LOCAL_API_PORT));
+                    return;
+                }
                 let token_path = crate::local_api::token_file_path();
                 p.as_mut()
                     .set_local_api_token_path(QString::from(&token_path.to_string_lossy().into_owned()));
-                let settings = p.current_settings();
-                let _ = settings.save(&core_host::host().data_dir);
-                crate::local_api::sync_from_settings();
-                save_in_background(settings);
+                save_in_background(p.current_settings());
             })
             .release();
         self.as_mut()
@@ -740,7 +749,10 @@ impl qobject::Preferences {
         if *self.whats_new_dismissed() != disk.whats_new_dismissed {
             self.as_mut().set_whats_new_dismissed(disk.whats_new_dismissed);
         }
-        let _ = disk.save(&core_host::host().data_dir);
+        // No write-back here: this snapshot was loaded before the property
+        // updates above, so saving it whole would overwrite newer settings
+        // (including privacy toggles) saved in the meantime. Property
+        // changes persist through their own on-changed handlers.
     }
 
     pub fn restart_walkthrough(mut self: Pin<&mut Self>) {
@@ -795,8 +807,10 @@ impl qobject::Preferences {
         if *self.window_maximized() != maximized {
             self.as_mut().set_window_maximized(maximized);
         }
-        let settings = self.current_settings();
-        let _ = settings.save(&core_host::host().data_dir);
+        // Sequenced save, not a direct one: a direct save bypassed
+        // save_in_background's ordering and could be overwritten by an
+        // older queued save (or overwrite a newer one).
+        self.save();
     }
 
     pub fn obs_port(&self) -> i32 {
@@ -809,10 +823,37 @@ impl qobject::Preferences {
 
     pub fn save_obs(self: Pin<&mut Self>, port: i32, password: &QString, replace_password: bool) {
         let (current_port, current_password) = crate::settings::obs_settings();
-        let port = u16::try_from(port).ok().filter(|&p| p >= 1024).unwrap_or(current_port);
+        // An invalid port used to be silently replaced by the old one, so
+        // the UI kept showing a port OBS was never told about.
+        let port = match u16::try_from(port).ok().filter(|&p| p >= 1024) {
+            Some(port) => port,
+            None => {
+                crate::bridge::app::show_message(tr!(
+                    "Prefs",
+                    "The OBS port must be 1024–65535. Keeping the previous port."
+                ));
+                current_port
+            }
+        };
+        // A protection failure used to collapse into None — indistinguishable
+        // from "user cleared the password" — and permanently wipe the saved
+        // password. Keep the old password and say so instead.
         let protected = if replace_password {
             let password = String::from(password);
-            if password.is_empty() { None } else { crate::settings::protect_obs_password(&password) }
+            if password.is_empty() {
+                None
+            } else {
+                match crate::settings::protect_obs_password(&password) {
+                    Some(protected) => Some(protected),
+                    None => {
+                        crate::bridge::app::show_message(tr!(
+                            "Prefs",
+                            "The OBS password couldn't be saved. Your previous password is unchanged."
+                        ));
+                        current_password
+                    }
+                }
+            }
         } else {
             current_password
         };
@@ -830,6 +871,7 @@ impl qobject::Preferences {
         });
         if let Err(e) = spawned {
             tracing::warn!(error = %e, "can't test the OBS connection");
+            crate::bridge::app::show_message(tr!("Prefs", "Couldn't test the OBS connection. Try again."));
         }
     }
 
@@ -844,6 +886,21 @@ impl qobject::Preferences {
             return;
         }
         let path = PathBuf::from(trimmed);
+        // Reject what recordings can never use: an existing non-directory,
+        // or a path that cannot be created. Otherwise the setting looks
+        // applied while every recording silently fails to save.
+        let usable = if path.exists() {
+            path.is_dir()
+        } else {
+            std::fs::create_dir_all(&path).is_ok()
+        };
+        if !usable {
+            crate::bridge::app::show_message(tr!(
+                "Prefs",
+                "That recordings folder can't be used. Pick an existing folder."
+            ));
+            return;
+        }
         self.as_mut().rust_mut().custom_recordings_folder = Some(path.clone());
         self.as_mut().set_recordings_folder(QString::from(&path.to_string_lossy().into_owned()));
         self.as_mut().set_recordings_folder_is_default(false);
@@ -874,14 +931,22 @@ impl qobject::Preferences {
             .unwrap_or_else(|| String::from(pc_folder));
         let pc_trimmed = raw_pc.trim();
         let phone_trimmed = String::from(phone_folder).trim().to_owned();
-        if pc_trimmed.is_empty() || phone_trimmed.is_empty() {
+        let device_trimmed = String::from(device_id).trim().to_owned();
+        if pc_trimmed.is_empty() || phone_trimmed.is_empty() || device_trimmed.is_empty() {
             return;
         }
         let mut rules = crate::settings::folder_sync_rules();
-        let next_id = format!("sync-{}", rules.len() + 1);
+        // An identical rule would only double up sync work (and, with the
+        // old length-derived ids, could share an id with another rule).
+        if rules.iter().any(|r| {
+            r.phone_id == device_trimmed && r.phone_folder == phone_trimmed && r.pc_folder == pc_trimmed
+        }) {
+            return;
+        }
+        let next_id = next_rule_id(rules.iter().map(|r| r.id.as_str()), "sync");
         rules.push(crate::folder_sync::FolderSyncRule {
             id: next_id,
-            phone_id: String::from(device_id).trim().to_owned(),
+            phone_id: device_trimmed,
             phone_folder: phone_trimmed,
             pc_folder: pc_trimmed.to_owned(),
             mode: if two_way { "two_way".into() } else { "one_way_phone_to_pc".into() },
@@ -932,7 +997,7 @@ impl qobject::Preferences {
             return;
         }
         let mut rules = crate::settings::automation_rules();
-        let next_id = format!("auto-{}", rules.len() + 1);
+        let next_id = next_rule_id(rules.iter().map(|r| r.id.as_str()), "auto");
         rules.push(crate::automations::AutomationRule {
             id: next_id,
             name: format!("{trig} → {act}"),
@@ -1018,7 +1083,7 @@ impl qobject::Preferences {
             local_api_enabled: p.local_api_enabled,
             local_api_port: u16::try_from(p.local_api_port)
                 .ok()
-                .filter(|&port| port > 0)
+                .filter(|&port| port >= 1024)
                 .unwrap_or(crate::settings::DEFAULT_LOCAL_API_PORT),
             clipboard_auto_copy_received_files: p.clipboard_auto_copy_received_files,
             open_shared_files: p.open_shared_files,
@@ -1054,25 +1119,56 @@ impl qobject::Preferences {
     }
 }
 
+/// Next free rule id for `prefix` (`"sync"`/`"auto"`): max existing numeric
+/// suffix + 1, skipping any id already taken. Deriving the id from the list
+/// length reused ids after a deletion (create 1,2,3, delete 2, add → 3
+/// again), so removing the duplicated id deleted two rules at once.
+fn next_rule_id<'a>(ids: impl Iterator<Item = &'a str>, prefix: &str) -> String {
+    let mut taken = std::collections::HashSet::new();
+    let mut next = 1u64;
+    for id in ids {
+        taken.insert(id);
+        if let Some(suffix) = id.strip_prefix(prefix).and_then(|s| s.strip_prefix('-'))
+            && let Ok(n) = suffix.parse::<u64>()
+        {
+            next = next.max(n + 1);
+        }
+    }
+    let mut candidate = format!("{prefix}-{next}");
+    while taken.contains(candidate.as_str()) {
+        next += 1;
+        candidate = format!("{prefix}-{next}");
+    }
+    candidate
+}
+
 /// Saves off the UI thread (the write is flushed to disk, which can take a
 /// moment), newest settings last even when changes come in quick succession.
+fn do_save(settings: &Settings, seq: u64, written: &Mutex<u64>) {
+    let mut written = written.lock().unwrap_or_else(|e| e.into_inner());
+    if *written > seq {
+        return; // A newer save already ran.
+    }
+    if let Err(e) = settings.save(&core_host::host().data_dir) {
+        tracing::warn!(error = %e, "can't save preferences");
+    } else {
+        crate::local_api::sync_from_settings();
+    }
+    *written = seq;
+}
+
 fn save_in_background(settings: Settings) {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     static WRITTEN: Mutex<u64> = Mutex::new(0);
     let seq = NEXT.fetch_add(1, Ordering::SeqCst) + 1;
-    let save = move || {
-        let mut written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
-        if *written > seq {
-            return; // A newer save already ran.
-        }
-        if let Err(e) = settings.save(&core_host::host().data_dir) {
-            tracing::warn!(error = %e, "can't save preferences");
-        } else {
-            crate::local_api::sync_from_settings();
-        }
-        *written = seq;
-    };
-    if let Err(e) = std::thread::Builder::new().name("save-preferences".into()).spawn(save) {
-        tracing::warn!(error = %e, "can't save preferences");
+    // Clone for the thread so a spawn failure can still fall back to a
+    // synchronous save instead of silently dropping the change.
+    let thread_settings = settings.clone();
+    let spawned = std::thread::Builder::new()
+        .name("save-preferences".into())
+        .spawn(move || do_save(&thread_settings, seq, &WRITTEN));
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "can't save preferences in background; saving synchronously");
+        do_save(&settings, seq, &WRITTEN);
     }
 }

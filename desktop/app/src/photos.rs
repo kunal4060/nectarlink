@@ -57,6 +57,10 @@ enum Intent {
 struct State {
     /// Transfers bringing photos the user asked for.
     pending: HashMap<String, Intent>,
+    /// When each pending transfer was asked for, so stale ones (phone
+    /// disconnected, core dropped it) can be expired instead of living
+    /// in `pending` forever.
+    pending_at: HashMap<String, Instant>,
     /// Transfers whose completion is handled here (so `transfers.rs` suppresses
     /// its generic "saved in Downloads" toast).
     handled: HashMap<String, Instant>,
@@ -73,6 +77,8 @@ const KEEP_FINISHED: Duration = Duration::from_secs(60);
 /// How long a private transfer stays out of the list (longer than any
 /// photo or video takes to arrive).
 const KEEP_PRIVATE: Duration = Duration::from_secs(6 * 60 * 60);
+/// How long a transfer with no terminal event is kept as pending.
+const KEEP_PENDING: Duration = Duration::from_secs(30 * 60);
 
 fn state<T>(f: impl FnOnce(&mut State) -> T) -> T {
     f(STATE.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_default())
@@ -175,7 +181,17 @@ fn save_preview(device: DeviceId, photo: &Photo) -> Option<PathBuf> {
         return None;
     }
     let dir = crate::notifications::images_dir();
-    let path = dir.join(format!("photo-{:016x}.jpg", fingerprint(&format!("{device} {}", photo.id))));
+    // Sniff the real format: every preview used to be named .jpg even
+    // when the thumb bytes were PNG/WebP, so the toast loader could
+    // silently fail to decode it.
+    let ext = if photo.thumb.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if photo.thumb.len() >= 12 && &photo.thumb[0..4] == b"RIFF" && &photo.thumb[8..12] == b"WEBP" {
+        "webp"
+    } else {
+        "jpg"
+    };
+    let path = dir.join(format!("photo-{:016x}.{ext}", fingerprint(&format!("{device} {}", photo.id))));
     let written = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&path, &photo.thumb));
     match written {
         Ok(()) => Some(path),
@@ -190,9 +206,15 @@ pub(crate) fn fingerprint(text: &str) -> u64 {
     fingerprint_bytes(text.as_bytes())
 }
 
-/// FNV-1a: a stable name for cached files.
+/// First 8 bytes of SHA-256: a stable name for cached files. The old
+/// FNV-1a hash is non-cryptographic and collision-prone, so one photo's
+/// files could overwrite another's; SHA-256 truncated to 64 bits keeps
+/// the same filename shape with a far lower collision chance. (Cache
+/// filenames change once, so existing caches are re-downloaded.)
 pub(crate) fn fingerprint_bytes(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, b| (hash ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(bytes);
+    u64::from_be_bytes(digest[..8].try_into().unwrap_or([0; 8]))
 }
 
 /// The user clicked the notification (`action` None) or one of its buttons.
@@ -227,6 +249,17 @@ fn asked(transfer: String, intent: Intent) {
         s.finished.retain(|_, (at, _)| now.duration_since(*at) < KEEP_FINISHED);
         s.handled.retain(|_, at| now.duration_since(*at) < KEEP_FINISHED);
         s.private.retain(|_, at| now.duration_since(*at) < KEEP_PRIVATE);
+        // Expire pending transfers that never reached a terminal event.
+        let stale: Vec<String> = s
+            .pending_at
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) >= KEEP_PENDING)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            s.pending.remove(&id);
+            s.pending_at.remove(&id);
+        }
         if intent != Intent::ToastSave {
             s.handled.insert(transfer.clone(), now);
         }
@@ -236,6 +269,7 @@ fn asked(transfer: String, intent: Intent) {
         match s.finished.remove(&transfer) {
             Some((_, saved)) => Some(saved),
             None => {
+                s.pending_at.insert(transfer.clone(), now);
                 s.pending.insert(transfer, intent.clone());
                 None
             }
@@ -261,13 +295,26 @@ fn finished(t: &Transfer) {
     let saved = match &t.state {
         TransferState::Done { saved } => saved.clone(),
         TransferState::Failed(_) | TransferState::Cancelled => {
-            let removed = state(|s| s.pending.remove(&t.id));
-            if removed.is_some() {
-                gallery_state(|g| {
-                    g.saving = false;
-                    g.busy_item = None;
+            let removed = state(|s| {
+                s.pending_at.remove(&t.id);
+                s.pending.remove(&t.id)
+            });
+            // A failed/cancelled transfer must not leave handled/private
+            // entries behind, and must not clear a spinner belonging to
+            // an unrelated gallery operation (a toast transfer never
+            // set one).
+            if let Some(intent) = removed {
+                state(|s| {
+                    s.handled.remove(&t.id);
+                    s.private.remove(&t.id);
                 });
-                gallery_changed();
+                if !matches!(intent, Intent::ToastSave) {
+                    gallery_state(|g| {
+                        g.saving = false;
+                        g.busy_item = None;
+                    });
+                    gallery_changed();
+                }
             }
             return;
         }
@@ -275,7 +322,20 @@ fn finished(t: &Transfer) {
     };
     let intent = state(|s| {
         let now = Instant::now();
+        s.finished.retain(|_, (at, _)| now.duration_since(*at) < KEEP_FINISHED);
         s.handled.retain(|_, at| now.duration_since(*at) < KEEP_FINISHED);
+        s.private.retain(|_, at| now.duration_since(*at) < KEEP_PRIVATE);
+        let stale: Vec<String> = s
+            .pending_at
+            .iter()
+            .filter(|(_, at)| now.duration_since(**at) >= KEEP_PENDING)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            s.pending.remove(&id);
+            s.pending_at.remove(&id);
+        }
+        s.pending_at.remove(&t.id);
         match s.pending.remove(&t.id) {
             Some(intent) => {
                 if intent != Intent::ToastSave {
@@ -336,31 +396,52 @@ fn deliver(transfer_id: &str, intent: Intent, saved: &[PathBuf]) {
             let ext = first.extension().and_then(|e| e.to_str()).filter(|e| !e.is_empty()).unwrap_or("jpg");
             let dir = thumbs_dir(device);
             let cached = dir.join(format!("full-{:016x}.{ext}", fingerprint(&item_id)));
-            let final_path =
-                if std::fs::create_dir_all(&dir).and_then(|()| move_or_copy(first, &cached)).is_ok() {
-                    cached
-                } else {
-                    first.clone()
-                };
-            gallery_state(|g| {
-                g.full_files.insert(item_id.clone(), final_path);
-                if g.busy_item.as_deref() == Some(item_id.as_str()) {
-                    g.busy_item = None;
+            // On a move failure the file must not be silently adopted
+            // as the cached viewer copy in Downloads (outside every
+            // cache budget): report it and retry on the next view.
+            match std::fs::create_dir_all(&dir).and_then(|()| move_or_copy(first, &cached)) {
+                Ok(()) => {
+                    gallery_state(|g| {
+                        g.full_files.insert(item_id.clone(), cached);
+                        if g.busy_item.as_deref() == Some(item_id.as_str()) {
+                            g.busy_item = None;
+                        }
+                    });
                 }
-            });
+                Err(e) => {
+                    tracing::warn!(error = %e, "can't move a viewed photo into the gallery cache");
+                    show_message(tr!("Photos", "Couldn't open that photo in the viewer. Try again."));
+                    gallery_state(|g| {
+                        if g.busy_item.as_deref() == Some(item_id.as_str()) {
+                            g.busy_item = None;
+                        }
+                    });
+                }
+            }
             gallery_changed();
         }
         Intent::GallerySave { ids, folder } => {
             let mut final_paths = Vec::with_capacity(saved.len());
+            // Files that failed to move are still listed (at their real
+            // location) for the timeline record, but counted separately
+            // so the success message never claims a folder they never
+            // reached.
+            let mut failed = 0usize;
             let dest_label = match &folder {
                 Some(dir) => {
-                    let _ = std::fs::create_dir_all(dir);
+                    let dir_ok = std::fs::create_dir_all(dir).is_ok();
                     for src in saved {
                         let name = src.file_name().and_then(|n| n.to_str()).unwrap_or("photo.jpg");
+                        if !dir_ok {
+                            failed += 1;
+                            final_paths.push(src.clone());
+                            continue;
+                        }
                         let dst = free_path(dir, name);
                         if dst == *src || move_or_copy(src, &dst).is_ok() {
                             final_paths.push(dst);
                         } else {
+                            failed += 1;
                             final_paths.push(src.clone());
                         }
                     }
@@ -393,24 +474,38 @@ fn deliver(transfer_id: &str, intent: Intent, saved: &[PathBuf]) {
                 );
             }
             gallery_state(|g| {
-                if ids.len() == final_paths.len() {
-                    for (id, path) in ids.into_iter().zip(final_paths.iter().cloned()) {
-                        g.full_files.insert(id, path);
-                    }
+                // Map positionally for the files that did arrive: the
+                // old all-or-nothing guard dropped every mapping when
+                // the phone returned fewer files than requested, so the
+                // viewer re-downloaded files just saved.
+                for (id, path) in ids.into_iter().zip(final_paths.iter().cloned()) {
+                    g.full_files.insert(id, path);
                 }
                 g.saving = false;
                 g.busy_item = None;
             });
             gallery_changed();
-            match final_paths.as_slice() {
-                [one] => {
-                    let name = one.file_name().and_then(|n| n.to_str()).unwrap_or("Photo");
-                    show_message(tr!("Photos", "Saved %1 to %2.", name, dest_label));
+            let succeeded = final_paths.len().saturating_sub(failed);
+            if failed > 0 {
+                show_message(tr!(
+                    "Photos",
+                    "Saved %1 of %2 items to %3. %4 couldn't be moved there.",
+                    succeeded,
+                    final_paths.len(),
+                    dest_label,
+                    failed
+                ));
+            } else {
+                match final_paths.as_slice() {
+                    [one] => {
+                        let name = one.file_name().and_then(|n| n.to_str()).unwrap_or("Photo");
+                        show_message(tr!("Photos", "Saved %1 to %2.", name, dest_label));
+                    }
+                    many if !many.is_empty() => {
+                        show_message(tr!("Photos", "Saved %1 items to %2.", many.len(), dest_label));
+                    }
+                    _ => {}
                 }
-                many if !many.is_empty() => {
-                    show_message(tr!("Photos", "Saved %1 items to %2.", many.len(), dest_label));
-                }
-                _ => {}
             }
         }
     }
@@ -436,7 +531,11 @@ pub(crate) fn free_path(dir: &Path, name: &str) -> PathBuf {
     let path = Path::new(name);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
     let ext = path.extension().and_then(|e| e.to_str());
-    for n in 2..10_000u32 {
+    // Keep counting past 9999 instead of falling back to `first`: the
+    // old fallback returned an existing file, which the caller then
+    // overwrote, silently destroying the user's file of that name.
+    let mut n: u64 = 2;
+    loop {
         let candidate = match ext {
             Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
             None => dir.join(format!("{stem} ({n})")),
@@ -444,13 +543,17 @@ pub(crate) fn free_path(dir: &Path, name: &str) -> PathBuf {
         if !candidate.exists() {
             return candidate;
         }
+        n += 1;
     }
-    first
 }
 
 fn copy_file_to_clipboard(path: &Path, remove_after: bool, notify_ui: bool) {
+    // Label the bytes by their real format: every non-PNG used to be
+    // handed over as image/jpeg, including WebP and HEIC.
     let mime = match path.extension().and_then(|e| e.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("heic" | "heif") => "image/heic",
         _ => "image/jpeg",
     };
     let copied = std::fs::read(path)
@@ -521,7 +624,11 @@ struct GalleryState {
     failed_thumbs: HashSet<String>,
     full_files: HashMap<String, PathBuf>,
     wanted_thumbs: Vec<String>,
-    fetching_thumbs: bool,
+    /// Generation of the pump currently fetching thumbnails, if any.
+    /// A plain bool let a stale pump clear a newer pump's flag (or
+    /// suppress a new pump while the old one exited), leaving queued
+    /// tiles with no pump running or two pumps duplicating work.
+    fetching_thumbs: Option<u64>,
     saving: bool,
     busy_item: Option<String>,
     save_folder: Option<PathBuf>,
@@ -628,7 +735,10 @@ pub fn prune_cache() {
             .filter_map(|e| {
                 let e = e.ok()?;
                 let meta = e.metadata().ok().filter(|m| m.is_file())?;
-                Some((meta.modified().ok()?, meta.len(), e.path()))
+                // Fall back to the epoch like step 1 does: a file whose
+                // mtime can't be read used to escape the byte budgets
+                // forever.
+                Some((meta.modified().unwrap_or(std::time::UNIX_EPOCH), meta.len(), e.path()))
             })
             .partition(|(_, _, path)| {
                 path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("thumb-"))
@@ -894,6 +1004,10 @@ fn load_albums() {
     let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         let Ok(albums) = node.photo_albums(device).await else {
+            // A failed album fetch used to leave a stale/empty list
+            // indistinguishable from "no albums"; log it so the next
+            // reload (which retries) has something to explain the gap.
+            tracing::warn!("can't list photo albums; keeping the last list");
             return;
         };
         let covers: Vec<String> =
@@ -915,16 +1029,26 @@ fn load_albums() {
 
 fn load_items(before: Option<(i64, String)>) {
     let Some((device, album, generation)) = gallery_state(|s| {
-        if before.is_none() && s.items.is_empty() {
-            s.status = Status::Loading;
-        }
         let album = (!s.album.is_empty()).then(|| s.album.clone());
         s.device.map(|d| (d, album, s.generation))
     }) else {
         return;
     };
+    // Check the node before marking Loading: returning early with the
+    // core down used to leave the gallery stuck at Loading.
+    let Some(node) = core_host::node() else {
+        if before.is_some() {
+            gallery_state(|s| s.loading_older = false);
+            gallery_changed();
+        }
+        return;
+    };
+    gallery_state(|s| {
+        if before.is_none() && s.items.is_empty() {
+            s.status = Status::Loading;
+        }
+    });
     gallery_changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         let first_page = before.is_none();
         let result = node.photo_list(device, album, before, PAGE).await;
@@ -932,7 +1056,10 @@ fn load_items(before: Option<(i64, String)>) {
             populate_disk_thumbs(device, page.iter().map(|i| i.id.clone()));
         }
         gallery_state(|s| {
-            s.loading_older = false;
+            // Only the load that set it may clear it (see calls.rs).
+            if before.is_some() {
+                s.loading_older = false;
+            }
             if s.device != Some(device) || s.generation != generation {
                 return;
             }
@@ -995,8 +1122,11 @@ pub fn need_thumb(id: String) {
         if !s.wanted_thumbs.contains(&id) {
             s.wanted_thumbs.push(id);
         }
-        if !s.fetching_thumbs {
-            s.fetching_thumbs = true;
+        // Start a pump unless one for this generation already runs: a
+        // stale pump's generation never matches the current one, so it
+        // can neither suppress nor be clobbered by a new pump.
+        if s.fetching_thumbs != Some(s.generation) {
+            s.fetching_thumbs = Some(s.generation);
             Some((device, s.generation))
         } else {
             None
@@ -1020,7 +1150,11 @@ pub fn drop_thumb(id: &str) {
 
 fn pump_thumbs(device: DeviceId, generation: u64) {
     let Some(node) = core_host::node() else {
-        gallery_state(|s| s.fetching_thumbs = false);
+        gallery_state(|s| {
+            if s.fetching_thumbs == Some(generation) {
+                s.fetching_thumbs = None;
+            }
+        });
         return;
     };
     core_host::spawn(async move {
@@ -1031,7 +1165,11 @@ fn pump_thumbs(device: DeviceId, generation: u64) {
             tokio::time::sleep(Duration::from_millis(25)).await;
             let batch: Vec<String> = gallery_state(|s| {
                 if s.device != Some(device) || s.generation != generation || s.wanted_thumbs.is_empty() {
-                    s.fetching_thumbs = false;
+                    // Only clear our own flag: a newer pump may already
+                    // own it, and clobbering it used to strand its tiles.
+                    if s.fetching_thumbs == Some(generation) {
+                        s.fetching_thumbs = None;
+                    }
                     return Vec::new();
                 }
                 let take = s.wanted_thumbs.len().min(THUMB_BATCH);
@@ -1048,10 +1186,24 @@ fn pump_thumbs(device: DeviceId, generation: u64) {
                 Err(e) => {
                     tracing::debug!(error = %e, "can't fetch photo thumbnails");
                     gallery_state(|s| {
-                        for id in &batch {
-                            s.failed_thumbs.insert(id.clone());
+                        // Only a proven-permanent failure blanks tiles:
+                        // a transient blip used to mark a whole batch
+                        // (up to 24 tiles) permanently failed, with no
+                        // retry until a device switch or cache clear.
+                        // Anything else goes back to the front of the
+                        // queue for the next need_thumb to retry.
+                        if matches!(e, Error::NotFound) {
+                            for id in &batch {
+                                s.failed_thumbs.insert(id.clone());
+                            }
+                        } else {
+                            let mut queued = batch.clone();
+                            queued.extend(s.wanted_thumbs.drain(..));
+                            s.wanted_thumbs = queued;
                         }
-                        s.fetching_thumbs = false;
+                        if s.fetching_thumbs == Some(generation) {
+                            s.fetching_thumbs = None;
+                        }
                     });
                     return;
                 }
@@ -1108,14 +1260,16 @@ pub fn ensure_full(id: String) {
                 return None;
             }
         }
-        s.busy_item = Some(id.clone());
         s.device
     }) else {
         gallery_changed();
         return;
     };
-    gallery_changed();
+    // Check the node before marking the item busy: the old order left
+    // the gallery stuck showing busy with no error when the core was down.
     let Some(node) = core_host::node() else { return };
+    gallery_state(|s| s.busy_item = Some(id.clone()));
+    gallery_changed();
     core_host::spawn(async move {
         match node.fetch_photo(device, id.clone()).await {
             Ok(transfer) => asked(transfer, Intent::View { device, item_id: id }),
@@ -1142,15 +1296,18 @@ pub fn open_item(id: String) {
         crate::transfers::open(&existing);
         return;
     }
-    let Some(device) = gallery_state(|s| {
-        s.saving = true;
-        s.busy_item = Some(id.clone());
-        s.device
-    }) else {
+    let Some(device) = gallery_state(|s| s.device) else {
         return;
     };
+    let Some(node) = core_host::node() else {
+        show_message(tr!("Photos", "The phone isn't connected right now."));
+        return;
+    };
+    gallery_state(|s| {
+        s.saving = true;
+        s.busy_item = Some(id.clone());
+    });
     gallery_changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         match node.fetch_photo(device, id.clone()).await {
             Ok(transfer) => asked(transfer, Intent::Open { item_id: Some(id) }),
@@ -1289,15 +1446,29 @@ pub fn copy_item(id: String) {
         copy_file_to_clipboard(&existing, false, true);
         return;
     }
-    let Some(device) = gallery_state(|s| {
-        s.saving = true;
-        s.busy_item = Some(id.clone());
-        s.device
-    }) else {
+    // Copy is for still images: unlike ensure_full, this path never
+    // rejected videos, so copying one read the whole video into RAM
+    // for a clipboard write that can't hold it.
+    let is_video = gallery_state(|s| {
+        id.starts_with("video:")
+            || s.items.iter().find(|i| i.id == id).is_some_and(|i| i.duration.is_some())
+    });
+    if is_video {
+        show_message(tr!("Photos", "Only photos can be copied to the clipboard."));
+        return;
+    }
+    let Some(device) = gallery_state(|s| s.device) else {
         return;
     };
+    let Some(node) = core_host::node() else {
+        show_message(tr!("Photos", "The phone isn't connected right now."));
+        return;
+    };
+    gallery_state(|s| {
+        s.saving = true;
+        s.busy_item = Some(id.clone());
+    });
     gallery_changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         match node.fetch_photo(device, id.clone()).await {
             Ok(transfer) => asked(transfer, Intent::Copy { item_id: Some(id), notify_ui: true }),
@@ -1328,16 +1499,21 @@ pub fn save_items(ids: Vec<String>, folder: Option<PathBuf>) {
         return;
     }
     let Some((device, target_folder)) = gallery_state(|s| {
+        s.device.map(|d| (d, folder.clone().or_else(|| s.save_folder.clone())))
+    }) else {
+        return;
+    };
+    let Some(node) = core_host::node() else {
+        show_message(tr!("Photos", "The phone isn't connected right now."));
+        return;
+    };
+    gallery_state(|s| {
         if folder.is_some() {
             s.save_folder = folder.clone();
         }
         s.saving = true;
-        s.device.map(|d| (d, folder.or_else(|| s.save_folder.clone())))
-    }) else {
-        return;
-    };
+    });
     gallery_changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         match node.fetch_photos(device, ids.clone()).await {
             Ok(transfer) => asked(transfer, Intent::GallerySave { ids, folder: target_folder }),
@@ -1367,7 +1543,20 @@ pub(crate) fn sanitize_drag_filename(raw_name: &str, fallback_ext: &str) -> Stri
     let cleaned: String =
         leaf.chars().map(|c| if c.is_control() || r#"<>:"/\|?*"#.contains(c) { '_' } else { c }).collect();
     let mut name = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    name = name.trim_matches(['.', ' ']).chars().take(120).collect();
+    // Truncate the stem, not the whole name: a flat 120-char cut used
+    // to split the extension (".jp"), leaving a file the drop target
+    // no longer recognises as an image.
+    let trimmed = name.trim_matches(['.', ' ']);
+    name = match trimmed.rfind('.') {
+        Some(at) if at > 0 => {
+            let (stem, ext) = (&trimmed[..at], &trimmed[at..]);
+            let max_stem = 120usize.saturating_sub(ext.len());
+            let mut out: String = stem.chars().take(max_stem).collect();
+            out.push_str(ext);
+            out
+        }
+        _ => trimmed.chars().take(120).collect(),
+    };
     let stem = name.split('.').next().unwrap_or_default().to_ascii_uppercase();
     let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
         || ((stem.starts_with("COM") || stem.starts_with("LPT"))
@@ -1424,16 +1613,11 @@ fn stage_for_drag_in(id: &str, drag_dir: &Path) -> Option<PathBuf> {
         }
     }
 
-    if source.is_none() {
-        source = gallery_state(|s| {
-            s.thumbs.get(id).filter(|p| p.exists()).cloned().or_else(|| {
-                let dev = s.device.or(device)?;
-                let path = thumb_path(dev, id);
-                path.exists().then_some(path)
-            })
-        });
-    }
-
+    // No thumbnail fallback: staging a thumbnail under the photo's real
+    // filename used to deliver a low-res file the user believes is the
+    // photo. Returning None keeps the drag from starting (the 2.5 s
+    // wait above stays: drag start is a synchronous API, so the full
+    // file must be awaited here, not in the background).
     let src = source?;
     if !src.exists() {
         return None;
@@ -1443,18 +1627,38 @@ fn stage_for_drag_in(id: &str, drag_dir: &Path) -> Option<PathBuf> {
     std::fs::create_dir_all(drag_dir).ok()?;
     let dst = drag_dir.join(file_name);
     if dst != src {
-        let _ = std::fs::remove_file(&dst);
-        if std::fs::hard_link(&src, &dst).is_err() {
-            std::fs::copy(&src, &dst).ok()?;
+        // Stage into a temp name first, then swap it in: the old code
+        // deleted the previous staged copy before linking/copying, so
+        // a failed copy left no staged file at all.
+        let tmp = drag_dir.join(format!(".{file_name}.tmp"));
+        let _ = std::fs::remove_file(&tmp);
+        if std::fs::hard_link(&src, &tmp).is_err() && std::fs::copy(&src, &tmp).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
         }
+        let backup = drag_dir.join(format!(".{file_name}.bak"));
+        let had_dst = dst.exists();
+        if had_dst && std::fs::rename(&dst, &backup).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        if std::fs::rename(&tmp, &dst).is_err() {
+            if had_dst {
+                let _ = std::fs::rename(&backup, &dst);
+            }
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        let _ = std::fs::remove_file(&backup);
     }
     Some(dst)
 }
 
 /// Stages a gallery photo on disk under `<data_dir>/cache/photos/drag/<name>`
 /// so dragging a tile out to the Desktop or File Explorer drops the photo with
-/// its real filename. Prefers the full-resolution image (waiting up to ~2.5s
-/// if it is still arriving), falling back to the cached thumbnail.
+/// its real filename. Waits up to ~2.5s for the full-resolution image; if
+/// it still isn't ready, no drag is staged (a thumbnail is never passed
+/// off as the photo).
 pub fn stage_for_drag(id: &str) -> Option<PathBuf> {
     stage_for_drag_in(id, &photos_drag_dir())
 }

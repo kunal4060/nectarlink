@@ -153,6 +153,11 @@ pub fn last_open_ms() -> f64 {
 /// of matching items ordered by relevance.
 pub fn search(query: &str) -> String {
     let results = with_state(|s| {
+        // Closed means no candidates in memory: searching must not
+        // rebuild them behind the palette's back.
+        if !s.open {
+            return Vec::new();
+        }
         if s.candidates.is_empty() {
             s.candidates = build_candidates();
         }
@@ -165,22 +170,70 @@ fn serialize_results(items: &[PaletteCandidate]) -> String {
     Value::Array(items.iter().take(MAX_RESULTS).map(PaletteCandidate::to_json).collect()).to_string()
 }
 
+/// The device a palette id acts on, if it is device-scoped.
+fn palette_device(id: &str) -> Option<DeviceId> {
+    const PREFIXES: &[&str] = &[
+        "action:send_clipboard:",
+        "action:ring:",
+        "action:open_last_photo:",
+        "action:record_voice:",
+        "action:mirror_screen:",
+        "action:type_on_phone:",
+        "action:webcam:",
+        "action:phone_storage:",
+        "action:handoff_file:",
+        "text_thread:",
+        "text_contact:",
+        "call_contact:",
+        "mirror_app:",
+    ];
+    for prefix in PREFIXES {
+        if let Some(rest) = id.strip_prefix(prefix) {
+            let dev_str = rest.split(':').next().unwrap_or("");
+            return dev_str.parse::<DeviceId>().ok();
+        }
+    }
+    if let Some(rest) = id.strip_prefix("toggle:") {
+        let dev_str = rest.split(':').next().unwrap_or("");
+        return dev_str.parse::<DeviceId>().ok();
+    }
+    if let Some(dev_str) = id.strip_prefix("nav_device:") {
+        return dev_str.parse::<DeviceId>().ok();
+    }
+    None
+}
+
 /// Executes a Command Palette item by `id`, closing the palette and returning
 /// an optional [`PaletteUiAction`] if the main window needs to navigate or show
 /// a sheet.
 pub fn execute(id: &str) -> Option<PaletteUiAction> {
     let id = id.trim().to_owned();
+    // Snapshot before close() clears candidates: only an id the user
+    // actually saw, while the palette was open, may run. A hand-crafted
+    // id used to execute blindly — ringing, dialling, toggling, or
+    // mirroring any syntactically valid device id.
+    let (was_open, is_candidate) = with_state(|s| {
+        (s.open, s.candidates.iter().any(|c| c.id == id))
+    });
     close();
-    if id.is_empty() {
+    if id.is_empty() || !was_open || !is_candidate {
         return None;
+    }
+    // Defence in depth: the target device must still be paired.
+    if let Some(dev) = palette_device(&id) {
+        let paired = core_host::host().hub.read(|s| s.devices.iter().any(|d| d.id == dev));
+        if !paired {
+            return None;
+        }
     }
 
     if let Some(page) = id.strip_prefix("nav:") {
         return Some(PaletteUiAction::NavigatePage { page: page.to_owned(), device_index: None });
     }
-    if let Some(idx_str) = id.strip_prefix("nav_device:")
-        && let Ok(idx) = idx_str.parse::<usize>()
+    if let Some(dev_str) = id.strip_prefix("nav_device:")
+        && let Ok(dev) = dev_str.parse::<DeviceId>()
     {
+        let idx = device_index_of(dev)?;
         return Some(PaletteUiAction::NavigatePage { page: "home".to_owned(), device_index: Some(idx) });
     }
 
@@ -218,7 +271,11 @@ pub fn execute(id: &str) -> Option<PaletteUiAction> {
         let mut settings = Settings::load(data_dir);
         settings.walkthrough_completed = false;
         settings.walkthrough_step = 0;
-        let _ = settings.save(data_dir);
+        if let Err(e) = settings.save(data_dir) {
+            // Don't claim the reset succeeded when it didn't persist.
+            show_message(tr!("CommandPalette", "Couldn't reset the walkthrough: %1", e));
+            return None;
+        }
         core_host::host().hub.changed(Changes::PREFS);
         return Some(PaletteUiAction::OpenWalkthrough);
     }
@@ -226,22 +283,28 @@ pub fn execute(id: &str) -> Option<PaletteUiAction> {
         return Some(PaletteUiAction::NavigatePage { page: "guide".to_owned(), device_index: None });
     }
     if id == "action:wake_pc" {
-        core_host::spawn(core_host::refresh_wake());
-        let msg = core_host::host().hub.read(|s| match s.wake.primary() {
-            Some(adapter) if s.wake.state_str() == "enabled" => {
-                tr!("CommandPalette", "Wake-on-LAN is ready on %1 (phones can wake this PC).", adapter.label)
-            }
-            Some(adapter) => {
-                tr!(
-                    "CommandPalette",
-                    "Wake-on-LAN on %1 is %2. Check Settings.",
-                    adapter.label,
-                    s.wake.state_str()
-                )
-            }
-            None => tr!("CommandPalette", "No physical network adapter found for Wake-on-LAN."),
+        // Report the refreshed result, not the stale state: the old
+        // code spawned the refresh and immediately read the previous
+        // value, so the toast described the state before the check.
+        show_message(tr!("CommandPalette", "Checking Wake-on-LAN…"));
+        core_host::spawn(async move {
+            core_host::refresh_wake().await;
+            let msg = core_host::host().hub.read(|s| match s.wake.primary() {
+                Some(adapter) if s.wake.state_str() == "enabled" => {
+                    tr!("CommandPalette", "Wake-on-LAN is ready on %1 (phones can wake this PC).", adapter.label)
+                }
+                Some(adapter) => {
+                    tr!(
+                        "CommandPalette",
+                        "Wake-on-LAN on %1 is %2. Check Settings.",
+                        adapter.label,
+                        s.wake.state_str()
+                    )
+                }
+                None => tr!("CommandPalette", "No physical network adapter found for Wake-on-LAN."),
+            });
+            show_message(msg);
         });
-        show_message(msg);
         return Some(PaletteUiAction::NavigatePage { page: "settings".to_owned(), device_index: None });
     }
 
@@ -367,7 +430,16 @@ pub fn execute(id: &str) -> Option<PaletteUiAction> {
 
     if let Some(path_str) = id.strip_prefix("timeline_open:") {
         let path = PathBuf::from(path_str);
-        if path.exists() {
+        // transfers::open is a generic open verb, not a viewer: refuse
+        // executable extensions outright instead of running them.
+        let executable = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|e| matches!(e.as_str(), "exe" | "bat" | "cmd" | "msi" | "ps1" | "scr" | "com"));
+        if executable {
+            show_message(tr!("CommandPalette", "That file can't be opened from here."));
+        } else if path.exists() {
             crate::transfers::open(&path);
         } else {
             show_message(tr!("CommandPalette", "That file is no longer in its saved location."));
@@ -416,6 +488,21 @@ fn execute_phone_toggle(rest: &str) {
     let Some(node) = core_host::node() else { return };
 
     let current = core_host::host().hub.read(|s| s.toggles.get(&device).cloned());
+    // With no known toggle state there is nothing to update
+    // optimistically, so the success message must wait for the phone's
+    // answer: the old code announced success immediately either way.
+    let pending = current.is_none();
+    // Per-device sequence: two rapid toggles used to complete out of
+    // order, so the first one's error-path refresh could overwrite the
+    // second one's state and leave the phone opposite to the UI.
+    static TOGGLE_SEQ: std::sync::Mutex<std::collections::HashMap<DeviceId, u64>> =
+        std::sync::Mutex::new(std::collections::HashMap::new());
+    let seq = {
+        let mut seqs = TOGGLE_SEQ.lock().unwrap_or_else(|e| e.into_inner());
+        let next = seqs.get(&device).copied().unwrap_or(0) + 1;
+        seqs.insert(device, next);
+        next
+    };
     let (toggle_id, val, label) = match kind {
         "dnd" => {
             let next = !current.as_ref().is_some_and(|t| t.dnd);
@@ -473,12 +560,30 @@ fn execute_phone_toggle(rest: &str) {
         }
         s.set_toggles(device, Some(next))
     });
-    show_message(label);
+    if pending {
+        show_message(tr!("CommandPalette", "Sending…"));
+    } else {
+        show_message(label);
+    }
     core_host::spawn(async move {
-        if let Err(e) = node.set_phone_toggle(device, toggle_id, val).await {
-            let latest = node.phone_toggles(device);
-            core_host::host().hub.update(|s| s.set_toggles(device, latest));
-            show_message(describe(&e));
+        match node.set_phone_toggle(device, toggle_id, val).await {
+            Ok(()) => {
+                if pending {
+                    show_message(label);
+                }
+            }
+            Err(e) => {
+                // Only the latest toggle for this device may refresh
+                // state from the phone; a stale one's refresh would
+                // clobber a newer toggle's optimistic state.
+                let latest_seq =
+                    TOGGLE_SEQ.lock().unwrap_or_else(|e| e.into_inner()).get(&device).copied();
+                if latest_seq == Some(seq) {
+                    let latest = node.phone_toggles(device);
+                    core_host::host().hub.update(|s| s.set_toggles(device, latest));
+                }
+                show_message(describe(&e));
+            }
         }
     });
 }
@@ -932,13 +1037,16 @@ fn build_candidates() -> Vec<PaletteCandidate> {
 
     // 3. Contacts & Conversations ("Text <contact>", "Call <contact>") + "Mirror <app>"
     for (_, dev_id, dev_name, _) in &devices {
+        // Deduplicate Text entries by destination, not display name:
+        // the old name-keyed set dropped the second contact sharing a
+        // name, even though it texts a different number/thread.
         let mut seen_text = HashSet::new();
         for (title, sub, thread_id) in crate::messages::palette_recipients(*dev_id) {
             let clean = title.trim();
             if clean.is_empty() {
                 continue;
             }
-            let key = clean.to_ascii_lowercase();
+            let key = (clean.to_ascii_lowercase(), sub.clone(), thread_id.clone());
             if !seen_text.insert(key) {
                 continue;
             }
@@ -967,8 +1075,11 @@ fn build_candidates() -> Vec<PaletteCandidate> {
             if clean_name.is_empty() || clean_num.is_empty() {
                 continue;
             }
-            let text_key = clean_name.to_ascii_lowercase();
-            if seen_text.insert(text_key) {
+            // Suppress only if a thread entry already texts this exact
+            // number: suppressing by name alone dropped the second
+            // contact sharing a name, even when it texts elsewhere.
+            let already_threaded = seen_text.iter().any(|(_, sub, _)| sub == clean_num);
+            if !already_threaded {
                 out.push(PaletteCandidate {
                     id: format!("text_contact:{dev_id}:{clean_num}\t{clean_name}"),
                     title: tr!("CommandPalette", "Text %1", clean_name),
@@ -1054,9 +1165,12 @@ fn build_candidates() -> Vec<PaletteCandidate> {
         });
     }
     if multi {
-        for (idx, _, dev_name, online) in &devices {
+        // Keyed by device id, not snapshot index: an index goes stale
+        // the moment a phone pairs or unpairs, and navigating by it
+        // then switches to the wrong phone.
+        for (_, dev_id, dev_name, online) in &devices {
             out.push(PaletteCandidate {
-                id: format!("nav_device:{idx}"),
+                id: format!("nav_device:{dev_id}"),
                 title: tr!("CommandPalette", "Switch to %1", dev_name),
                 subtitle: if *online { "Connected".into() } else { "Offline".into() },
                 category: "Navigation".into(),

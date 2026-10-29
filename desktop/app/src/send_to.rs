@@ -308,10 +308,13 @@ fn task_notify(device: Option<String>, task: nectarlink_core::TaskNotify) {
                 }
             }
             Some(q) => {
+                // Exact match only: the old substring filter notified every
+                // phone whose name contained the query, leaking task details
+                // to phones the caller never named. No match notifies nobody.
                 let Ok(devices) = node.paired_devices() else { return };
                 let lower = q.to_lowercase();
                 for d in devices.into_iter().filter(|d| {
-                    d.id.to_string().starts_with(&lower) || d.info.name.to_lowercase().contains(&lower)
+                    d.id.to_string() == lower || d.info.name.to_lowercase() == lower
                 }) {
                     if let Err(e) = node.task_notify(Some(d.id), task.clone()).await {
                         tracing::debug!(device = %d.id, error = %e, "task.notify wasn't delivered");

@@ -366,13 +366,16 @@ pub fn send_obs_command(obs_cmd: &str) -> Result<(), String> {
 }
 
 fn next_unique_id(prefix: &str, existing: &[String]) -> String {
-    for n in 1..=999 {
+    // Keep searching past 999: the old `{prefix}_x` fallback was unchecked
+    // and could hand out an ID another page/tile already had, so edits and
+    // presses landed on the wrong tile. `existing` is finite, so this ends.
+    for n in 1.. {
         let candidate = format!("{prefix}_{n}");
         if !existing.contains(&candidate) {
             return candidate;
         }
     }
-    format!("{prefix}_x")
+    unreachable!("a finite id list always leaves a free number")
 }
 
 /// Adds a new page and returns its ID.

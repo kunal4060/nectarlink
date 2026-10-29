@@ -369,7 +369,6 @@ pub fn remove_addon() {
             return true;
         }
         s.addon_busy = true;
-        s.vcam_handle = None;
         false
     });
     if already_busy {
@@ -381,6 +380,12 @@ pub fn remove_addon() {
         state(|s| {
             s.addon_busy = false;
             s.addon_registered = registered;
+            // Only drop the session handle once unregister is confirmed:
+            // dropping it first left the webcam broken until re-setup
+            // when unregister was cancelled or failed.
+            if !registered {
+                s.vcam_handle = None;
+            }
         });
         core_host::host().hub.changed(Changes::WEBCAM);
     });
@@ -526,11 +531,30 @@ fn reconfigure_active_stream() {
 /// Requests a webcam stream from `device` (or the selected phone).
 pub fn start(device: Option<DeviceId>) {
     let Some(device) = device.or_else(selected_phone) else { return };
-    set_selected_phone(device);
+    // Check the node before touching the phase: returning early with the
+    // core down used to leave the page stuck at "Asking" forever.
+    let Some(node) = core_host::node() else { return };
+    let previous = state(|s| match s.phase {
+        Phase::Asking { device: old } | Phase::Streaming { device: old, .. } => Some(old),
+        Phase::Idle | Phase::Ended { .. } => None,
+    });
+    if previous == Some(device) {
+        // Already asking/streaming for this phone: don't start twice.
+        return;
+    }
     state(|s| s.phase = Phase::Asking { device });
+    // One stream at a time: starting phone B while phone A streams used
+    // to overwrite the phase without ever stopping A, so both cameras
+    // stayed on and both decoders published into the same mapping.
+    if let Some(old) = previous {
+        let node = node.clone();
+        core_host::spawn(async move {
+            node.webcam_stop(old).await;
+        });
+    }
+    set_selected_phone(device);
     core_host::host().hub.changed(Changes::WEBCAM);
 
-    let Some(node) = core_host::node() else { return };
     let options = current_webcam_start();
     core_host::spawn(async move {
         if let Err(e) = node.webcam_start(device, options).await {
@@ -599,7 +623,33 @@ pub fn on_event(event: &NodeEvent) {
                 core_host::host().hub.changed(Changes::WEBCAM);
             }
         }
-        NodeEvent::DeviceAdded(_) | NodeEvent::DeviceRemoved(_) | NodeEvent::PeerInfoChanged { .. } => {
+        NodeEvent::DeviceRemoved(device) => {
+            // Unpairing a streaming phone must end its stream, not leave
+            // the decoder publishing to the virtual camera: handle it
+            // like the Offline arm instead of a no-op idle-frame refresh.
+            let streaming = state(|s| {
+                if matches!(s.phase, Phase::Asking { device: d } | Phase::Streaming { device: d, .. } if d == *device)
+                {
+                    s.phase = Phase::Idle;
+                    true
+                } else {
+                    false
+                }
+            });
+            if streaming {
+                refresh_idle_frame();
+                if let Some(node) = core_host::node() {
+                    let device = *device;
+                    core_host::spawn(async move {
+                        node.webcam_stop(device).await;
+                    });
+                }
+            } else {
+                refresh_idle_frame();
+            }
+            core_host::host().hub.changed(Changes::WEBCAM);
+        }
+        NodeEvent::DeviceAdded(_) | NodeEvent::PeerInfoChanged { .. } => {
             refresh_idle_frame();
             core_host::host().hub.changed(Changes::WEBCAM);
         }
@@ -621,6 +671,9 @@ enum Item {
 struct Video {
     queue: SyncSender<Item>,
     waiting: Arc<AtomicUsize>,
+    /// Whether the decoder thread actually spawned. A spawn failure used
+    /// to leave the UI at "Streaming" with packets dropped silently.
+    started: bool,
 }
 
 struct Sink {
@@ -649,10 +702,14 @@ impl Video {
         let started = std::thread::Builder::new()
             .name("webcam-decoder".into())
             .spawn(move || decode(device, &items, &counter));
-        if let Err(e) = started {
-            tracing::error!(error = %e, "can't start the webcam decoder");
-        }
-        Self { queue, waiting }
+        let started = match started {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "can't start the webcam decoder");
+                false
+            }
+        };
+        Self { queue, waiting, started }
     }
 }
 
@@ -671,7 +728,20 @@ impl WebcamSink for Sink {
         });
         core_host::host().hub.changed(Changes::WEBCAM);
         let video = self.video.get_or_init(|| Video::start(self.device));
-        let _ = video.queue.send(Item::Config(config));
+        if !video.started {
+            // No decoder thread: don't pretend to stream.
+            state(|s| {
+                if matches!(s.phase, Phase::Streaming { device: d, .. } if d == self.device) {
+                    s.phase = Phase::Ended { reason: "This PC can't decode the phone's camera video.".into() };
+                }
+            });
+            refresh_idle_frame();
+            core_host::host().hub.changed(Changes::WEBCAM);
+            return;
+        }
+        // Never block the core event thread on a stalled decoder queue:
+        // a dropped config is superseded by the next one, as with packets.
+        let _ = video.queue.try_send(Item::Config(config));
     }
 
     fn packet(&self, keyframe: bool, time_us: u64, data: Vec<u8>) {
@@ -692,7 +762,7 @@ impl WebcamSink for Sink {
 
     fn ended(&self) {
         if let Some(video) = self.video.get() {
-            let _ = video.queue.send(Item::Ended);
+            let _ = video.queue.try_send(Item::Ended);
         }
     }
 }
@@ -739,6 +809,13 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
             });
             refresh_idle_frame();
             core_host::host().hub.changed(Changes::WEBCAM);
+            // Tell the phone to stop: otherwise it keeps encoding and
+            // sending video (camera indicator on) while the PC shows Ended.
+            if let Some(node) = core_host::node() {
+                core_host::spawn(async move {
+                    node.webcam_stop(device).await;
+                });
+            }
             return;
         }
     };
@@ -750,6 +827,7 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
     };
     let phone_name = phone_name_for(Some(device));
     let mut size = (0u32, 0u32);
+    let mut decoder_failed = false;
     let mut need_keyframe = true;
     let mut local_mapping = mapping();
     let mut last_mapping_check = Instant::now();
@@ -769,6 +847,7 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
                         }
                         Err(error) => {
                             tracing::error!(codec = %config.codec, %error, "negotiated webcam decoder unavailable");
+                            decoder_failed = true;
                             break;
                         }
                     }
@@ -856,7 +935,12 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
                     if flip {
                         mirror_bgrx_in_place(&mut bgrx, src_w, src_h);
                     }
-                    if local_mapping.is_none() && last_mapping_check.elapsed() >= Duration::from_secs(1) {
+                    // Re-check every second even once a local mapping
+                    // exists: if a conferencing app opens the virtual
+                    // camera's global mapping mid-stream, switch to it
+                    // instead of publishing into the session-local mapping
+                    // forever while the app sees a blank camera.
+                    if last_mapping_check.elapsed() >= Duration::from_secs(1) {
                         local_mapping = mapping();
                         last_mapping_check = Instant::now();
                     }
@@ -881,11 +965,27 @@ fn decode(device: DeviceId, items: &Receiver<Item>, waiting: &AtomicUsize) {
 
     #[cfg(windows)]
     drop(gpu_publisher);
-    state(|s| {
-        if matches!(s.phase, Phase::Streaming { device: d, .. } if d == device) {
-            s.phase = Phase::Idle;
+    if decoder_failed {
+        // A codec-change failure is not a clean end: say why, and tell
+        // the phone to stop instead of silently going Idle while it
+        // keeps streaming.
+        state(|s| {
+            if matches!(s.phase, Phase::Streaming { device: d, .. } if d == device) {
+                s.phase = Phase::Ended { reason: "This PC can't decode the phone's camera video.".into() };
+            }
+        });
+        if let Some(node) = core_host::node() {
+            core_host::spawn(async move {
+                node.webcam_stop(device).await;
+            });
         }
-    });
+    } else {
+        state(|s| {
+            if matches!(s.phase, Phase::Streaming { device: d, .. } if d == device) {
+                s.phase = Phase::Idle;
+            }
+        });
+    }
     refresh_idle_frame();
     core_host::host().hub.changed(Changes::WEBCAM);
 }

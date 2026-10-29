@@ -367,6 +367,12 @@ impl AppState {
                     Some(existing) => {
                         existing.info = device.info.clone();
                         existing.paired_at = device.paired_at;
+                        // Re-adding is a fresh sighting: battery/power
+                        // from the old session are stale (the phone may
+                        // have charged, or switched power mode, while
+                        // away), and the fresh path starts them empty.
+                        existing.battery = None;
+                        existing.power = PowerLevel::Basic;
                     }
                     None => {
                         self.devices.push(DeviceView::from(device.clone()));
@@ -410,6 +416,43 @@ impl AppState {
                 self.notifications.retain(|n| n.device != *id);
                 if self.notifications.len() != notifications {
                     changes |= Changes::NOTIFICATIONS;
+                }
+                // Everything else that could resurrect this phone's
+                // notifications: history, their pictures, cleared keys,
+                // and the in-feed undo of a dismissed one.
+                let history = self.history.len();
+                self.history.retain(|h| h.device != *id);
+                if self.history.len() != history {
+                    changes |= Changes::HISTORY;
+                }
+                let images = self.notification_images.len();
+                self.notification_images.retain(|(d, _), _| d != id);
+                if self.notification_images.len() != images {
+                    changes |= Changes::NOTIFICATIONS;
+                }
+                let cleared = self.cleared.len();
+                self.cleared.retain(|(d, _), _| d != id);
+                if self.cleared.len() != cleared {
+                    changes |= Changes::NOTIFICATIONS;
+                }
+                let dismissed = self.last_dismissed.len();
+                self.last_dismissed.retain(|v| v.device != *id);
+                if self.last_dismissed.len() != dismissed {
+                    if self.last_dismissed.is_empty() {
+                        self.last_dismissed_label.clear();
+                    }
+                    changes |= Changes::NOTIFICATIONS;
+                }
+                // A pairing screen about this device is stale too.
+                let pairing_peer = match &self.pairing {
+                    PairingView::Connecting { peer }
+                    | PairingView::Comparing { peer, .. }
+                    | PairingView::Confirmed { peer, .. } => Some(*peer),
+                    PairingView::Paired { device, .. } => Some(*device),
+                    _ => None,
+                };
+                if pairing_peer == Some(*id) {
+                    changes |= self.set_pairing(PairingView::Idle);
                 }
                 let queue_len = self.send_queue.len();
                 self.send_queue.retain(|q| q.peer != *id);
@@ -869,7 +912,9 @@ impl AppState {
             self.history.clear();
             self.notification_images.clear();
         }
-        Changes::HISTORY
+        // Live notification pictures are not history: listeners that
+        // only watch NOTIFICATIONS used to miss them being wiped.
+        Changes::HISTORY | Changes::NOTIFICATIONS
     }
 
     pub fn clear_history(&mut self) -> Changes {
@@ -878,7 +923,7 @@ impl AppState {
         }
         self.history.clear();
         self.notification_images.clear();
-        Changes::HISTORY
+        Changes::HISTORY | Changes::NOTIFICATIONS
     }
 
     pub fn clear_notification_history(&mut self) -> Changes {

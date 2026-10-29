@@ -86,7 +86,12 @@ pub fn start(data_dir: PathBuf, platform: Arc<dyn Platform>) -> std::io::Result<
         data_dir: data_dir.clone(),
     };
     if HOST.set(host).is_err() {
-        panic!("core host started twice");
+        // A second start used to abort the whole process; report it as an
+        // error instead (main handles `Err` by exiting cleanly). Note:
+        // `host()` itself still panics when called before `start` — changing
+        // its return type would touch its ~254 call sites, most outside this
+        // file set, so that half is left for a coordinated change (see log).
+        return Err(std::io::Error::other("core host started twice"));
     }
     let host = self::host();
     host.hub.update(|s| {

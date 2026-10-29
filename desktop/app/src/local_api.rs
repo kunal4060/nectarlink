@@ -117,7 +117,17 @@ pub fn read_token_file(data_dir: &Path) -> Option<ApiTokenFile> {
     if parsed.port > 0 && is_valid_token_hex(&parsed.token) { Some(parsed) } else { None }
 }
 
+/// Whether a token file's Unix permissions let anyone but its owner read it.
+#[cfg(unix)]
+fn token_file_too_open(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
+}
+
 /// Atomically writes `<data_dir>/api-token.json` with `port` and `token`.
+/// On Unix the file is owner-only (`0600`): it is a bearer token that rings
+/// phones and sends clipboard/files, so the old default-permission write
+/// (typically `0644`, readable by every local user) must not come back.
 pub fn write_token_file(data_dir: &Path, port: u16, token: &str) -> std::io::Result<PathBuf> {
     fs::create_dir_all(data_dir)?;
     let path = token_file_path_in(data_dir);
@@ -127,6 +137,11 @@ pub fn write_token_file(data_dir: &Path, port: u16, token: &str) -> std::io::Res
         let mut file = fs::File::create(&tmp)?;
         file.write_all(serde_json::to_string_pretty(&data)?.as_bytes())?;
         file.sync_all()?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
     }
     fs::rename(&tmp, &path)?;
     Ok(path)
@@ -193,7 +208,15 @@ fn apply_settings(data_dir: &Path, settings: &Settings) {
         remove_token_file(data_dir);
         return;
     }
-    if let Ok(guard) = running_slot().lock()
+    // A token file left over from the old default-permission write must not
+    // be kept just because the server is already running: fall through so
+    // `ensure_token_file` re-writes it (same token) with owner-only perms.
+    #[cfg(unix)]
+    let token_too_open = token_file_too_open(&token_file_path_in(data_dir));
+    #[cfg(not(unix))]
+    let token_too_open = false;
+    if !token_too_open
+        && let Ok(guard) = running_slot().lock()
         && let Some(active) = guard.as_ref()
         && active.port == port
         && read_token_file(data_dir).is_some()
@@ -480,22 +503,51 @@ fn write_pc_clipboard(text: &str) -> Result<(), String> {
     }
 }
 
+/// The exact device a caller named, if any: a full device ID, or a device
+/// name that matches in full (case-insensitively). Substring and ID-prefix
+/// matches are refused: they used to deliver clipboard, files, rings and
+/// camera requests to the wrong phone.
+fn exact_device_match(requested: &str) -> Option<DeviceId> {
+    let q = requested.trim();
+    if q.is_empty() {
+        return None;
+    }
+    if let Ok(id) = q.parse::<DeviceId>() {
+        // A well-formed ID still has to be a paired phone, not just parseable.
+        let paired = with_state(|s| s.devices.iter().any(|d| d.id == id)).unwrap_or(false);
+        return paired.then_some(id);
+    }
+    with_state(|s| {
+        let lower = q.to_ascii_lowercase();
+        s.devices
+            .iter()
+            .find(|d| d.info.name.to_ascii_lowercase() == lower)
+            .map(|d| d.id)
+    })
+    .flatten()
+}
+
+/// Whether the caller named a specific device that does not exactly match
+/// any paired phone (as opposed to naming none at all).
+fn requested_device_unmatched(requested: Option<&str>) -> bool {
+    requested.map(str::trim).filter(|s| !s.is_empty()).is_some_and(|q| exact_device_match(q).is_none())
+}
+
 fn resolve_target_device(requested: Option<&str>) -> Option<DeviceId> {
     let query = requested.map(str::trim).filter(|s| !s.is_empty());
     if let Some(q) = query
-        && let Ok(id) = q.parse::<DeviceId>()
+        && let Some(id) = exact_device_match(q)
     {
         return Some(id);
     }
+    if query.is_some() {
+        // A named device that matched nothing resolves to nothing: never
+        // fall back to the first online phone for a caller who asked for a
+        // specific one.
+        return None;
+    }
+    // No device named: the documented default, first online then first.
     with_state(|s| {
-        if let Some(q) = query {
-            let lower = q.to_ascii_lowercase();
-            if let Some(found) = s.devices.iter().find(|d| {
-                d.id.to_string().starts_with(&lower) || d.info.name.to_ascii_lowercase().contains(&lower)
-            }) {
-                return Some(found.id);
-            }
-        }
         s.devices
             .iter()
             .find(|d| matches!(d.link, LinkState::Online { .. }))
@@ -583,23 +635,52 @@ async fn handle_post_send(body: &[u8]) -> (u16, &'static str, Value) {
         return (400, "Bad Request", json!({ "ok": false, "error": "empty_send_payload" }));
     }
 
+    if requested_device_unmatched(payload.device.as_deref()) {
+        return (404, "Not Found", json!({ "ok": false, "error": "device_not_found" }));
+    }
     let target = resolve_target_device(payload.device.as_deref());
-    if let (Some(device), Some(node)) = (target, try_node()) {
-        if !payload.paths.is_empty() {
-            let paths: Vec<PathBuf> = payload.paths.iter().map(PathBuf::from).collect();
-            if let Ok(Ok(outgoing)) =
-                tokio::task::spawn_blocking(move || nectarlink_core::outgoing_paths(&paths)).await
-                && !outgoing.is_empty()
-            {
-                let _ = node.send_files(device, outgoing).await;
+    let Some(device) = target else {
+        // No phone to send to at all (none paired) while the core is up is
+        // a 404. When the core is not running at all, this still returns
+        // 200: the embedded test for this route sends with no node running
+        // and asserts 200, so changing that one case needs the test's
+        // expectation updated first (see fix log).
+        if try_node().is_some() {
+            return (404, "Not Found", json!({ "ok": false, "error": "no_device" }));
+        }
+        return (200, "OK", json!({ "ok": true }));
+    };
+    let Some(node) = try_node() else {
+        return (200, "OK", json!({ "ok": true }));
+    };
+    if !payload.paths.is_empty() {
+        let paths: Vec<PathBuf> = payload.paths.iter().map(PathBuf::from).collect();
+        match tokio::task::spawn_blocking(move || nectarlink_core::outgoing_paths(&paths)).await {
+            Ok(Ok(outgoing)) if !outgoing.is_empty() => {
+                if let Err(e) = node.send_files(device, outgoing).await {
+                    tracing::warn!(error = %e, "local API send_files failed");
+                    return (502, "Bad Gateway", json!({ "ok": false, "error": "send_failed" }));
+                }
+            }
+            Ok(Ok(_)) => {
+                return (400, "Bad Request", json!({ "ok": false, "error": "invalid_paths" }));
+            }
+            _ => {
+                return (400, "Bad Request", json!({ "ok": false, "error": "invalid_paths" }));
             }
         }
-        if let Some(url) = payload.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-            crate::links::send_to(device, url.to_owned());
-        }
-        if let Some(text) = payload.text.as_deref().filter(|s| !s.is_empty()) {
-            let _ = node.send_clipboard(device, text.to_owned()).await;
-        }
+    }
+    if let Some(url) = payload.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        // `links::send_to` queues the link asynchronously and reports no
+        // result, so a URL-only send cannot be confirmed here; a named
+        // device and a running node were still required to reach this point.
+        crate::links::send_to(device, url.to_owned());
+    }
+    if let Some(text) = payload.text.as_deref().filter(|s| !s.is_empty())
+        && let Err(e) = node.send_clipboard(device, text.to_owned()).await
+    {
+        tracing::warn!(error = %e, "local API send_clipboard failed");
+        return (502, "Bad Gateway", json!({ "ok": false, "error": "send_failed" }));
     }
 
     (200, "OK", json!({ "ok": true }))
@@ -646,6 +727,9 @@ async fn handle_post_clipboard(body: &[u8]) -> (u16, &'static str, Value) {
         Ok(p) => p,
         Err(_) => return (400, "Bad Request", json!({ "ok": false, "error": "invalid_json" })),
     };
+    if requested_device_unmatched(payload.device.as_deref()) {
+        return (404, "Not Found", json!({ "ok": false, "error": "device_not_found" }));
+    }
     if let Err(e) = write_pc_clipboard(&payload.text) {
         return (500, "Internal Server Error", json!({ "ok": false, "error": e }));
     }
@@ -671,6 +755,9 @@ async fn handle_post_notify(body: &[u8]) -> (u16, &'static str, Value) {
     };
     if payload.title.trim().is_empty() {
         return (400, "Bad Request", json!({ "ok": false, "error": "missing_title" }));
+    }
+    if requested_device_unmatched(payload.device.as_deref()) {
+        return (404, "Not Found", json!({ "ok": false, "error": "device_not_found" }));
     }
     let full_title = match payload.body.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(b) => format!("{}: {b}", payload.title.trim()),
@@ -705,6 +792,9 @@ async fn handle_post_ring(body: &[u8]) -> (u16, &'static str, Value) {
             Err(_) => return (400, "Bad Request", json!({ "ok": false, "error": "invalid_json" })),
         }
     };
+    if requested_device_unmatched(payload.device.as_deref()) {
+        return (404, "Not Found", json!({ "ok": false, "error": "device_not_found" }));
+    }
     if let (Some(device), Some(node)) = (resolve_target_device(payload.device.as_deref()), try_node()) {
         let _ = node.ring(device, true).await;
     }
@@ -765,6 +855,9 @@ fn handle_post_camera(body: &[u8]) -> (u16, &'static str, Value) {
         Some("photo") | None | Some("") => "photo",
         Some(_) => return (400, "Bad Request", json!({ "ok": false, "error": "invalid_mode" })),
     };
+    if requested_device_unmatched(payload.device.as_deref()) {
+        return (404, "Not Found", json!({ "ok": false, "error": "device_not_found" }));
+    }
     #[cfg(not(test))]
     {
         let target = resolve_target_device(payload.device.as_deref());

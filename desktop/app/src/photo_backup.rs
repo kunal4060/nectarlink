@@ -427,10 +427,21 @@ fn local_offset_ms(at_ms: i64) -> i64 {
     crate::win::local_offset_ms(at_ms)
 }
 
+/// BLAKE3 digest of a file on disk, for comparing a download against an
+/// existing file without trusting name and size alone.
+fn file_blake3(path: &Path) -> Option<blake3::Hash> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher).ok()?;
+    Some(hasher.finalize())
+}
+
 /// Moves `staged` into `folder\<year>\<month>`, under the item's name. A file
-/// of the same name and size already there is taken to be this item (backed
-/// up before the backup's list was lost); any other one keeps its name and
-/// the new file gets a numbered one. Returns the file's size.
+/// of the same name, size *and content* already there is taken to be this
+/// item (backed up before the backup's list was lost); a same-name,
+/// same-size file with different content keeps its name and the new file
+/// gets a numbered one, instead of being silently deleted. Returns the
+/// file's size.
 fn place(staged: &Path, folder: &Path, item: &Pending) -> std::io::Result<u64> {
     let size = std::fs::metadata(staged)?.len();
     if item.size > 0 && size != item.size {
@@ -441,7 +452,9 @@ fn place(staged: &Path, folder: &Path, item: &Pending) -> std::io::Result<u64> {
     std::fs::create_dir_all(&dir)?;
     let name = crate::photos::sanitize_drag_filename(&item.name, "jpg");
     let same = dir.join(&name);
-    if std::fs::metadata(&same).is_ok_and(|m| m.is_file() && m.len() == size) {
+    if std::fs::metadata(&same).is_ok_and(|m| m.is_file() && m.len() == size)
+        && matches!((file_blake3(&same), file_blake3(staged)), (Some(a), Some(b)) if a == b)
+    {
         let _ = std::fs::remove_file(staged);
         return Ok(size);
     }

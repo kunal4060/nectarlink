@@ -314,18 +314,28 @@ fn spawn_focus_and_paste(hwnd: isize) {
 pub fn on_event(event: &NodeEvent) {
     match event {
         NodeEvent::CameraCaptureReceived { device, request_id, mode, mime, data, .. } => {
+            // Only a capture answering this PC's own outstanding request may
+            // touch the clipboard or auto-paste: an unsolicited or stale
+            // image (matching only the device, or arriving with no active
+            // request at all) is dropped, never pasted into the foreground
+            // window.
             let matched = {
                 let mut guard = STATE.lock().unwrap_or_else(|e| e.into_inner());
-                if guard.active.as_ref().is_some_and(|a| a.request_id == *request_id || a.device == *device) {
+                if guard.active.as_ref().is_some_and(|a| a.request_id == *request_id) {
                     guard.active.take()
                 } else {
                     None
                 }
             };
+            let Some(matched) = matched else {
+                tracing::warn!(
+                    device = %device.short(),
+                    "ignoring continuity camera capture with no matching active request"
+                );
+                return;
+            };
 
-            let device_name = matched.as_ref().map(|a| a.device_name.clone()).unwrap_or_else(|| {
-                core_host::host().hub.read(|s| s.name_of(device).unwrap_or_else(|| device.short()))
-            });
+            let device_name = matched.device_name.clone();
 
             if let Err(e) = crate::win::clipboard::write_image(mime, data) {
                 tracing::warn!(error = %e, "can't copy continuity camera image to clipboard");
@@ -339,7 +349,7 @@ pub fn on_event(event: &NodeEvent) {
             }
 
             let target_ref =
-                matched.as_ref().and_then(|a| a.target_hwnd.map(|hwnd| (hwnd, a.target_title.as_str())));
+                matched.target_hwnd.map(|hwnd| (hwnd, matched.target_title.as_str()));
             let alive =
                 target_ref.is_some_and(|(hwnd, _)| crate::win::tray::is_window_alive_and_visible(hwnd));
 

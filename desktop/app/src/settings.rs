@@ -575,6 +575,30 @@ impl Settings {
             self.window_x = None;
             self.window_y = None;
         }
+        // Positions are clamped to a sane range here; checking them against
+        // the actually attached screens is the window-restore caller's job
+        // (it owns screen enumeration, outside this file).
+        if let Some(x) = self.window_x {
+            self.window_x = Some(x.clamp(-MAX_WINDOW_WIDTH as i32, MAX_WINDOW_WIDTH as i32));
+        }
+        if let Some(y) = self.window_y {
+            self.window_y = Some(y.clamp(-MAX_WINDOW_HEIGHT as i32, MAX_WINDOW_HEIGHT as i32));
+        }
+        // Documented ranges, previously stored verbatim from hand-edited JSON:
+        // mic gain 50–400 (see phone_mic::MIN/MAX_GAIN), webcam height one of
+        // 720/1080/2160, timeline retention must survive the `as i32` cast
+        // in QML, and a local-API port below 1024 cannot bind unprivileged.
+        self.phone_mic_gain = self.phone_mic_gain.clamp(crate::phone_mic::MIN_GAIN, crate::phone_mic::MAX_GAIN);
+        if !matches!(self.webcam_height, 720 | 1080 | 2160) {
+            self.webcam_height = 720;
+        }
+        self.timeline_retention_days = self.timeline_retention_days.min(i32::MAX as u32);
+        if self.local_api_port != 0 && self.local_api_port < 1024 {
+            self.local_api_port = DEFAULT_LOCAL_API_PORT;
+        }
+        if self.obs_port == 0 {
+            self.obs_port = crate::obs::DEFAULT_PORT;
+        }
         #[cfg(target_os = "macos")]
         {
             self.close_to_tray = false;
@@ -627,7 +651,19 @@ impl Settings {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Settings::default(),
             Err(e) => {
-                tracing::warn!(error = %e, "can't read settings; using defaults");
+                // Any other read failure (permission denied, locked file,
+                // invalid UTF-8) used to run on defaults and let the next
+                // save overwrite the user's real file with those defaults,
+                // destroying the OBS password blob and all rules. Set the
+                // unreadable file aside instead, like a corrupt one.
+                tracing::warn!(error = %e, "can't read settings; setting the file aside and using defaults");
+                let mut aside = path.with_extension("json.unreadable");
+                let mut n = 1;
+                while aside.exists() && n < 100 {
+                    aside = path.with_extension(format!("json.unreadable.{n}"));
+                    n += 1;
+                }
+                let _ = fs::rename(&path, &aside);
                 return Settings::default();
             }
         };
@@ -642,17 +678,34 @@ impl Settings {
     }
 
     /// Saves atomically: a crash mid-write never leaves a half-written file.
+    /// The temp name is unique per process (two app instances sharing a
+    /// data dir no longer interleave into one fixed `.tmp` file), the file
+    /// is owner-only on Unix (it can hold the encrypted OBS password), and
+    /// the parent directory is fsynced after the rename on Unix so the new
+    /// directory entry itself survives a power loss.
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         static SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = SAVE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = Self::path(dir);
-        let tmp = path.with_extension("json.tmp");
+        let tmp = path.with_extension(format!("json.tmp.{}", std::process::id()));
         {
             let mut file = fs::File::create(&tmp)?;
             file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
             file.sync_all()?;
         }
-        fs::rename(&tmp, &path)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
+        }
+        fs::rename(&tmp, &path)?;
+        #[cfg(unix)]
+        {
+            if let Ok(dir_file) = fs::File::open(dir) {
+                let _ = dir_file.sync_all();
+            }
+        }
+        Ok(())
     }
 }
 

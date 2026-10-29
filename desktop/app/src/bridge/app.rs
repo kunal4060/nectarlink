@@ -483,11 +483,18 @@ pub struct AppControllerRust {
     last_online_count: usize,
     last_tray_tooltip: String,
     tray: Option<tray::Tray>,
+    /// Token stored alongside this instance's thread handle in
+    /// `CONTROLLER`; `Drop` clears the slot only when it still matches.
+    controller_token: u64,
 }
 
 /// The controller's thread handle, so other threads (second launch) can
 /// reach it.
-static CONTROLLER: OnceLock<Mutex<Option<CxxQtThread<qobject::AppController>>>> = OnceLock::new();
+static CONTROLLER: OnceLock<Mutex<Option<(CxxQtThread<qobject::AppController>, u64)>>> =
+    OnceLock::new();
+/// Monotonic id per controller instance, so an old controller's `Drop`
+/// cannot wipe a newer controller's thread handle (see `Drop` below).
+static CONTROLLER_TOKEN: AtomicU64 = AtomicU64::new(0);
 static SHELF_OPEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static QUIT_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -522,28 +529,40 @@ pub fn install_update_in_background() {
     let Some(qt) = controller() else { return };
     let started = qt.queue(|mut object| {
         if object.update_busy {
+            object.toast(QString::from("An update is already downloading."));
             return;
         }
         object.as_mut().set_update_busy(true);
         object.as_mut().set_update_progress(-1.0);
         object.as_mut().set_update_status(QString::from("Downloading the update…"));
         let qt = object.qt_thread();
-        std::thread::spawn(move || {
+        let fallback_qt = qt.clone();
+        let spawned = std::thread::spawn(move || {
             let progress_qt = qt.clone();
-            let result = crate::updater::install(move |done, total| {
-                let fraction = if total > 0 { (done as f64 / total as f64).clamp(0.0, 1.0) } else { -1.0 };
-                let text = if total > 0 {
-                    tr!("App", "Downloading the update · %1 of %2", megabytes(done), megabytes(total))
-                } else {
-                    tr!("App", "Downloading the update…")
-                };
-                let _ = progress_qt.queue(move |mut object| {
-                    object.as_mut().set_update_progress(fraction);
-                    object.as_mut().set_update_status(QString::from(&text));
-                });
-            });
+            // A panic in the worker must not strand update_busy=true: turn
+            // it into an ordinary error so the queued completion clears it.
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::updater::install(move |done, total| {
+                    let fraction = if total > 0 { (done as f64 / total as f64).clamp(0.0, 1.0) } else { -1.0 };
+                    let text = if total > 0 {
+                        tr!("App", "Downloading the update · %1 of %2", megabytes(done), megabytes(total))
+                    } else {
+                        tr!("App", "Downloading the update…")
+                    };
+                    let _ = progress_qt.queue(move |mut object| {
+                        object.as_mut().set_update_progress(fraction);
+                        object.as_mut().set_update_status(QString::from(&text));
+                    });
+                })
+            }))
+            .map_err(|_| tr!("App", "The update failed unexpectedly."))
+            .and_then(|r| r);
             let _ = qt.queue(move |mut object| match result {
                 Ok(()) => {
+                    // Clear the flag even on success: the installer may fail
+                    // to launch (or the quit may be deferred), and a stuck
+                    // flag would make every later Check/Install a silent no-op.
+                    object.as_mut().set_update_busy(false);
                     object.as_mut().set_update_progress(-1.0);
                     object
                         .as_mut()
@@ -557,6 +576,15 @@ pub fn install_update_in_background() {
                 }
             });
         });
+        if spawned.is_err() {
+            // The worker never started, so its queued completion never runs.
+            let _ = fallback_qt.queue(|mut object| {
+                object.as_mut().set_update_busy(false);
+                object.as_mut().set_update_progress(-1.0);
+                object.as_mut().set_update_status(QString::default());
+                object.toast(QString::from("The update failed to start."));
+            });
+        }
     });
     if started.is_err() {
         tracing::warn!("can't start the update");
@@ -572,25 +600,33 @@ fn megabytes(bytes: u64) -> String {
 /// findings land in `doctor_checks`.
 fn diagnose_in_background(mut object: Pin<&mut qobject::AppController>, fix: Option<String>) {
     if object.doctor_busy {
+        object.toast(QString::from("The Connection Doctor is already running."));
         return;
     }
     object.as_mut().set_doctor_busy(true);
     let qt = object.qt_thread();
     let spawned = std::thread::Builder::new().name("doctor".into()).spawn(move || {
-        if let Some(fix) = fix {
-            crate::doctor::fix(&fix);
-            // A reconnect needs a moment to show.
-            if fix == "reconnect" {
-                std::thread::sleep(std::time::Duration::from_secs(3));
+        // A panic must still clear doctor_busy, or Doctor becomes a dead
+        // button until restart (its queued completion would never run).
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(fix) = fix {
+                crate::doctor::fix(&fix);
+                // A reconnect needs a moment to show.
+                if fix == "reconnect" {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                }
             }
-        }
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs() as i64);
-        let checks = crate::doctor::diagnose(&crate::doctor::gather(), now);
-        let json = serde_json::to_string(&checks).unwrap_or_else(|_| "[]".into());
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs() as i64);
+            let checks = crate::doctor::diagnose(&crate::doctor::gather(), now);
+            serde_json::to_string(&checks).unwrap_or_else(|_| "[]".into())
+        }));
         let _ = qt.queue(move |mut object| {
-            object.as_mut().set_doctor_checks(QString::from(&json));
+            match outcome {
+                Ok(json) => object.as_mut().set_doctor_checks(QString::from(&json)),
+                Err(_) => object.toast(QString::from("The Connection Doctor failed unexpectedly.")),
+            }
             object.set_doctor_busy(false);
         });
     });
@@ -599,8 +635,24 @@ fn diagnose_in_background(mut object: Pin<&mut qobject::AppController>, fix: Opt
     }
 }
 
+/// Takes the pending PC-mirror prompt only when it belongs to `id`, and
+/// returns its options. A prompt for another device (or no prompt) yields
+/// `None` and is left untouched, so it can still be answered for its device.
+fn take_pc_mirror_prompt(id: DeviceId) -> Option<nectarlink_core::MirrorStart> {
+    let mut options = None;
+    core_host::host().hub.update(|s| {
+        if s.pc_mirror_prompt.as_ref().is_some_and(|(d, _)| *d == id) {
+            options = s.pc_mirror_prompt.take().map(|(_, opts)| opts);
+            Changes::REMOTE
+        } else {
+            Changes::NONE
+        }
+    });
+    options
+}
+
 fn controller() -> Option<CxxQtThread<qobject::AppController>> {
-    CONTROLLER.get()?.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    CONTROLLER.get()?.lock().unwrap_or_else(|e| e.into_inner()).clone().map(|(qt, _)| qt)
 }
 
 /// Asks the app to quit (from any thread), as Quit in the tray does.
@@ -690,18 +742,14 @@ pub(crate) fn open_dialer(device: DeviceId, number: &str) {
     if number.is_empty() {
         return;
     }
-    let idx = core_host::host().hub.read(|s| {
-        s.devices
-            .iter()
-            .position(|d| d.id == device && matches!(d.link, LinkState::Online { .. }))
-            .or_else(|| s.devices.iter().position(|d| matches!(d.link, LinkState::Online { .. })))
-            .or_else(|| s.devices.iter().position(|d| d.id == device))
-    });
+    // Only the requested phone, even when it is offline: retargeting to
+    // another online phone would prefill (and risk dialling from) the
+    // wrong phone/SIM, and silently switch the selected device.
+    let idx = core_host::host().hub.read(|s| s.devices.iter().position(|d| d.id == device));
+    let Some(idx) = idx else { return };
     if let Some(qt) = controller() {
         let _ = qt.queue(move |mut object| {
-            if let Some(idx) = idx {
-                object.as_mut().set_current_device(idx as i32);
-            }
+            object.as_mut().set_current_device(idx as i32);
             object.as_mut().set_pending_dial(QString::from(&number));
             object.as_mut().set_current_page(QString::from("calls"));
             object.activate_requested();
@@ -762,11 +810,17 @@ impl cxx_qt::Initialize for qobject::AppController {
         self.as_mut().refresh_appearance();
         self.as_mut().refresh_localsend_state();
         let qt = self.qt_thread();
-        *CONTROLLER.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) = Some(qt.clone());
+        let token = CONTROLLER_TOKEN.fetch_add(1, Ordering::SeqCst) + 1;
+        self.as_mut().rust_mut().controller_token = token;
+        *CONTROLLER.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((qt.clone(), token));
         if QUIT_REQUESTED.load(Ordering::Acquire) {
             let _ = qt.queue(|object| object.quit_requested());
         }
-        if let Some(task) = PENDING_JUMP_TASK.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        // Drain every task queued before the UI loaded, in order: the old
+        // single slot silently dropped all but the last one.
+        while let Some(task) = pending_jump_tasks().lock().unwrap_or_else(|e| e.into_inner()).pop_front()
+        {
             dispatch_jump_task(&qt, task);
         }
         super::subscribe(
@@ -846,7 +900,11 @@ impl cxx_qt::Initialize for qobject::AppController {
     }
 }
 
-static PENDING_JUMP_TASK: Mutex<Option<String>> = Mutex::new(None);
+static PENDING_JUMP_TASK: OnceLock<Mutex<std::collections::VecDeque<String>>> = OnceLock::new();
+
+fn pending_jump_tasks() -> &'static Mutex<std::collections::VecDeque<String>> {
+    PENDING_JUMP_TASK.get_or_init(Mutex::default)
+}
 
 /// Executes one of the 5 Windows Taskbar Jump List tasks (`--task <action>`).
 pub fn handle_jump_task(action: &str) {
@@ -855,7 +913,7 @@ pub fn handle_jump_task(action: &str) {
         return;
     }
     let Some(qt) = controller() else {
-        *PENDING_JUMP_TASK.lock().unwrap_or_else(|e| e.into_inner()) = Some(action);
+        pending_jump_tasks().lock().unwrap_or_else(|e| e.into_inner()).push_back(action);
         return;
     };
     dispatch_jump_task(&qt, action);
@@ -869,15 +927,21 @@ fn dispatch_jump_task(qt: &CxxQtThread<qobject::AppController>, action: String) 
             object.file_picker_requested();
         }
         "send-clipboard" => {
-            if let (Some(device), _, _) = resolve_shelf_device(object.current_device) {
+            // Strictly the selected phone: falling back to another online
+            // phone would silently send the PC clipboard to the wrong phone.
+            if let (Some(device), _, _) = selected_shelf_device(object.current_device) {
                 crate::clipboard::send_now(device);
             } else {
                 object.toast(QString::from("No paired phone is connected."));
             }
         }
         "find-phone" => {
-            if let (Some(device), _, _) = resolve_shelf_device(object.current_device) {
-                ring_device(device, true);
+            if let (Some(device), device_name, online) = selected_shelf_device(object.current_device) {
+                if online {
+                    ring_device(device, true);
+                } else {
+                    object.toast(QString::from(&format!("{device_name} is offline.")));
+                }
             } else {
                 object.toast(QString::from("No paired phone is connected."));
             }
@@ -1058,6 +1122,12 @@ fn refresh_wallpaper_colors(qt: CxxQtThread<qobject::AppController>) {
             return;
         }
         let _ = qt.queue(move |object| {
+            // Re-check on the Qt thread: checking only before the queue let
+            // a stale worker pre-empted between check and queue apply last
+            // and revert the theme to the previous wallpaper's palette.
+            if WALLPAPER_GENERATION.load(Ordering::SeqCst) != generation {
+                return;
+            }
             object.set_wallpaper_colors(QString::from(json.as_deref().unwrap_or_default()));
         });
     });
@@ -1409,18 +1479,23 @@ impl qobject::AppController {
         let action =
             LAST_TOAST_ACTION.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner()).take();
         match action {
-            Some(ToastAction::UndoQueuedSend { device, item_id }) => {
-                if crate::continuity_camera::view().busy {
-                    crate::continuity_camera::cancel();
-                }
+            Some(ToastAction::UndoQueuedSend { device: _, item_id }) => {
+                // Undo cancels exactly the queued item the toast named. When
+                // the item could not be identified, cancel nothing: falling
+                // back to cancel-all would silently drop queued sends the
+                // toast never mentioned. (An unrelated in-flight camera
+                // capture is never cancelled from here either.)
                 if let Some(id) = item_id {
                     crate::transfers::cancel_queue_item(&id);
+                    show_message(tr!("App", "Send cancelled"));
                 } else {
-                    crate::transfers::cancel_all_queued(Some(device));
+                    show_message(tr!("App", "Couldn't identify the queued send to cancel."));
                 }
-                show_message(tr!("App", "Send cancelled"));
             }
-            _ => crate::clipboard::run_last_suggestion(),
+            Some(ToastAction::ClipSuggestion) => crate::clipboard::run_last_suggestion(),
+            // No action recorded (e.g. a plain toast replaced the action
+            // toast): run nothing rather than a stale clipboard suggestion.
+            None => {}
         }
     }
 
@@ -1550,10 +1625,23 @@ impl qobject::AppController {
     }
 
     pub fn allow_remote_input(mut self: Pin<&mut Self>, device: &QString) {
-        self.as_mut().set_device_toggle(device, &QString::from("remote_input"), true);
-        core_host::host()
-            .hub
-            .update(|s| if s.remote_prompt.take().is_some() { Changes::REMOTE } else { Changes::NONE });
+        // Only the device the consent prompt was actually shown for may be
+        // enabled: enabling any other device would grant remote control that
+        // was never consented to, and silently dismiss the real prompt.
+        let Some(id) = super::parse_device(device) else { return };
+        let mut matched = false;
+        core_host::host().hub.update(|s| {
+            if s.remote_prompt == Some(id) {
+                s.remote_prompt = None;
+                matched = true;
+                Changes::REMOTE
+            } else {
+                Changes::NONE
+            }
+        });
+        if matched {
+            self.as_mut().set_device_toggle(device, &QString::from("remote_input"), true);
+        }
     }
 
     pub fn dismiss_remote_prompt(self: Pin<&mut Self>) {
@@ -1564,43 +1652,35 @@ impl qobject::AppController {
 
     pub fn allow_pc_mirror_once(self: Pin<&mut Self>, device: &QString) {
         let Some(id) = super::parse_device(device) else { return };
+        // Check-and-take the prompt FIRST: marking the session allowed before
+        // the prompt matches leaves the PC exposed to a phone whose prompt
+        // was never approved (or that never prompted at all). A non-matching
+        // prompt is left in place for its own device.
+        let Some(opts) = take_pc_mirror_prompt(id) else {
+            if let Some(node) = core_host::node() {
+                node.set_pc_mirror_session_allowed(id, false);
+            }
+            return;
+        };
         if let Some(node) = core_host::node() {
             node.set_pc_mirror_session_allowed(id, true);
         }
-        let mut options = None;
-        core_host::host().hub.update(|s| {
-            if let Some((prompt_id, opts)) = s.pc_mirror_prompt.take()
-                && prompt_id == id
-            {
-                options = Some(opts);
-            }
-            Changes::REMOTE
-        });
-        if let Some(opts) = options {
-            crate::pc_mirror::start(id, opts);
-        } else {
-            core_host::refresh_capabilities();
-        }
+        crate::pc_mirror::start(id, opts);
     }
 
     pub fn allow_pc_mirror_device(mut self: Pin<&mut Self>, device: &QString) {
         let Some(id) = super::parse_device(device) else { return };
+        let Some(opts) = take_pc_mirror_prompt(id) else {
+            if let Some(node) = core_host::node() {
+                node.set_pc_mirror_session_allowed(id, false);
+            }
+            return;
+        };
         self.as_mut().set_device_toggle(device, &QString::from("pc_mirror"), true);
         if let Some(node) = core_host::node() {
             node.set_pc_mirror_session_allowed(id, true);
         }
-        let mut options = None;
-        core_host::host().hub.update(|s| {
-            if let Some((prompt_id, opts)) = s.pc_mirror_prompt.take()
-                && prompt_id == id
-            {
-                options = Some(opts);
-            }
-            Changes::REMOTE
-        });
-        if let Some(opts) = options {
-            crate::pc_mirror::start(id, opts);
-        }
+        crate::pc_mirror::start(id, opts);
     }
 
     pub fn dismiss_pc_mirror_prompt(self: Pin<&mut Self>) {
@@ -1651,7 +1731,10 @@ impl qobject::AppController {
     pub fn set_hotspot_network(&self, device: &QString, network: &QString) {
         if let Some(id) = super::parse_device(device) {
             let name = String::from(network);
-            crate::hotspot::set_network(id, (!name.trim().is_empty()).then_some(name));
+            // Store trimmed: a pasted leading/trailing space made the
+            // later auto-join lookup silently never match the real SSID.
+            let trimmed = name.trim();
+            crate::hotspot::set_network(id, (!trimmed.is_empty()).then_some(trimmed.to_owned()));
         }
     }
 
@@ -1670,42 +1753,54 @@ impl qobject::AppController {
     pub fn set_device_toggle(mut self: Pin<&mut Self>, device: &QString, name: &QString, on: bool) {
         let (Some(id), Some(node)) = (super::parse_device(device), core_host::node()) else { return };
         let name_str = String::from(name);
-        if let Err(e) = node.set_device_toggle(id, &name_str, on) {
+        // A failed enable must not consume the consent prompt, trigger a
+        // sync, or bump the revision: none of those things happened.
+        // (Failed disables still run the safe stops below.)
+        let failed = if let Err(e) = node.set_device_toggle(id, &name_str, on) {
             show_message(describe(&e));
-        }
+            true
+        } else {
+            false
+        };
         if name_str == "remote_input" {
             if !on {
                 crate::remote::stop_all();
             }
-            core_host::host().hub.update(|s| {
-                if s.remote_prompt == Some(id) {
-                    s.remote_prompt = None;
-                    Changes::REMOTE
-                } else {
-                    Changes::NONE
-                }
-            });
-            core_host::refresh_capabilities();
+            if !failed {
+                core_host::host().hub.update(|s| {
+                    if s.remote_prompt == Some(id) {
+                        s.remote_prompt = None;
+                        Changes::REMOTE
+                    } else {
+                        Changes::NONE
+                    }
+                });
+                core_host::refresh_capabilities();
+            }
         }
         if name_str == "pc_mirror" {
             if !on {
                 crate::pc_mirror::stop_for(&id);
             }
-            core_host::host().hub.update(|s| {
-                if s.pc_mirror_prompt.as_ref().is_some_and(|(d, _)| *d == id) {
-                    s.pc_mirror_prompt = None;
-                    Changes::REMOTE
-                } else {
-                    Changes::NONE
-                }
-            });
-            core_host::refresh_capabilities();
+            if !failed {
+                core_host::host().hub.update(|s| {
+                    if s.pc_mirror_prompt.as_ref().is_some_and(|(d, _)| *d == id) {
+                        s.pc_mirror_prompt = None;
+                        Changes::REMOTE
+                    } else {
+                        Changes::NONE
+                    }
+                });
+                core_host::refresh_capabilities();
+            }
         }
-        if name_str == "storage" {
+        if name_str == "storage" && !failed {
             crate::storage::sync();
         }
-        let revision = self.toggles_revision.wrapping_add(1);
-        self.as_mut().set_toggles_revision(revision);
+        if !failed {
+            let revision = self.toggles_revision.wrapping_add(1);
+            self.as_mut().set_toggles_revision(revision);
+        }
     }
 
     pub fn phone_toggles(&self, device: &QString) -> QString {
@@ -1752,23 +1847,31 @@ impl qobject::AppController {
                 // The phone's hotspot is on: join it, when a network is set for it.
                 Ok(()) if hotspot_on => crate::hotspot::hotspot_turned_on(device),
                 Ok(()) => {}
-                Err(e) => {
-                    let latest = node.phone_toggles(device);
-                    core_host::host().hub.update(|s| s.set_toggles(device, latest));
-                    show_message(describe(&e));
-                }
+                Err(e) => show_message(describe(&e)),
             }
+            // Re-read the phone's truth either way: hotspot/pc_active have
+            // no field in the local toggle state, so without this they never
+            // updated (or snapped back) until an unrelated refresh — and a
+            // failed toggle leaves the optimistic value on screen.
+            let latest = node.phone_toggles(device);
+            core_host::host().hub.update(|s| s.set_toggles(device, latest));
         });
     }
 
     pub fn check_for_updates(mut self: Pin<&mut Self>) {
         if self.update_busy {
+            self.toast(QString::from("Already checking for updates."));
             return;
         }
         self.as_mut().set_update_busy(true);
         let qt = self.qt_thread();
-        std::thread::spawn(move || {
-            let message = crate::updater::check_now(true);
+        let spawned = std::thread::spawn(move || {
+            let message = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::updater::check_now(true)
+            })) {
+                Ok(message) => message,
+                Err(_) => Some(tr!("App", "Checking for updates failed unexpectedly.")),
+            };
             let _ = qt.queue(move |mut object| {
                 object.as_mut().set_update_busy(false);
                 if let Some(message) = message {
@@ -1776,6 +1879,11 @@ impl qobject::AppController {
                 }
             });
         });
+        if spawned.is_err() {
+            // The worker never started, so its queued completion never runs.
+            self.as_mut().set_update_busy(false);
+            self.toast(QString::from("Checking for updates failed to start."));
+        }
     }
 
     pub fn install_update(self: Pin<&mut Self>) {
@@ -1956,9 +2064,35 @@ impl qobject::AppController {
             && let Some(node) = core_host::node()
             && let Some((_, bytes)) = node.clipboard_history_image(&s)
         {
-            let tmp = core_host::host().data_dir.join("cache").join("shelf-clip.png");
-            if let Some(parent) = tmp.parent() {
-                let _ = std::fs::create_dir_all(parent);
+            // A unique file per drag: the old single fixed path let a
+            // second drag overwrite the file before the first drop target
+            // read it, so the recipient got the wrong image.
+            let cache = core_host::host().data_dir.join("cache");
+            let _ = std::fs::create_dir_all(&cache);
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let tmp = cache.join(format!("shelf-clip-{}-{nanos}.png", std::process::id()));
+            // Best-effort litter cleanup (the drag API reports no
+            // completion, so the just-written file cannot be deleted here):
+            // drop day-old clip drags, which no live drag can still need.
+            if let Ok(entries) = std::fs::read_dir(&cache) {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    let stale = p
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("shelf-clip-") && n.ends_with(".png"))
+                        && entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .and_then(|m| m.elapsed().ok())
+                            .is_some_and(|age| age.as_secs() > 24 * 60 * 60);
+                    if stale {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                }
             }
             if std::fs::write(&tmp, &bytes).is_ok() {
                 return super::native::ffi::start_external_drag(&tmp.to_string_lossy(), "");
@@ -2018,8 +2152,13 @@ impl qobject::AppController {
 
         if !paths.is_empty() {
             crate::transfers::send(device, paths);
+            // Always name the actual recipient: previously an offline drop
+            // showed nothing, so files could queue to a fallback phone
+            // without the user ever seeing which phone got them.
             if online {
                 show_message(tr!("App", "Sending to %1…", device_name));
+            } else {
+                show_message(tr!("App", "Queued for %1 (offline).", device_name));
             }
             return;
         }
@@ -2172,16 +2311,10 @@ fn find_guide_file_on_disk(file_stem: &str) -> Option<String> {
         return None;
     }
     let rel = std::path::PathBuf::from("docs").join("guide").join(format!("{safe}.md"));
+    // Only shipped locations: the working directory used to win, so a
+    // planted docs/guide/*.md in the launch directory would render as
+    // trusted in-app help.
     let mut candidates = Vec::new();
-    if let Ok(cwd) = std::env::current_dir() {
-        candidates.push(cwd.join(&rel));
-        if let Some(parent) = cwd.parent() {
-            candidates.push(parent.join(&rel));
-            if let Some(grand) = parent.parent() {
-                candidates.push(grand.join(&rel));
-            }
-        }
-    }
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
@@ -2667,6 +2800,20 @@ fn load_guide_doc_content(raw_key: &str) -> (String, String) {
     (title, body)
 }
 
+/// The Shelf's *selected* device only, with no fallback to another phone.
+/// Send paths must use this: `resolve_shelf_device` substitutes the first
+/// online phone when the selected one is offline, which would silently send
+/// clipboard content or files to a phone the user did not pick.
+fn selected_shelf_device(current_device_idx: i32) -> (Option<DeviceId>, String, bool) {
+    core_host::host().hub.read(|s| {
+        let idx = current_device_idx.max(0) as usize;
+        match s.devices.get(idx) {
+            Some(d) => (Some(d.id), d.info.name.clone(), matches!(d.link, LinkState::Online { .. })),
+            None => (None, String::new(), false),
+        }
+    })
+}
+
 fn resolve_shelf_device(current_device_idx: i32) -> (Option<DeviceId>, String, bool) {
     core_host::host().hub.read(|s| {
         let idx = current_device_idx.max(0) as usize;
@@ -2682,6 +2829,16 @@ fn resolve_shelf_device(current_device_idx: i32) -> (Option<DeviceId>, String, b
             None => (None, String::new(), false),
         }
     })
+}
+
+/// Normalises a Unix timestamp to milliseconds. Timeline timestamps and
+/// `PhotoNew.taken` are seconds, `PhotoItem.date` and filesystem mtimes are
+/// milliseconds; comparing them raw let every Downloads file outrank any
+/// genuinely newer timeline/home photo. Values below 10^11 are seconds
+/// (millis only reach that in 1973 / seconds in year 5138, so the split is
+/// unambiguous for real timestamps).
+fn unix_ts_to_millis(ts: i64) -> i64 {
+    if ts.abs() < 100_000_000_000 { ts.saturating_mul(1000) } else { ts }
 }
 
 fn compute_shelf_items_json(current_device_idx: i32) -> String {
@@ -2718,10 +2875,10 @@ fn compute_shelf_items_json(current_device_idx: i32) -> String {
                     });
                     if d.photo_is_screenshot {
                         latest_screenshot = Some(obj);
-                        latest_screenshot_ts = d.photo_date;
+                        latest_screenshot_ts = unix_ts_to_millis(d.photo_date);
                     } else {
                         latest_photo = Some(obj);
-                        latest_photo_ts = d.photo_date;
+                        latest_photo_ts = unix_ts_to_millis(d.photo_date);
                     }
                 }
             }
@@ -2763,13 +2920,14 @@ fn compute_shelf_items_json(current_device_idx: i32) -> String {
                 "thumbUrl": crate::icons::file_url(&path),
                 "localPath": path.to_string_lossy(),
             });
+            let entry_ts = unix_ts_to_millis(entry.timestamp);
             if is_shot {
-                if entry.timestamp >= latest_screenshot_ts {
-                    latest_screenshot_ts = entry.timestamp;
+                if entry_ts >= latest_screenshot_ts {
+                    latest_screenshot_ts = entry_ts;
                     latest_screenshot = Some(obj);
                 }
-            } else if entry.timestamp >= latest_photo_ts {
-                latest_photo_ts = entry.timestamp;
+            } else if entry_ts >= latest_photo_ts {
+                latest_photo_ts = entry_ts;
                 latest_photo = Some(obj);
             }
         }
@@ -2813,7 +2971,11 @@ fn compute_shelf_items_json(current_device_idx: i32) -> String {
                 "thumbUrl": crate::icons::file_url(p),
                 "localPath": p.to_string_lossy(),
             }));
-        } else if !is_shot && latest_photo.is_none() {
+        } else if !is_shot && *ts > latest_photo_ts {
+            // Mirror the screenshot branch: previously only the first
+            // Downloads photo won, so a newer saved photo never replaced a
+            // stale home/timeline photo (or an older Downloads one).
+            latest_photo_ts = *ts;
             latest_photo = Some(serde_json::json!({
                 "id": p.to_string_lossy(),
                 "name": name,
@@ -2967,8 +3129,15 @@ fn compute_data_retention_json() -> String {
 
 impl Drop for AppControllerRust {
     fn drop(&mut self) {
+        // Only clear the slot when it still holds THIS instance's handle:
+        // a newer controller initialised before this one drops must keep
+        // its handle, or toasts, quit requests and background updates
+        // silently stop working until the next re-initialisation.
         if let Some(cell) = CONTROLLER.get() {
-            *cell.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            let mut slot = cell.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().is_some_and(|(_, token)| *token == self.controller_token) {
+                *slot = None;
+            }
         }
     }
 }
@@ -3261,6 +3430,9 @@ fn refresh_home_if_needed(device: DeviceId, force_sms: bool, force_calls: bool, 
     if !online {
         return;
     }
+    // Check the node BEFORE setting busy flags: setting them first and then
+    // returning on node==None leaked them, gating every later refresh out.
+    let Some(node) = core_host::node() else { return };
     let (do_sms, do_calls, do_photo) = home_store(|s| {
         if s.watched != Some(device) {
             return (false, false, false);
@@ -3280,7 +3452,6 @@ fn refresh_home_if_needed(device: DeviceId, force_sms: bool, force_calls: bool, 
         }
         (do_sms, do_calls, do_photo)
     });
-    let Some(node) = core_host::node() else { return };
     if do_sms {
         let node = node.clone();
         core_host::spawn(async move {

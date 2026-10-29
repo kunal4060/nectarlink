@@ -297,7 +297,14 @@ mod imp {
             .map(|d| d.id)
             .collect();
         let wanted = *TARGET.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&peer) = wanted.as_ref().filter(|w| peers.contains(w)).or_else(|| peers.first()) else {
+        // A phone that asked to be the speaker gets the audio only while it is
+        // online; when it goes away, stream nothing rather than leaking live
+        // PC audio to a different paired phone. Only when no phone asked
+        // (the PC turned it on) does the first online phone get it.
+        let Some(&peer) = match wanted.as_ref() {
+            None => peers.first(),
+            Some(wanted) => peers.iter().find(|p| **p == *wanted),
+        } else {
             std::thread::sleep(Duration::from_millis(500));
             return Ok(());
         };
@@ -412,7 +419,14 @@ mod imp {
             .map(|d| d.id)
             .collect();
         let wanted = *TARGET.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(&peer) = wanted.as_ref().filter(|w| peers.contains(w)).or_else(|| peers.first()) else {
+        // A phone that asked to be the speaker gets the audio only while it is
+        // online; when it goes away, stream nothing rather than leaking live
+        // PC audio to a different paired phone. Only when no phone asked
+        // (the PC turned it on) does the first online phone get it.
+        let Some(&peer) = match wanted.as_ref() {
+            None => peers.first(),
+            Some(wanted) => peers.iter().find(|p| **p == *wanted),
+        } else {
             std::thread::sleep(Duration::from_millis(500));
             return Ok(());
         };

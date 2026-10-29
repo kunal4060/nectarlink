@@ -108,6 +108,9 @@ struct State {
     app_filter: String,
     /// Staged MMS image attachment for the current SMS composer.
     staged_attachment: Option<StagedAttachment>,
+    /// Cached palette triples per device, so the palette can serve a
+    /// second phone without hijacking this page's device.
+    thread_cache: HashMap<DeviceId, Vec<(String, String, String)>>,
     /// Bumped when the phone changes, so late answers are dropped.
     generation: u64,
 }
@@ -545,18 +548,25 @@ pub fn load_chat_threads() {
     changed();
 }
 
+/// Monotonic load order: generation alone can't order two loads for
+/// the same device, so a slow first load used to overwrite a newer one.
+static LOAD_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn load_threads() {
     load_chat_threads();
-    let Some((device, generation)) = state(|s| {
+    let Some((device, generation)) = state(|s| s.device.map(|d| (d, s.generation))) else {
+        return;
+    };
+    // Check the node before marking Loading: the old order left the
+    // page stuck at Loading with the core down.
+    let Some(node) = core_host::node() else { return };
+    state(|s| {
         if s.threads.is_empty() && s.chat_threads.is_empty() {
             s.status = Status::Loading;
         }
-        s.device.map(|d| (d, s.generation))
-    }) else {
-        return;
-    };
+    });
     changed();
-    let Some(node) = core_host::node() else { return };
+    let seq = LOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     core_host::spawn(async move {
         let result = node.sms_threads(device, THREADS).await;
         let photos = match &result {
@@ -564,12 +574,21 @@ pub fn load_threads() {
             Err(_) => HashMap::new(),
         };
         state(|s| {
-            if s.generation != generation {
+            if s.generation != generation || seq != LOAD_SEQ.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(1) {
                 return;
             }
             match result {
                 Ok(threads) => {
                     crate::bridge::app::update_home_sms(device, &threads);
+                    s.thread_cache.insert(
+                        device,
+                        threads
+                            .iter()
+                            .map(|t| {
+                                (title_of(t), t.addresses.first().cloned().unwrap_or_default(), t.id.clone())
+                            })
+                            .collect(),
+                    );
                     s.threads = threads;
                     s.photos.extend(photos);
                     s.status = Status::Ready;
@@ -747,10 +766,14 @@ pub fn palette_recipients(device: DeviceId) -> Vec<(String, String, String)> {
                 out.push((title, addr, t.id.clone()));
             }
             s.threads.is_empty() && s.status != Status::Loading
-        } else if s.device.is_none() {
-            *s = State { device: Some(device), generation: s.generation + 1, ..State::default() };
-            true
         } else {
+            // Serve another phone from its cache, never by hijacking
+            // this page's device: the old fallback silently switched
+            // the Messages page to the first phone the palette asked
+            // about and started loading its threads.
+            if let Some(cached) = s.thread_cache.get(&device) {
+                out.extend(cached.iter().cloned());
+            }
             false
         }
     });
@@ -804,7 +827,10 @@ fn load_messages(before: Option<i64>) {
     core_host::spawn(async move {
         let result = node.sms_messages(device, thread.clone(), before, PAGE).await;
         let wanted = state(|s| {
-            s.loading_older = false;
+            // Only the load that set it may clear it.
+            if before.is_some() {
+                s.loading_older = false;
+            }
             if s.generation != generation || s.thread.as_deref() != Some(&thread) {
                 return Vec::new();
             }
@@ -813,10 +839,22 @@ fn load_messages(before: Option<i64>) {
                     let full = page.len() as u32 >= PAGE;
                     if before.is_none() {
                         // The latest page replaces what was there, keeping
-                        // older pages already read.
+                        // older pages already read, optimistic local
+                        // sends, and messages sharing the boundary
+                        // timestamp (the old strict < dropped those,
+                        // and a refresh dropped unsent "Sending…" rows).
                         let oldest = page.last().map(|m| m.date).unwrap_or(i64::MAX);
-                        let older: Vec<SmsMessage> =
-                            s.messages.drain(..).filter(|m| m.date < oldest).collect();
+                        let page_ids: std::collections::HashSet<&str> =
+                            page.iter().map(|m| m.id.as_str()).collect();
+                        let older: Vec<SmsMessage> = s
+                            .messages
+                            .drain(..)
+                            .filter(|m| {
+                                m.id.starts_with("local:")
+                                    || m.date < oldest
+                                    || (m.date == oldest && !page_ids.contains(m.id.as_str()))
+                            })
+                            .collect();
                         let had_older = !older.is_empty();
                         s.messages = page;
                         s.messages.extend(older);
@@ -854,6 +892,13 @@ async fn fetch_pictures(device: DeviceId, generation: u64, parts: Vec<String>) {
     let dir = files_dir();
     for id in parts {
         let Ok((mime, data)) = node.sms_part(device, id.clone()).await else { continue };
+        // Phone-supplied parts are written to disk uncapped: refuse
+        // anything absurd (real MMS parts are far below this) rather
+        // than filling the disk from a malicious part.
+        if data.len() > 32 * 1024 * 1024 {
+            tracing::warn!(part = %id, "skipping an oversize MMS part");
+            continue;
+        }
         let ext = if mime.contains("png") {
             "png"
         } else if mime.contains("gif") {
@@ -883,11 +928,15 @@ async fn fetch_pictures(device: DeviceId, generation: u64, parts: Vec<String>) {
         let current = state(|s| {
             let current = s.generation == generation;
             if current {
-                s.pictures.insert(id, path);
+                s.pictures.insert(id.clone(), path.clone());
             }
             current
         });
         if !current {
+            // The file was already written for a generation that has
+            // since moved on: delete it instead of leaving an orphan
+            // no UI state points at.
+            let _ = std::fs::remove_file(&path);
             return;
         }
         changed();
@@ -995,22 +1044,32 @@ fn stage_attachment_bytes(name: String, mime: String, data: Vec<u8>) -> bool {
     } else {
         "jpg"
     };
-    let dir = files_dir();
-    let preview_path = std::fs::create_dir_all(&dir).ok().and_then(|()| {
-        let p = dir.join(format!("mms-stage-{:016x}.{ext}", crate::photos::fingerprint_bytes(&data)));
-        (p.exists() || std::fs::write(&p, &data).is_ok()).then_some(p)
-    });
-    let preview_url = if is_audio {
-        String::new()
+    // Size first: the old order wrote the preview file, then dropped
+    // the data for an oversize attachment, leaving an orphan preview
+    // and a staged record pointing at it.
+    let (data, error, preview_path, preview_url) = if data.len() > MAX_ATTACHMENT_BYTES {
+        (Vec::new(), tr!("Messages", "Attachment is %1 (MMS supports up to 900 KB)", size_text), None, String::new())
     } else {
-        preview_path.as_ref().map(|p| crate::icons::file_url(p)).unwrap_or_default()
-    };
-    let (data, error) = if data.len() > MAX_ATTACHMENT_BYTES {
-        (Vec::new(), tr!("Messages", "Attachment is %1 (MMS supports up to 900 KB)", size_text))
-    } else {
-        (data, String::new())
+        let dir = files_dir();
+        let preview_path = std::fs::create_dir_all(&dir).ok().and_then(|()| {
+            let p = dir.join(format!("mms-stage-{:016x}.{ext}", crate::photos::fingerprint_bytes(&data)));
+            (p.exists() || std::fs::write(&p, &data).is_ok()).then_some(p)
+        });
+        let preview_url = if is_audio {
+            String::new()
+        } else {
+            preview_path.as_ref().map(|p| crate::icons::file_url(p)).unwrap_or_default()
+        };
+        (data, String::new(), preview_path, preview_url)
     };
     state(|s| {
+        // Replacing a staged attachment orphans its preview file.
+        if let Some(old) = s.staged_attachment.take()
+            && let Some(old_path) = old.preview_path
+            && Some(&old_path) != preview_path.as_ref()
+        {
+            let _ = std::fs::remove_file(old_path);
+        }
         s.staged_attachment =
             Some(StagedAttachment { name, mime, data, preview_path, preview_url, size_text, error });
     });
@@ -1022,6 +1081,34 @@ fn stage_attachment_bytes(name: String, mime: String, data: Vec<u8>) -> bool {
 pub fn attach_file(path_or_url: String) -> bool {
     let path = url_to_path(&path_or_url);
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("attachment").to_owned();
+    // Check the size before reading: a multi-GB file used to be read
+    // whole into RAM only to be rejected as oversize afterwards.
+    if let Ok(meta) = std::fs::metadata(&path)
+        && meta.len() as usize > MAX_ATTACHMENT_BYTES
+    {
+        // Stage the error without reading the file: the same oversize
+        // record stage_attachment_bytes would build after reading it.
+        let size_text = format_attachment_size(meta.len() as usize);
+        let error = tr!("Messages", "Attachment is %1 (MMS supports up to 900 KB)", size_text.clone());
+        state(|s| {
+            if let Some(old) = s.staged_attachment.take()
+                && let Some(old_path) = old.preview_path
+            {
+                let _ = std::fs::remove_file(old_path);
+            }
+            s.staged_attachment = Some(StagedAttachment {
+                name,
+                mime: String::new(),
+                data: Vec::new(),
+                preview_path: None,
+                preview_url: String::new(),
+                size_text,
+                error,
+            });
+        });
+        changed();
+        return true;
+    }
     let raw = match std::fs::read(&path) {
         Ok(b) if !b.is_empty() => b,
         _ => return false,
@@ -1057,7 +1144,17 @@ pub fn paste_clipboard_image() -> bool {
 
 /// Clears any staged MMS image attachment.
 pub fn clear_attachment() {
-    let had = state(|s| s.staged_attachment.take().is_some());
+    let had = state(|s| {
+        let old = s.staged_attachment.take();
+        if let Some(old) = old {
+            if let Some(path) = old.preview_path {
+                let _ = std::fs::remove_file(path);
+            }
+            true
+        } else {
+            false
+        }
+    });
     if had {
         changed();
     }
@@ -1102,7 +1199,12 @@ pub fn send(body: String) {
         Some(_) => {
             crate::bridge::app::show_message(tr!("Messages", "Group texts can't be sent from the PC yet."))
         }
-        None => {}
+        // No open conversation and not composing (the composer routes
+        // a new conversation through send_to instead): say so rather
+        // than silently dropping the text.
+        None => {
+            crate::bridge::app::show_message(tr!("Messages", "Open a conversation first, then send."))
+        }
     }
 }
 
@@ -1113,11 +1215,18 @@ fn send_chat_reply(thread_id: String, body: String) {
     }
     let now = now_ms();
     let local_id = -now.max(1);
-    let Some(device) = state(|s| {
+    // Validate device and node before pushing the optimistic message:
+    // the old order left "sending" stuck and a phantom message when
+    // the core was down.
+    let Some(device) = state(|s| s.device) else {
+        return;
+    };
+    let Some(node) = core_host::node() else { return };
+    state(|s| {
         s.sending = true;
         s.chat_messages.push(ChatMessageRecord {
             id: local_id,
-            peer: s.device?,
+            peer: device,
             thread_id: thread_id.clone(),
             sender: None,
             text: text.clone(),
@@ -1125,21 +1234,25 @@ fn send_chat_reply(thread_id: String, body: String) {
             self_sent: true,
             avatar: None,
         });
-        s.device
-    }) else {
-        return;
-    };
+    });
     changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         let result = node.reply_chat_thread(device, &thread_id, text).await;
         let refreshed_threads = node.chat_threads(device);
         let refreshed_messages = node.chat_messages(device, &thread_id, PAGE);
         state(|s| {
             s.sending = false;
-            s.chat_threads = refreshed_threads;
-            if s.thread.as_deref() == Some(&thread_id) {
-                s.chat_messages = refreshed_messages;
+            // On failure keep the optimistic message (there is no
+            // status field to mark it failed): the old code overwrote
+            // it with the refreshed list, so a failed reply vanished
+            // silently apart from the toast.
+            if result.is_ok() {
+                if s.device == Some(device) {
+                    s.chat_threads = refreshed_threads;
+                }
+                if s.thread.as_deref() == Some(&thread_id) {
+                    s.chat_messages = refreshed_messages;
+                }
             }
         });
         changed();
@@ -1155,7 +1268,14 @@ pub fn send_to(to: Vec<String>, body: String) {
     let now = now_ms();
     let seq = NEXT_LOCAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let local_id = format!("local:{now}:{seq}");
-    let Some((device, attachments)) = state(|s| {
+    // Validate device and node before consuming the staged attachment
+    // and clearing the composer: the old order ate the attachment and
+    // left "sending" stuck when the core was down.
+    let Some(device) = state(|s| s.device) else {
+        return;
+    };
+    let Some(node) = core_host::node() else { return };
+    let Some(attachments) = state(|s| {
         let valid_att =
             s.staged_attachment.as_ref().filter(|a| a.error.is_empty() && !a.data.is_empty()).cloned();
         if body.trim().is_empty() && valid_att.is_none() {
@@ -1191,12 +1311,11 @@ pub fn send_to(to: Vec<String>, body: String) {
                 },
             );
         }
-        Some((s.device?, attachments))
+        Some(attachments)
     }) else {
         return;
     };
     changed();
-    let Some(node) = core_host::node() else { return };
     core_host::spawn(async move {
         let result = if attachments.is_empty() {
             node.sms_send(device, to.clone(), body).await
@@ -1241,9 +1360,11 @@ fn reload_after_send(to: &[String]) {
 static PENDING_OPEN: Mutex<Option<Vec<String>>> = Mutex::new(None);
 
 /// The last digits of a number, to match "+1 555-0100" with "5550100".
+/// Ten digits (a full national number): nine collided distinct numbers
+/// that share a suffix (e.g. two area codes' 555-0100s).
 pub(crate) fn digits(number: &str) -> String {
     let all: String = number.chars().filter(char::is_ascii_digit).collect();
-    all[all.len().saturating_sub(9)..].to_owned()
+    all[all.len().saturating_sub(10)..].to_owned()
 }
 
 /// Reads the conversations and the open one again.

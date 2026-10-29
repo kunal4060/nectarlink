@@ -232,8 +232,15 @@ fn encode_frame(opcode: u8, bytes: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// 16 unpredictable bytes for the handshake key and frame masks.
+/// 16 unpredictable bytes for the handshake key and frame masks, from the
+/// system RNG (the old time+pid+stack-address hash was predictable to a
+/// local observer). The hash derivation survives only as a fallback if the
+/// RNG ever fails, so a nonce is still produced.
 fn nonce() -> [u8; 16] {
+    let mut out = [0u8; 16];
+    if crate::win::secure_random(&mut out) {
+        return out;
+    }
     let mut hasher = blake3::Hasher::new();
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
     hasher.update(&now.as_nanos().to_le_bytes());

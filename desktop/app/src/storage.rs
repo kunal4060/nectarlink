@@ -21,7 +21,7 @@ mod imp {
         os::windows::ffi::{OsStrExt, OsStringExt},
         sync::{
             Arc, Mutex, MutexGuard,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
         },
         time::Duration,
     };
@@ -123,6 +123,14 @@ mod imp {
     static ACTIVE_ROOTS: Mutex<Option<HashMap<DeviceId, Arc<ActiveRoot>>>> = Mutex::new(None);
     #[cfg(windows)]
     static RECONCILING: Mutex<()> = Mutex::new(());
+    /// Monotonic generation for `sync()` snapshots: Rust mutexes give no
+    /// FIFO order, so an older snapshot could otherwise apply after a newer
+    /// one and undo it. A snapshot applies only if its generation is newer
+    /// than every snapshot applied so far.
+    #[cfg(windows)]
+    static SYNC_GENERATION: AtomicU64 = AtomicU64::new(0);
+    #[cfg(windows)]
+    static APPLIED_GENERATION: AtomicU64 = AtomicU64::new(0);
 
     #[cfg(windows)]
     fn active_roots() -> MutexGuard<'static, Option<HashMap<DeviceId, Arc<ActiveRoot>>>> {
@@ -177,11 +185,14 @@ mod imp {
         let mut desired: Vec<(DeviceId, String, bool)> = Vec::new();
         let mut disabled: Vec<(DeviceId, String)> = Vec::new();
         for (id, name, online) in devices {
-            let enabled = node
-                .device_toggles(id)
-                .ok()
-                .and_then(|t| t.into_iter().find(|(k, _)| *k == "storage").map(|(_, on)| on))
-                .unwrap_or(false);
+            // A transient error (node busy, IPC blip) is NOT "storage off":
+            // the old `.ok().unwrap_or(false)` turned any failure into a
+            // disable, and reconcile then `remove_dir_all`d the sync root,
+            // deleting files not yet uploaded. Skip the device entirely on
+            // error; only an explicit `false` toggle disables it.
+            let Ok(toggles) = node.device_toggles(id) else { continue };
+            let enabled =
+                toggles.into_iter().find(|(k, _)| *k == "storage").map(|(_, on)| on).unwrap_or(false);
             if enabled {
                 desired.push((id, name, online));
             } else {
@@ -189,8 +200,13 @@ mod imp {
             }
         }
 
+        let generation = SYNC_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
         let _ = std::thread::Builder::new().name("storage-sync".into()).spawn(move || {
             let _guard = lock(&RECONCILING);
+            if generation <= APPLIED_GENERATION.load(Ordering::SeqCst) {
+                return;
+            }
+            APPLIED_GENERATION.store(generation, Ordering::SeqCst);
             win::with_com(|| reconcile(&desired, &disabled));
         });
     }
@@ -206,8 +222,12 @@ mod imp {
         match event {
             NodeEvent::DeviceRemoved(device) => {
                 let device = *device;
+                // Invalidate any `sync()` snapshot taken before this removal
+                // so it cannot re-register the unpaired device afterwards.
+                let generation = SYNC_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 let _ = std::thread::Builder::new().name("storage-unpair".into()).spawn(move || {
                     let _guard = lock(&RECONCILING);
+                    APPLIED_GENERATION.store(generation, Ordering::SeqCst);
                     win::with_com(|| remove_device_root(device, None));
                 });
             }
@@ -235,9 +255,17 @@ mod imp {
         win::storage::on_event(event);
     }
 
-    /// Disconnects active sync roots when the desktop app exits.
+    /// Disconnects active sync roots when the desktop app exits. Holds
+    /// `RECONCILING` so a concurrent `sync()` cannot re-register a root
+    /// while shutdown (or uninstall) is tearing them down.
     #[cfg(windows)]
     pub fn shutdown() {
+        let _guard = lock(&RECONCILING);
+        shutdown_locked();
+    }
+
+    #[cfg(windows)]
+    fn shutdown_locked() {
         let roots: Vec<Arc<ActiveRoot>> =
             active_roots().as_mut().map(|m| m.drain().map(|(_, v)| v).collect()).unwrap_or_default();
         for root in roots {
@@ -255,7 +283,8 @@ mod imp {
     /// Unregisters all `NectarLink!*` sync roots from Windows (`--uninstall`).
     #[cfg(windows)]
     pub fn unregister_all() {
-        shutdown();
+        let _guard = lock(&RECONCILING);
+        shutdown_locked();
         win::with_com(|| {
             if let Ok(roots) = StorageProviderSyncRootManager::GetCurrentSyncRoots() {
                 let count = roots.Size().unwrap_or(0);
@@ -271,6 +300,11 @@ mod imp {
                                 .and_then(|f| f.Path().ok())
                                 .map(|p| PathBuf::from(p.to_string_lossy()));
                             let _ = StorageProviderSyncRootManager::Unregister(&id);
+                            // `cleanup_sync_root_dir` itself refuses any path
+                            // outside `%USERPROFILE%\Nectarlink` (or a
+                            // symlink), so a foreign `Nectarlink!*` root
+                            // pointing elsewhere loses its registration only,
+                            // never its files.
                             if let Some(path) = folder_path {
                                 cleanup_sync_root_dir(&path);
                             }
@@ -371,17 +405,22 @@ mod imp {
     pub fn relative_path_under_root(root_path: &Path, full_path: &Path) -> Option<String> {
         let root_norm = normalize_win_path(root_path);
         let full_norm = normalize_win_path(full_path);
-        let root_lower = root_norm.to_lowercase();
-        let full_lower = full_norm.to_lowercase();
-        if full_lower == root_lower {
-            return Some(String::new());
-        }
-        let prefix = format!("{root_lower}\\");
-        if !full_lower.starts_with(&prefix) {
+        // Compare segment by segment and take the remainder from the
+        // original string: slicing `full_norm` at the *lowercased* prefix
+        // length panicked (or corrupted the path) when lowercasing changed
+        // a character's byte length (e.g. `İ` U+0130).
+        let root_parts: Vec<&str> = root_norm.split('\\').filter(|s| !s.is_empty()).collect();
+        let full_parts: Vec<&str> = full_norm.split('\\').filter(|s| !s.is_empty()).collect();
+        if full_parts.len() < root_parts.len() {
             return None;
         }
-        let rel = &full_norm[prefix.len()..];
-        let parts: Vec<&str> = rel.split('\\').filter(|s| !s.is_empty()).collect();
+        let same_root = root_parts.iter().zip(full_parts.iter()).all(|(r, f)| {
+            r.to_lowercase() == f.to_lowercase()
+        });
+        if !same_root {
+            return None;
+        }
+        let parts: Vec<&str> = full_parts[root_parts.len()..].to_vec();
         if parts.iter().any(|p| *p == "." || *p == "..") {
             return None;
         }
@@ -441,10 +480,22 @@ mod imp {
     fn remove_device_root(device: DeviceId, known_name: Option<&str>) {
         let removed = active_roots().as_mut().and_then(|m| m.remove(&device));
         let mut folder_to_clean: Option<PathBuf> = None;
+        let mut keep_folder = false;
         if let Some(root) = removed {
             root.stop_watcher.store(true, Ordering::Relaxed);
             // SAFETY: connection_key was obtained from CfConnectSyncRoot.
             let _ = unsafe { CfDisconnectSyncRoot(root.connection_key) };
+            // Never delete a root with uploads still in flight or in their
+            // debounce: those are real user-dropped files that have not
+            // reached the phone yet. Leaving the folder is recoverable;
+            // deleting it is not.
+            if !lock(&root.uploading).is_empty() {
+                tracing::warn!(
+                    device = %device.short(),
+                    "keeping sync root folder: uploads are still pending"
+                );
+                keep_folder = true;
+            }
             folder_to_clean = Some(root.root_path.clone());
         } else if let Some(name) = known_name
             && let Some(base) = base_sync_dir()
@@ -456,16 +507,46 @@ mod imp {
         let _ = StorageProviderSyncRootManager::Unregister(&id);
 
         if let Some(path) = folder_to_clean {
-            cleanup_sync_root_dir(&path);
+            // Another active root still owns this folder (two phones that
+            // once shared one folder name): deleting it would delete the
+            // other phone's sync root.
+            let still_owned = active_roots()
+                .as_ref()
+                .is_some_and(|m| m.values().any(|r| r.root_path == path));
+            if !still_owned && !keep_folder {
+                cleanup_sync_root_dir(&path);
+            }
         }
         if let Some(base) = base_sync_dir() {
             let _ = std::fs::remove_dir(&base);
         }
     }
 
+    /// Whether `path` is a real directory strictly under the sync base: its
+    /// canonical form must be under the canonical base, must not be the base
+    /// itself, and must not be a symlink/junction. Anything else is refused
+    /// rather than deleted.
+    #[cfg(windows)]
+    fn path_is_owned_sync_root(path: &Path, base: &Path) -> bool {
+        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+        let Ok(canon) = std::fs::canonicalize(path) else { return false };
+        let Ok(base_canon) = std::fs::canonicalize(base) else { return false };
+        canon != base_canon && canon.starts_with(&base_canon)
+    }
+
     #[cfg(windows)]
     fn cleanup_sync_root_dir(path: &Path) {
         if !path.exists() {
+            return;
+        }
+        let Some(base) = base_sync_dir() else { return };
+        if !path_is_owned_sync_root(path, &base) {
+            tracing::warn!(
+                path = %path.display(),
+                "refusing to delete a sync root path outside the Nectarlink folder"
+            );
             return;
         }
         let _ = std::fs::remove_dir_all(path);
@@ -475,7 +556,23 @@ mod imp {
     fn register_and_connect(device: DeviceId, name: &str, online: bool) -> Result<(), String> {
         let base = base_sync_dir().ok_or_else(|| "no user home directory".to_owned())?;
         let folder_name = sanitize_folder_name(name);
-        let root_path = base.join(&folder_name);
+        // Two phones with the same name (or names that sanitise identically)
+        // must never share one folder: removing one would `remove_dir_all`
+        // the other's root. Disambiguate with the device's short ID; if even
+        // that collides, refuse rather than share.
+        let mut root_path = base.join(&folder_name);
+        if active_roots()
+            .as_ref()
+            .is_some_and(|m| m.values().any(|r| r.device != device && r.root_path == root_path))
+        {
+            root_path = base.join(format!("{folder_name} ({})", device.short()));
+            if active_roots()
+                .as_ref()
+                .is_some_and(|m| m.values().any(|r| r.device != device && r.root_path == root_path))
+            {
+                return Err("another phone already uses this sync root folder".into());
+            }
+        }
         std::fs::create_dir_all(&root_path).map_err(|e| format!("create sync root dir: {e}"))?;
 
         let exe = std::env::current_exe().map_err(|e| e.to_string())?;
@@ -547,7 +644,15 @@ mod imp {
                 CF_CONNECT_FLAG_REQUIRE_PROCESS_INFO | CF_CONNECT_FLAG_REQUIRE_FULL_FILE_PATH,
             )
         }
-        .map_err(|e| format!("CfConnectSyncRoot: {e}"))?;
+        .map_err(|e| {
+            // Registration without a connection used to leave an orphaned
+            // sync root: registered, untracked, and blocking the next
+            // register attempt as "already registered". Roll it back.
+            let _ = StorageProviderSyncRootManager::Unregister(&sync_root_id(device));
+            // SAFETY: ctx_ptr came from the Box just above and was never handed out.
+            drop(unsafe { Box::from_raw(ctx_ptr as *mut DeviceId) });
+            format!("CfConnectSyncRoot: {e}")
+        })?;
 
         let stop_watcher = Arc::new(AtomicBool::new(false));
         let active = Arc::new(ActiveRoot {
@@ -560,8 +665,19 @@ mod imp {
             uploading: Mutex::new(HashSet::new()),
         });
 
+        // If the root map was never initialised, the connection succeeded
+        // but nothing tracks it — roll back instead of leaving another
+        // orphan that callbacks can never reach.
+        let mut inserted = false;
         if let Some(map) = active_roots().as_mut() {
             map.insert(device, active.clone());
+            inserted = true;
+        }
+        if !inserted {
+            // SAFETY: connection_key was obtained from CfConnectSyncRoot just above.
+            let _ = unsafe { CfDisconnectSyncRoot(connection_key) };
+            let _ = StorageProviderSyncRootManager::Unregister(&sync_root_id(device));
+            return Err("phone storage root map was never initialised".into());
         }
 
         start_directory_watcher(active.clone(), stop_watcher);
@@ -651,8 +767,15 @@ mod imp {
             };
             match node.storage_list(root.device, &rel_path).await {
                 Ok(entries) => {
-                    lock(&root.populated_dirs).insert(rel_path.clone());
-                    transfer_placeholders(connection_key, transfer_key, request_key, &rel_path, &entries);
+                    if transfer_placeholders(connection_key, transfer_key, request_key, &rel_path, &entries)
+                    {
+                        lock(&root.populated_dirs).insert(rel_path.clone());
+                    } else {
+                        tracing::warn!(
+                            device = %root.device.short(),
+                            "couldn't transfer placeholders"
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::debug!(
@@ -666,6 +789,8 @@ mod imp {
         });
     }
 
+    /// Transfers placeholders to Explorer; `true` when `CfExecute` accepted
+    /// them, so callers only mark a folder populated on success.
     #[cfg(windows)]
     fn transfer_placeholders(
         connection_key: CF_CONNECTION_KEY,
@@ -673,7 +798,7 @@ mod imp {
         request_key: i64,
         parent_rel: &str,
         entries: &[StorageEntry],
-    ) {
+    ) -> bool {
         let mut wide_names: Vec<Vec<u16>> = Vec::with_capacity(entries.len());
         let mut identities: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
         for entry in entries {
@@ -712,7 +837,7 @@ mod imp {
             },
         };
         // SAFETY: op_info and op_params point to valid stack structures and buffers.
-        let _ = unsafe { CfExecute(&op_info, &mut op_params) };
+        unsafe { CfExecute(&op_info, &mut op_params) }.is_ok()
     }
 
     #[cfg(windows)]
@@ -882,6 +1007,22 @@ mod imp {
                 current_offset += len;
                 remaining = remaining.saturating_sub(len);
             }
+            // A stream that ends early used to return silently, leaving
+            // Explorer with a short file and no error. Fail the fetch
+            // explicitly so it can retry instead.
+            if remaining > 0 {
+                tracing::debug!(
+                    device = %root.device.short(),
+                    "hydration stream ended early with bytes still required"
+                );
+                ack_data_failed(
+                    connection_key,
+                    transfer_key,
+                    request_key,
+                    current_offset as i64,
+                    STATUS_CLOUD_NETWORK_UNAVAILABLE,
+                );
+            }
         });
     }
 
@@ -1005,7 +1146,12 @@ mod imp {
                 Ok(()) => STATUS_SUCCESS,
                 Err(nectarlink_core::Error::Offline) => STATUS_CLOUD_NETWORK_UNAVAILABLE,
                 Err(nectarlink_core::Error::Denied) => STATUS_ACCESS_DENIED,
-                Err(nectarlink_core::Error::Storage(msg)) if msg.contains("not_found") => STATUS_SUCCESS,
+                // Only the structured NotFound variant means "already gone".
+                // Success used to be inferred from a substring of a free-form
+                // storage error message, so any error mentioning `not_found`
+                // (even about another path) was acked as a successful delete
+                // while the phone file still existed.
+                Err(nectarlink_core::Error::NotFound) => STATUS_SUCCESS,
                 Err(_) => STATUS_CLOUD_UNSUCCESSFUL,
             };
             ack_delete(connection_key, transfer_key, request_key, status);
@@ -1028,31 +1174,52 @@ mod imp {
         let _ = unsafe { CfExecute(&op_info, &mut op_params) };
     }
 
+    /// Whether a phone-supplied folder path is safe to join under a sync
+    /// root: empty (the root itself) or plain `/`-separated segments, never
+    /// `.`/`..`, absolute, or backslash/drive tricks.
+    #[cfg(windows)]
+    fn is_safe_phone_rel_path(rel: &str) -> bool {
+        rel.is_empty()
+            || rel.split('/').all(|seg| {
+                !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':', '\0'])
+            })
+    }
+
     /// Refreshes a folder's placeholders from the phone (`storage.changed` or initial connect).
     #[cfg(windows)]
     async fn refresh_folder(root: Arc<ActiveRoot>, rel_folder: &str) {
+        // `rel_folder` comes from the phone's `storage.changed` event and
+        // `entry.name` from its listing: both used to be joined straight
+        // into the sync root, so `..\..\…` planted placeholders in arbitrary
+        // existing local directories. Reject anything unsafe up front.
+        if !is_safe_phone_rel_path(rel_folder) {
+            tracing::warn!(folder = %rel_folder, "ignoring phone folder path outside the sync root");
+            return;
+        }
         let Some(node) = core_host::node() else { return };
         let Ok(entries) = node.storage_list(root.device, rel_folder).await else { return };
 
-        let local_dir = if rel_folder.is_empty() {
-            root.root_path.clone()
-        } else {
-            root.root_path.join(rel_folder.replace('/', "\\"))
-        };
+        let mut local_dir = root.root_path.clone();
+        for seg in rel_folder.split('/').filter(|s| !s.is_empty()) {
+            local_dir.push(seg);
+        }
         if !local_dir.exists() {
             return;
         }
 
-        lock(&root.populated_dirs).insert(rel_folder.to_owned());
-
         let mut missing: Vec<StorageEntry> = Vec::new();
         for entry in entries {
+            if !is_safe_phone_rel_path(&entry.name) {
+                tracing::warn!(name = %entry.name, "ignoring phone entry name outside the sync root");
+                continue;
+            }
             let child_path = local_dir.join(&entry.name);
             if !child_path.exists() {
                 missing.push(entry);
             }
         }
         if missing.is_empty() {
+            lock(&root.populated_dirs).insert(rel_folder.to_owned());
             return;
         }
 
@@ -1076,7 +1243,7 @@ mod imp {
         let wide_dir = to_wide_null(&local_dir);
         let mut processed = 0u32;
         // SAFETY: wide_dir is null-terminated and create_infos stays alive for the call.
-        let _ = unsafe {
+        let created = unsafe {
             CfCreatePlaceholders(
                 PCWSTR(wide_dir.as_ptr()),
                 &mut create_infos,
@@ -1084,13 +1251,27 @@ mod imp {
                 Some(&mut processed),
             )
         };
+        // Only mark the folder populated when placeholders actually landed:
+        // the old code ignored the result (and `processed`), so a failed
+        // creation still counted as populated and was never retried.
+        if created.is_ok() {
+            lock(&root.populated_dirs).insert(rel_folder.to_owned());
+        } else {
+            tracing::warn!(
+                device = %root.device.short(),
+                folder = %rel_folder,
+                error = ?created,
+                "couldn't create placeholders"
+            );
+        }
     }
 
     /// Watches the sync root directory for files or folders dropped in by the user
     /// and uploads them to the phone via `storage.write` / `storage.mkdir`.
     #[cfg(windows)]
     fn start_directory_watcher(root: Arc<ActiveRoot>, stop: Arc<AtomicBool>) {
-        let _ = std::thread::Builder::new().name("storage-watch".into()).spawn(move || {
+        let watcher_device = root.device;
+        if let Err(e) = std::thread::Builder::new().name("storage-watch".into()).spawn(move || {
             let wide_dir = to_wide_null(&root.root_path);
             // SAFETY: wide_dir is a valid null-terminated path.
             let dir_handle = unsafe {
@@ -1104,8 +1285,18 @@ mod imp {
                     None,
                 )
             };
-            let Ok(dir_handle) = dir_handle else { return };
+            let Ok(dir_handle) = dir_handle else {
+                tracing::warn!(
+                    device = %root.device.short(),
+                    "can't open sync root for watching; dropped files won't upload"
+                );
+                return;
+            };
             if dir_handle == INVALID_HANDLE_VALUE {
+                tracing::warn!(
+                    device = %root.device.short(),
+                    "can't open sync root for watching; dropped files won't upload"
+                );
                 return;
             }
 
@@ -1160,15 +1351,55 @@ mod imp {
                     core_host::spawn(async move {
                         // Brief debounce so Explorer finishes writing the dropped file.
                         tokio::time::sleep(Duration::from_millis(350)).await;
-                        upload_local_item(&root_clone, &rel_slash, &full_path).await;
+                        // A failure used to be dropped silently, and a change
+                        // arriving while an upload was in flight was dropped
+                        // by the `uploading` dedup. Retry a failed upload, and
+                        // if the file is still out of sync after a successful
+                        // one (it changed mid-upload), run it once more.
+                        let mut uploaded = false;
+                        for attempt in 0..3 {
+                            if attempt > 0 {
+                                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+                            }
+                            uploaded = upload_local_item(&root_clone, &rel_slash, &full_path).await;
+                            if uploaded {
+                                break;
+                            }
+                        }
+                        if !uploaded {
+                            tracing::warn!(
+                                device = %root_clone.device.short(),
+                                path = %rel_slash,
+                                "upload to phone failed after retries; the file stays local-only"
+                            );
+                        }
                         lock(&root_clone.uploading).remove(&rel_slash);
+                        if uploaded && needs_upload(&full_path) {
+                            let mut uploading = lock(&root_clone.uploading);
+                            if uploading.insert(rel_slash.clone()) {
+                                let root_again = root_clone.clone();
+                                let rel_again = rel_slash.clone();
+                                let path_again = full_path.clone();
+                                drop(uploading);
+                                core_host::spawn(async move {
+                                    upload_local_item(&root_again, &rel_again, &path_again).await;
+                                    lock(&root_again.uploading).remove(&rel_again);
+                                });
+                            }
+                        }
                     });
                 }
             }
 
             // SAFETY: dir_handle was opened with CreateFileW above.
             let _ = unsafe { CloseHandle(dir_handle) };
-        });
+        }) {
+            tracing::warn!(
+                device = %watcher_device.short(),
+                error = %e,
+                "can't start sync root watcher; dropped files won't upload"
+            );
+        }
     }
 
     #[cfg(windows)]
@@ -1228,18 +1459,25 @@ mod imp {
     }
 
     #[cfg(windows)]
-    async fn upload_local_item(root: &Arc<ActiveRoot>, rel_slash: &str, full_path: &Path) {
+    /// Uploads one dropped item; `true` when it reached the phone (or was
+    /// already gone / already in sync — nothing left to do).
+    async fn upload_local_item(root: &Arc<ActiveRoot>, rel_slash: &str, full_path: &Path) -> bool {
         if !full_path.exists() || !needs_upload(full_path) {
-            return;
+            return true;
         }
-        let Some(node) = core_host::node() else { return };
+        let Some(node) = core_host::node() else { return false };
         if full_path.is_dir() {
             if node.storage_mkdir(root.device, rel_slash).await.is_ok() {
                 mark_path_in_sync(full_path, rel_slash, true);
+                return true;
             }
-        } else if full_path.is_file() && node.storage_write(root.device, rel_slash, full_path).await.is_ok() {
-            mark_path_in_sync(full_path, rel_slash, false);
+            return false;
         }
+        if full_path.is_file() && node.storage_write(root.device, rel_slash, full_path).await.is_ok() {
+            mark_path_in_sync(full_path, rel_slash, false);
+            return true;
+        }
+        false
     }
 
     #[cfg(windows)]
@@ -1379,11 +1617,14 @@ mod imp {
     }
 
     pub fn unix_ms_to_filetime_ticks(unix_ms: i64) -> i64 {
-        unix_ms * 10_000 + 116_444_736_000_000_000
+        // Saturating, like the Windows/Linux implementation: the old
+        // unchecked arithmetic panicked in debug (wrapped in release) on a
+        // huge phone-supplied `modified` value.
+        unix_ms.max(0).saturating_mul(10_000).saturating_add(116_444_736_000_000_000)
     }
 
     pub fn filetime_ticks_to_unix_ms(ticks: i64) -> i64 {
-        (ticks - 116_444_736_000_000_000) / 10_000
+        ticks.saturating_sub(116_444_736_000_000_000).max(0) / 10_000
     }
 
     pub fn relative_path_under_root(root_path: &Path, full_path: &Path) -> Option<String> {

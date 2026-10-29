@@ -242,8 +242,13 @@ impl qobject::Pairing {
             _ => None,
         });
         let Some((peer, code)) = comparing else { return };
+        // Confirmed only when the core actually accepted: on error the old
+        // code still showed Confirmed, so the user believed pairing had
+        // succeeded when the phone was never linked.
         if let Err(e) = node.pairing_confirm(codes_match) {
             tracing::warn!(error = %e, "can't answer the code check");
+            hub().update(|s| s.set_pairing(PairingView::Failed(PairingFailure::Other(e.to_string()))));
+            return;
         }
         let next = if codes_match {
             PairingView::Confirmed { peer, code }

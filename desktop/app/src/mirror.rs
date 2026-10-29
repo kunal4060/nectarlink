@@ -100,6 +100,9 @@ pub struct Shown {
     /// For an app window: the app's name, and its package.
     pub app: Option<String>,
     pub pkg: Option<String>,
+    /// Bumped per start attempt, so a stale app-start timeout can't kill
+    /// a retry that reused this window.
+    pub attempt: u64,
 }
 
 /// A phone's apps that open in windows.
@@ -143,19 +146,35 @@ impl SavedWindows {
     }
 
     fn load() -> Self {
-        std::fs::read_to_string(Self::path())
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        match std::fs::read_to_string(Self::path()) {
+            Ok(s) => match serde_json::from_str(&s) {
+                Ok(saved) => saved,
+                // A corrupt file used to silently discard all saved
+                // geometry and recent apps; say so instead.
+                Err(e) => {
+                    tracing::warn!(error = %e, "saved mirror windows are corrupt; starting fresh");
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
     }
 
-    fn save(&self) {
+    /// Serialized form, captured under the STATE lock so the file write
+    /// itself can happen after the lock is released.
+    fn serialized(&self) -> Option<String> {
+        serde_json::to_string_pretty(self).ok()
+    }
+
+    /// Writes a previously serialized snapshot. Callers must call this
+    /// after releasing the STATE lock: doing file I/O under that lock
+    /// stalled every mirror control path on a slow disk, and failures
+    /// were silently swallowed.
+    fn write_serialized(json: &str) {
         let path = Self::path();
-        if let Ok(json) = serde_json::to_string_pretty(self) {
-            let tmp = path.with_extension("json.tmp");
-            if std::fs::write(&tmp, json).is_ok() {
-                let _ = std::fs::rename(&tmp, &path);
-            }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+            tracing::warn!(error = %e, "can't save mirror window state");
         }
     }
 }
@@ -381,7 +400,11 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
     let path = Path::new(name);
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
     let ext = path.extension().and_then(|e| e.to_str());
-    for n in 2..10_000u32 {
+    // Keep counting past 9999 instead of falling back to `first`: the
+    // old fallback returned an existing file, which the caller then
+    // overwrote, silently destroying the user's file of that name.
+    let mut n: u64 = 2;
+    loop {
         let candidate = match ext {
             Some(ext) => dir.join(format!("{stem} ({n}).{ext}")),
             None => dir.join(format!("{stem} ({n})")),
@@ -389,8 +412,8 @@ fn free_path(dir: &Path, name: &str) -> PathBuf {
         if !candidate.exists() {
             return candidate;
         }
+        n += 1;
     }
-    first
 }
 
 /// Copies the current mirror frame for `window` to the PC clipboard as PNG.
@@ -568,11 +591,22 @@ pub fn toggle_recording(window: Window) {
         recorder.set_sps_pps(sps_pps);
     }
 
-    {
+    // Check-and-insert under one lock: two concurrent toggles used to
+    // both pass the earlier "not recording" check, and the second insert
+    // overwrote the first recorder without finalizing it, losing the MP4.
+    let already_recording = {
         let mut guard = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
         let map = guard.get_or_insert_with(HashMap::new);
-        map.insert(window, recorder);
-        ACTIVE_RECORDERS.store(map.len(), Ordering::Release);
+        if map.contains_key(&window) {
+            true
+        } else {
+            map.insert(window, recorder);
+            ACTIVE_RECORDERS.store(map.len(), Ordering::Release);
+            false
+        }
+    };
+    if already_recording {
+        return;
     }
 
     set_notice(window, "Recording started");
@@ -708,14 +742,19 @@ pub fn save_geometry(window: Window, x: i32, y: i32, width: u32, height: u32) {
     if window.session == MIRROR_SCREEN || width < 200 || height < 200 {
         return;
     }
-    state(|s| {
-        let Some(pkg) = s.windows.get(&window).and_then(|w| w.pkg.clone()) else { return };
+    let json = state(|s| {
+        let Some(pkg) = s.windows.get(&window).and_then(|w| w.pkg.clone()) else { return None };
         let key = format!("{}/{pkg}", window.device);
         let geom = WindowGeometry { x, y, width, height };
         if s.saved.geometry.insert(key, geom) != Some(geom) {
-            s.saved.save();
+            s.saved.serialized()
+        } else {
+            None
         }
     });
+    if let Some(json) = json {
+        SavedWindows::write_serialized(&json);
+    }
 }
 
 /// Package names of recent apps on `device` (apps opened from this PC first,
@@ -757,12 +796,14 @@ pub(crate) fn merge_recent_apps(
     out
 }
 
-fn record_recent(s: &mut State, device: &DeviceId, pkg: &str) {
+/// Records `pkg` as a recent app and returns the serialized snapshot
+/// for the caller to write after releasing the STATE lock.
+fn record_recent(s: &mut State, device: &DeviceId, pkg: &str) -> Option<String> {
     let list = s.saved.recent.entry(device.to_string()).or_default();
     list.retain(|p| p != pkg);
     list.insert(0, pkg.to_owned());
     list.truncate(12);
-    s.saved.save();
+    s.saved.serialized()
 }
 
 /// What `device` is set to while mirroring: `(stay_awake, screen_off)`.
@@ -782,7 +823,7 @@ pub fn start(device: DeviceId) {
         if !s.mirroring(&device) {
             s.screen_off.remove(&device);
         }
-        s.windows.insert(window, Shown { phase: Phase::Asking, app: None, pkg: None });
+        s.windows.insert(window, Shown { phase: Phase::Asking, app: None, pkg: None, attempt: 0 });
         power(s, &device)
     });
     request(window, MirrorStart { stay_awake, screen_off, ..OPTIONS });
@@ -868,7 +909,7 @@ pub fn start_app(device: DeviceId, pkg: String, label: String) {
         }) {
             return None;
         }
-        record_recent(s, &device, &pkg);
+        let json = record_recent(s, &device, &pkg);
         let ended = s
             .windows
             .iter()
@@ -879,10 +920,13 @@ pub fn start_app(device: DeviceId, pkg: String, label: String) {
         if !s.mirroring(&device) {
             s.screen_off.remove(&device);
         }
-        s.windows.insert(window, Shown { phase: Phase::Asking, app: Some(label), pkg: Some(pkg.clone()) });
-        Some((window, power(s, &device)))
+        s.windows.insert(window, Shown { phase: Phase::Asking, app: Some(label), pkg: Some(pkg.clone()), attempt: 0 });
+        Some((window, power(s, &device), json))
     });
-    let Some((window, (stay_awake, screen_off))) = window else { return };
+    if let Some((_, _, Some(json))) = &window {
+        SavedWindows::write_serialized(json);
+    }
+    let Some((window, (stay_awake, screen_off), _)) = window else { return };
     ffi::video_clear(&window.key());
     request(
         window,
@@ -910,10 +954,13 @@ pub fn reopen(window: Window) {
         let shown = s.windows.get_mut(&window)?;
         let pkg = shown.pkg.clone()?;
         shown.phase = Phase::Asking;
-        record_recent(s, &window.device, &pkg);
-        Some((pkg, power(s, &window.device)))
+        let json = record_recent(s, &window.device, &pkg);
+        Some((pkg, power(s, &window.device), json))
     });
-    let Some((pkg, (stay_awake, screen_off))) = pkg else { return };
+    if let Some((_, _, Some(json))) = &pkg {
+        SavedWindows::write_serialized(json);
+    }
+    let Some((pkg, (stay_awake, screen_off), _)) = pkg else { return };
     ffi::video_clear(&window.key());
     request(
         window,
@@ -954,6 +1001,18 @@ fn request(window: Window, options: MirrorStart) {
     core_host::host().hub.changed(Changes::MIRROR);
     let Some(node) = core_host::node() else { return };
     let app = options.app.is_some();
+    // Per-attempt token: a stale 15 s timeout used to kill a retried
+    // session that reused the same window id while still Asking.
+    let attempt = state(|s| {
+        let shown = s.windows.get_mut(&window);
+        match shown {
+            Some(shown) => {
+                shown.attempt = shown.attempt.wrapping_add(1);
+                shown.attempt
+            }
+            None => 0,
+        }
+    });
     core_host::spawn(async move {
         if let Err(e) = node.mirror_start(window.device, options).await {
             let reason = match e {
@@ -978,7 +1037,9 @@ fn request(window: Window, options: MirrorStart) {
         // seconds, or the phone couldn't start it (its stream then ends with no picture).
         if app {
             tokio::time::sleep(APP_START_TIMEOUT).await;
-            let stuck = state(|s| s.windows.get(&window).is_some_and(|w| w.phase == Phase::Asking));
+            let stuck = state(|s| {
+                s.windows.get(&window).is_some_and(|w| w.phase == Phase::Asking && w.attempt == attempt)
+            });
             if stuck {
                 tracing::warn!(session = window.session, "an app window never started on the phone");
                 node.mirror_stop(window.device, window.session).await;
@@ -1018,6 +1079,12 @@ pub fn on_event(event: &NodeEvent) {
     match event {
         NodeEvent::Mirroring { device, session, on: true } => {
             let window = Window { device: *device, session: *session };
+            // Ignore stray events for windows this PC never opened:
+            // set_phase would otherwise point active_window at a
+            // nonexistent window and start the gamepad loop.
+            if phase(&window).is_none() {
+                return;
+            }
             set_phase(window, Phase::Showing);
             if *session != MIRROR_SCREEN {
                 let saved = state(|s| {
@@ -1132,8 +1199,14 @@ pub fn load_apps(device: DeviceId) {
                     save_apps(&data_dir, &device, &apps);
                     apps
                 })
-                .await
-                .unwrap_or_default();
+                .await;
+                // A failed blocking task used to become an empty list
+                // that overwrote a good one; keep the last list instead,
+                // like the refresh-failure arm below.
+                let Ok(apps) = apps else {
+                    tracing::warn!("can't load a phone's apps; keeping the last list");
+                    return;
+                };
                 tracing::info!(
                     apps = apps.len(),
                     ms = started.elapsed().as_millis() as u64,
@@ -1258,13 +1331,18 @@ pub fn palette_apps(device: DeviceId) -> Vec<(String, String)> {
 
 /// The PC's mouse, keyboard, and gamepad on a mirrored screen or app window,
 /// sent in order.
+/// Input events buffered while the phone is slow to take them. The old
+/// unbounded queue grew memory without limit during a stall and then
+/// replayed a huge backlog of stale mouse positions.
+const INPUT_QUEUE: usize = 512;
+
 pub fn input(window: Window, input: nectarlink_core::MirrorInput) {
     static QUEUE: std::sync::OnceLock<
-        tokio::sync::mpsc::UnboundedSender<(Window, nectarlink_core::MirrorInput)>,
+        tokio::sync::mpsc::Sender<(Window, nectarlink_core::MirrorInput)>,
     > = std::sync::OnceLock::new();
     let queue = QUEUE.get_or_init(|| {
         let (queue, mut inputs) =
-            tokio::sync::mpsc::unbounded_channel::<(Window, nectarlink_core::MirrorInput)>();
+            tokio::sync::mpsc::channel::<(Window, nectarlink_core::MirrorInput)>(INPUT_QUEUE);
         core_host::spawn(async move {
             while let Some((window, input)) = inputs.recv().await {
                 if let Some(node) = core_host::node()
@@ -1276,7 +1354,13 @@ pub fn input(window: Window, input: nectarlink_core::MirrorInput) {
         });
         queue
     });
-    let _ = queue.send((window, input));
+    // Full: drop the new event rather than queueing it. tokio's bounded
+    // channel can't drop the oldest from the sender side, and dropping
+    // a stale mouse move / keystroke during a stall beats unbounded
+    // growth followed by replaying minutes of stale input.
+    if let Err(e) = queue.try_send((window, input)) {
+        tracing::debug!(error = ?e, "mirror input dropped while the phone is slow");
+    }
 }
 
 /// Resolves the currently active or showing mirror window.
@@ -1290,8 +1374,16 @@ fn active_or_showing_window() -> Option<Window> {
         s.windows
             .iter()
             .find(|(_, shown)| matches!(shown.phase, Phase::Showing))
-            .or_else(|| s.windows.iter().next())
-            .map(|(w, _)| *w)
+            // Fall back only to a window still being opened, never to
+            // an arbitrary (possibly Ended) one: the old `.next()` pick
+            // could send dropped files to a different phone chosen by
+            // HashMap order. With neither, the drop is refused.
+            .or_else(|| {
+                s.windows
+                    .iter()
+                    .find(|(_, shown)| matches!(shown.phase, Phase::Asking))
+                    .map(|(w, _)| *w)
+            })
     })
 }
 
@@ -1403,17 +1495,20 @@ pub fn sync_clipboard_for_device(device: DeviceId) {
         && !text.is_empty()
     {
         let normalized = text.replace("\r\n", "\n");
-        let changed = state(|s| {
-            if s.last_focus_clip.as_deref() == Some(normalized.as_str()) {
-                false
-            } else {
-                s.last_focus_clip = Some(normalized);
-                true
-            }
-        });
+        let changed = state(|s| s.last_focus_clip.as_deref() != Some(normalized.as_str()));
         if changed {
             core_host::spawn(async move {
-                let _ = node.send_clipboard_rich(device, text, html, rtf).await;
+                // Only mark it sent after the send succeeds: the old
+                // code marked it first, so a transient failure lost the
+                // clipboard text forever with no error shown.
+                match node.send_clipboard_rich(device, text, html, rtf).await {
+                    Ok(()) => {
+                        state(|s| s.last_focus_clip = Some(normalized));
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "clipboard didn't reach the phone");
+                    }
+                }
             });
         }
     }
@@ -1741,6 +1836,15 @@ fn ensure_gamepad_loop() {
             let target = active_or_showing_window().filter(|w| matches!(phase(w), Some(Phase::Showing)));
             let Some(window) = target else {
                 RUNNING.store(false, Ordering::Release);
+                // A window may have become Showing between this loop's
+                // target check and the flag store, in which case its
+                // ensure_gamepad_loop() saw RUNNING and returned: restart
+                // here instead of leaving gamepad input dead.
+                if active_or_showing_window()
+                    .is_some_and(|w| matches!(phase(&w), Some(Phase::Showing)))
+                {
+                    ensure_gamepad_loop();
+                }
                 break;
             };
             match poll_gamepad() {
@@ -1783,6 +1887,8 @@ struct Sink {
     window: Window,
     video: OnceLock<Video>,
     sound: Mutex<Option<Player>>,
+    /// Last keyframe request, to rate-limit them.
+    keyframe_at: Mutex<Option<Instant>>,
 }
 
 /// The decoder thread's end of a sink.
@@ -1794,7 +1900,7 @@ struct Video {
 
 impl Sink {
     fn new(window: Window) -> Sink {
-        Sink { window, video: OnceLock::new(), sound: Mutex::new(None) }
+        Sink { window, video: OnceLock::new(), sound: Mutex::new(None), keyframe_at: Mutex::new(None) }
     }
 }
 
@@ -1815,6 +1921,16 @@ impl Video {
 
 impl Sink {
     fn keyframe_please(&self) {
+        // At most one keyframe request per 500 ms per window: the old
+        // code fired one per dropped/failed packet (up to ~60/s),
+        // flooding the phone's control channel during the congestion
+        // that caused the drops.
+        let mut at = self.keyframe_at.lock().unwrap_or_else(|e| e.into_inner());
+        if at.is_some_and(|t| t.elapsed() < Duration::from_millis(500)) {
+            return;
+        }
+        *at = Some(Instant::now());
+        drop(at);
         let window = self.window;
         if let Some(node) = core_host::node() {
             core_host::spawn(async move { node.mirror_keyframe(window.device, window.session).await });
@@ -1874,6 +1990,13 @@ impl MirrorSink for Sink {
     }
 
     fn audio_config(&self, config: MirrorAudioConfig) {
+        // Core already validates rate/channels, but never hand a zero
+        // rate or channel count to the player: it would divide by zero
+        // or build a broken player thread downstream.
+        if config.rate == 0 || config.channels == 0 {
+            tracing::warn!("ignoring mirror audio config with a zero rate or channel count");
+            return;
+        }
         LAST_AUDIO_CONFIG
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1942,7 +2065,14 @@ fn decode(window: Window, items: &Receiver<Item>, waiting: &AtomicUsize) {
         }
     };
     tracing::info!(gpu = decoder.on_gpu(), codec = decoder.codec(), "mirror decoder ready");
-    let keyframe_please = || {
+    // Rate-limited like Sink::keyframe_please: at most one request per
+    // 500 ms, so a persistently undecodable stream can't flood the phone.
+    let mut last_keyframe = Instant::now() - Duration::from_secs(1);
+    let mut keyframe_please = || {
+        if last_keyframe.elapsed() < Duration::from_millis(500) {
+            return;
+        }
+        last_keyframe = Instant::now();
         if let Some(node) = core_host::node() {
             core_host::spawn(async move { node.mirror_keyframe(window.device, window.session).await });
         }
@@ -2003,7 +2133,10 @@ fn decode(window: Window, items: &Receiver<Item>, waiting: &AtomicUsize) {
                 // Behind: skip showing this one, the next is already here.
                 if let (Some(picture), false) = (pictures.last(), behind) {
                     let converted = Instant::now();
-                    let (w, h) = if size.0 > 0 { size } else { (picture.width, picture.height) };
+                    // Any zero dimension falls back to the picture's own
+                    // size: the old width-only check let (1920, 0) through
+                    // and handed a 0-height frame to the video view.
+                    let (w, h) = if size.0 > 0 && size.1 > 0 { size } else { (picture.width, picture.height) };
                     let (src_w, src_h) = (w.min(picture.width), h.min(picture.height));
                     let bgrx = to_bgrx(picture, w, h);
                     if (src_w, src_h) == (w, h) || src_w == 0 || src_h == 0 {
@@ -2011,8 +2144,13 @@ fn decode(window: Window, items: &Receiver<Item>, waiting: &AtomicUsize) {
                         save_latest_frame(window, src_w, src_h, bgrx);
                     } else {
                         let scaled = scale_bgrx(&bgrx, src_w, src_h, w, h);
-                        ffi::video_frame(&stream, w, h, &scaled);
-                        save_latest_frame(window, w, h, scaled);
+                        // scale_bgrx falls back to the source buffer for
+                        // absurd destinations: never publish it under
+                        // the destination's dimensions.
+                        if scaled.len() == (w as usize) * (h as usize) * 4 {
+                            ffi::video_frame(&stream, w, h, &scaled);
+                            save_latest_frame(window, w, h, scaled);
+                        }
                     }
                     stats.shown(decoded, converted.elapsed());
                 } else {
@@ -2026,8 +2164,33 @@ fn decode(window: Window, items: &Receiver<Item>, waiting: &AtomicUsize) {
     ffi::video_clear(&stream);
 }
 
+/// Largest frame the scaler will produce (the protocol's own per-side
+/// cap): anything larger is a lying config, not a phone screen.
+const MAX_SCALE_SIDE: u32 = 8192;
+
 fn scale_bgrx(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
-    let mut dst = vec![0u8; (dst_w * dst_h * 4) as usize];
+    // All arithmetic in usize with checked products: the old u32
+    // product wrapped in release builds, allocating a too-small buffer
+    // that the row loop then indexed out of bounds. Zero or absurd
+    // destinations, or a source buffer that doesn't hold the claimed
+    // frame, fall back to the source unchanged instead of panicking.
+    if src_w == 0
+        || src_h == 0
+        || dst_w == 0
+        || dst_h == 0
+        || dst_w > MAX_SCALE_SIDE
+        || dst_h > MAX_SCALE_SIDE
+        || src.len() < (src_w as usize) * (src_h as usize) * 4
+    {
+        return src.to_vec();
+    }
+    let Some(pixels) = (dst_w as usize)
+        .checked_mul(dst_h as usize)
+        .and_then(|p| p.checked_mul(4))
+    else {
+        return src.to_vec();
+    };
+    let mut dst = vec![0u8; pixels];
     for y in 0..dst_h {
         let sy = ((u64::from(y) * u64::from(src_h)) / u64::from(dst_h)) as usize;
         let src_row = &src[sy * (src_w as usize * 4)..(sy + 1) * (src_w as usize * 4)];

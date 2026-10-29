@@ -517,18 +517,12 @@ fn resolve_target_device(requested: &QString, fallback: Option<DeviceId>) -> Opt
     if let Some(id) = super::parse_device(requested) {
         return Some(id);
     }
+    // No silent substitution: when the requested device string does not
+    // parse, only the entry's own device (when still paired) is a safe
+    // target. Falling back to the first online/paired phone would resend
+    // files, clips or links to a phone the user never picked.
     core_host::host().hub.read(|s| {
-        if let Some(id) = fallback
-            && s.devices.iter().any(|d| d.id == id && matches!(d.link, LinkState::Online { .. }))
-        {
-            return Some(id);
-        }
-        s.devices
-            .iter()
-            .find(|d| matches!(d.link, LinkState::Online { .. }))
-            .map(|d| d.id)
-            .or_else(|| fallback.filter(|id| s.devices.iter().any(|d| d.id == *id)))
-            .or_else(|| s.devices.first().map(|d| d.id))
+        fallback.filter(|id| s.devices.iter().any(|d| d.id == *id))
     })
 }
 
