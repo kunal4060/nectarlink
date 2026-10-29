@@ -130,6 +130,9 @@ impl WindowCapture {
     /// a new frame (nothing changed on screen), the last one again. False
     /// before the first frame.
     pub fn capture(&mut self, crop: RECT, dst_w: u32, dst_h: u32, bgra: &mut Vec<u8>) -> bool {
+        if dst_w == 0 || dst_h == 0 {
+            return false;
+        }
         if let Err(e) = self.latest(crop) {
             tracing::debug!(error = %e, "window capture frame failed");
         }
@@ -235,6 +238,17 @@ impl Drop for WindowCapture {
 /// copies it when the size is the same.
 pub(crate) fn scale_bgra(src: &[u8], w: u32, h: u32, dst_w: u32, dst_h: u32, out: &mut Vec<u8>) {
     let (w, h, dw, dh) = (w as usize, h as usize, dst_w as usize, dst_h as usize);
+    // A zero size (a minimized/zero-sized capture target) would panic
+    // below (`chunks_exact_mut(0)`), and a short source would panic on
+    // the slices: emit nothing / a black frame instead.
+    if w == 0 || h == 0 || dw == 0 || dh == 0 {
+        out.clear();
+        return;
+    }
+    if src.len() < w * h * 4 {
+        out.resize(dw * dh * 4, 0);
+        return;
+    }
     out.resize(dw * dh * 4, 0);
     if (w, h) == (dw, dh) {
         out.copy_from_slice(&src[..w * h * 4]);

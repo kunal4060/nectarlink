@@ -309,7 +309,10 @@ pub fn query_wake_status() -> WakeStatus {
                 if !addr.is_null() && (*addr).sa_family.0 == 2 {
                     let bytes = &(*addr).sa_data;
                     let ip = Ipv4Addr::new(bytes[2] as u8, bytes[3] as u8, bytes[4] as u8, bytes[5] as u8);
-                    if let Some(bcast) = ipv4_broadcast(ip, u.OnLinkPrefixLength) {
+                    if let Some(bcast) = ipv4_broadcast(ip, u.OnLinkPrefixLength) && !bcast.is_broadcast() {
+                        // Never hand out the global broadcast address
+                        // (255.255.255.255): a directed subnet broadcast is
+                        // what wake-on-LAN needs.
                         let s = bcast.to_string();
                         if !broadcasts.contains(&s) {
                             broadcasts.push(s);

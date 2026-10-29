@@ -16,11 +16,50 @@ use windows::{
     core::{HSTRING, w},
 };
 
+/// Schemes `open_url` may hand to the shell. Anything else — a local
+/// path, `file:`, `ms-msdt:`, `search-ms:` or any other registered
+/// handler — is refused: this is reached with links a paired phone sent
+/// (`crate::links::open_here`), and ShellExecute's "open" verb would
+/// otherwise run or open whatever the string names.
+const ALLOWED_URL_SCHEMES: &[&str] =
+    &["http", "https", "mailto", "geo", "ms-settings", "bingmaps", "ms-maps"];
+
+/// Checks a URL against [`ALLOWED_URL_SCHEMES`] (mirroring the Linux
+/// shell's `validate_url`); the trimmed URL on success.
+fn validate_url(url: &str) -> Result<&str, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return Err("empty URL".into());
+    }
+    if trimmed.starts_with('-') {
+        return Err("URL must not start with '-'".into());
+    }
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("URL contains invalid whitespace or control characters".into());
+    }
+    let Some((scheme, rest)) = trimmed.split_once(':') else {
+        return Err("missing URL scheme".into());
+    };
+    let scheme_lower = scheme.to_ascii_lowercase();
+    if !ALLOWED_URL_SCHEMES.contains(&scheme_lower.as_str()) {
+        return Err(format!("unsupported URL scheme: {scheme}"));
+    }
+    if rest.is_empty() {
+        return Err("empty URL target".into());
+    }
+    if (scheme_lower == "http" || scheme_lower == "https") && (!rest.starts_with("//") || rest.len() <= 2) {
+        return Err("http/https URL must include a host".into());
+    }
+    Ok(trimmed)
+}
+
 /// Opens a link in the default browser.
 pub fn open_url(url: &str) -> Result<(), String> {
-    // SAFETY: plain ShellExecute with valid strings; the result is a
-    // pseudo-handle that's only compared.
-    let result = unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(url), None, None, SW_SHOWNORMAL) };
+    let validated = validate_url(url)?;
+    // SAFETY: plain ShellExecute with a validated URL string; the result
+    // is a pseudo-handle that's only compared.
+    let result =
+        unsafe { ShellExecuteW(None, w!("open"), &HSTRING::from(validated), None, None, SW_SHOWNORMAL) };
     // Values above 32 mean success.
     if result.0 as isize > 32 { Ok(()) } else { Err(format!("ShellExecute returned {}", result.0 as isize)) }
 }
@@ -28,10 +67,21 @@ pub fn open_url(url: &str) -> Result<(), String> {
 /// Opens a `mailto:` link in the default mail client.
 pub fn open_mailto(email: &str) -> Result<(), String> {
     let trimmed = email.trim();
-    if trimmed.is_empty() {
-        return Err("empty email address".into());
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err("invalid email address".into());
     }
-    open_url(&format!("mailto:{trimmed}"))
+    let uri = if trimmed.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("mailto:")) {
+        trimmed.to_owned()
+    } else {
+        if !trimmed.contains('@') {
+            return Err("invalid email address".into());
+        }
+        format!("mailto:{trimmed}")
+    };
+    open_url(&uri)
 }
 
 /// Opens a street address in the registered Windows maps handler if one is

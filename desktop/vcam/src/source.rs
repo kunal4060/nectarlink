@@ -335,17 +335,21 @@ impl IMFMediaSource_Impl for VcamMediaSource_Impl {
             return Err(MF_E_SHUTDOWN.into());
         };
         let event_type = if guard.ever_started { MEUpdatedStream } else { MENewStream };
-        guard.ever_started = true;
-        guard.state = SourceState::Started;
 
         unsafe {
             let unk: IUnknown = stream.cast()?;
-            guard.events.QueueEventParamUnk(event_type.0 as u32, &GUID::zeroed(), S_OK, &unk)?;
             let empty = PROPVARIANT::default();
             let pos = if pvarstartposition.is_null() { &empty } else { &*pvarstartposition };
-            guard.events.QueueEventParamVar(MESourceStarted.0 as u32, &GUID::zeroed(), S_OK, pos)?;
+            // Start the stream first: only a successful start may report
+            // Started, MENewStream/MEUpdatedStream, or MESourceStarted.
+            // Previously the state and events were committed before this
+            // call, so a failed start still looked like a running source.
             let stream_impl: &VcamMediaStream = stream.as_impl();
             stream_impl.on_start(pos)?;
+            guard.ever_started = true;
+            guard.state = SourceState::Started;
+            guard.events.QueueEventParamUnk(event_type.0 as u32, &GUID::zeroed(), S_OK, &unk)?;
+            guard.events.QueueEventParamVar(MESourceStarted.0 as u32, &GUID::zeroed(), S_OK, pos)?;
         }
         Ok(())
     }
@@ -709,6 +713,10 @@ impl VcamMediaStream {
                 allocator.SetDirectXManager(manager)?;
             }
         }
+        // The retired allocators are owned too: dropping them here, not
+        // waiting for an on_stop that only clears them while owns_allocator
+        // is true (it is now false, so they would leak for good).
+        guard.retired_allocators.clear();
         guard.sample_allocator = Some(allocator);
         guard.owns_allocator = false;
         Ok(())
@@ -838,6 +846,11 @@ impl IMFMediaStream_Impl for VcamMediaStream_Impl {
             let frame_size = mt.GetUINT64(&MF_MT_FRAME_SIZE)?;
             let width = ((frame_size >> 32) as u32).max(1);
             let height = (frame_size as u32).max(1);
+            // Defense in depth: the handler only offers MODES, but a
+            // non-offered type must never drive unbounded scratch resizes.
+            if width > crate::shm::MAX_WIDTH || height > crate::shm::MAX_HEIGHT {
+                return Err(E_INVALIDARG.into());
+            }
 
             let bgrx_len = (width as usize) * (height as usize) * 4;
             let out_bytes = if subtype == MFVideoFormat_NV12 {
@@ -883,8 +896,12 @@ impl IMFMediaStream_Impl for VcamMediaStream_Impl {
                 if let Some(reader) = &mut guard.gpu_reader {
                     match reader.write_nv12(&buffer, width, height) {
                         Ok(written) => written,
-                        Err(error) => {
-                            reader.disable_with_error(&error);
+                        Err(_) => {
+                            // A transient per-frame GPU failure must not
+                            // poison the transport (disable_with_error
+                            // fails the control mapping for good): fall
+                            // back to the CPU path for this frame and
+                            // retry the GPU path on the next frame.
                             false
                         }
                     }
@@ -902,8 +919,12 @@ impl IMFMediaStream_Impl for VcamMediaStream_Impl {
                 let gpu_rgb = if let Some(reader) = &mut inner.gpu_reader {
                     match reader.read_bgrx(width, height, &mut inner.bgrx_scratch[..bgrx_len]) {
                         Ok(read) => read,
-                        Err(error) => {
-                            reader.disable_with_error(&error);
+                        Err(_) => {
+                            // A transient per-frame GPU failure must not
+                            // poison the transport (disable_with_error
+                            // fails the control mapping for good): fall
+                            // back to the CPU path for this frame and
+                            // retry the GPU path on the next frame.
                             false
                         }
                     }
@@ -978,6 +999,37 @@ impl IMFMediaStream_Impl for VcamMediaStream_Impl {
                             if (buffer_length as usize) < required_length {
                                 return Err(E_INVALIDARG.into());
                             }
+                            // That length is measured from buffer_start,
+                            // but rows are written from scanline0, which
+                            // Lock2DSize does not promise to equal
+                            // buffer_start (bottom-up buffers start their
+                            // first scanline stride*(h-1) past it, and an
+                            // allocator may pad). Bound the actual span
+                            // of rows written, in both pitch directions.
+                            let buffer_end = (buffer_start as usize)
+                                .checked_add(buffer_length as usize)
+                                .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+                            let first_row = scanline0 as usize;
+                            let last_row = if pitch >= 0 {
+                                first_row
+                                    .checked_add(stride.checked_mul(h - 1).ok_or_else(|| {
+                                        windows::core::Error::from(E_INVALIDARG)
+                                    })?)
+                            } else {
+                                first_row
+                                    .checked_sub(stride.checked_mul(h - 1).ok_or_else(|| {
+                                        windows::core::Error::from(E_INVALIDARG)
+                                    })?)
+                            }
+                            .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+                            let row_low = first_row.min(last_row);
+                            let row_high = first_row
+                                .max(last_row)
+                                .checked_add(row_bytes)
+                                .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+                            if row_low < buffer_start as usize || row_high > buffer_end {
+                                return Err(E_INVALIDARG.into());
+                            }
 
                             for row in 0..h {
                                 let dst_row = if pitch >= 0 {
@@ -1001,6 +1053,30 @@ impl IMFMediaStream_Impl for VcamMediaStream_Impl {
                                 } else {
                                     buffer_start.add(plane_bytes + stride * (h / 2 - 1))
                                 };
+                                // Same bound as the Y rows above, for the
+                                // UV rows (which run in the pitch direction
+                                // from uv_plane).
+                                let uv_first = uv_plane as usize;
+                                let uv_last = if pitch >= 0 {
+                                    uv_first
+                                        .checked_add(stride.checked_mul(h / 2 - 1).ok_or_else(|| {
+                                            windows::core::Error::from(E_INVALIDARG)
+                                        })?)
+                                } else {
+                                    uv_first
+                                        .checked_sub(stride.checked_mul(h / 2 - 1).ok_or_else(|| {
+                                            windows::core::Error::from(E_INVALIDARG)
+                                        })?)
+                                }
+                                .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+                                let uv_low = uv_first.min(uv_last);
+                                let uv_high = uv_first
+                                    .max(uv_last)
+                                    .checked_add(row_bytes)
+                                    .ok_or_else(|| windows::core::Error::from(E_INVALIDARG))?;
+                                if uv_low < buffer_start as usize || uv_high > buffer_end {
+                                    return Err(E_INVALIDARG.into());
+                                }
                                 let source_uv = width as usize * h;
                                 for row in 0..(h / 2) {
                                     let dst_row = if pitch >= 0 {

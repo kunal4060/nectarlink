@@ -54,6 +54,11 @@ impl Player {
     /// (from [`super::audio::output_devices`]), or the default one when
     /// it's `None` or gone.
     pub fn start_on(device: Option<String>, rate: u32, channels: u16) -> std::io::Result<Player> {
+        // The format comes from the phone's stream: a 0 rate or 0
+        // channels would divide by zero in `Jitter` (Linux clamps the
+        // same values in `start_for_device`).
+        let rate = rate.max(8_000);
+        let channels = channels.max(1);
         let (queue, packets) = sync_channel(QUEUE);
         std::thread::Builder::new().name("mirror-sound".into()).spawn(move || {
             let mut attempts = 0;
@@ -99,7 +104,8 @@ struct Jitter {
 
 impl Jitter {
     fn new(rate: u32, channels: u16) -> Jitter {
-        let frame = 2 * usize::from(channels);
+        // A frame of 0 bytes would divide by zero in `push`/`fill`.
+        let frame = 2 * usize::from(channels.max(1));
         Jitter {
             bytes: VecDeque::new(),
             frame,

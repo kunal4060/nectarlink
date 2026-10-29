@@ -566,6 +566,11 @@ const HEVC_AUD: [u8; 7] = [0, 0, 0, 1, 0x46, 0x01, 0x50];
 /// A sample holding `data` followed by `end`.
 fn sample_of(data: &[u8], end: &[u8], time_us: u64) -> windows::core::Result<IMFSample> {
     let len = data.len() + end.len();
+    // MFCreateMemoryBuffer takes a u32: a longer unit would truncate
+    // the buffer size and then overrun it in the copy below.
+    if len > u32::MAX as usize {
+        return Err(windows::core::Error::from(E_FAIL));
+    }
     // SAFETY: the buffer is at least `len` long and locked while it's
     // written.
     unsafe {

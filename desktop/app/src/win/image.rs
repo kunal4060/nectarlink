@@ -61,6 +61,12 @@ pub fn decode(bytes: &[u8]) -> Result<Bitmap> {
             )?;
             let (mut width, mut height) = (0, 0);
             converter.GetSize(&mut width, &mut height)?;
+            // The stride passed to CopyPixels below is `width * 4` in a
+            // u32: a wider image would wrap it (and the allocation
+            // check alone would not catch it).
+            if width > u32::MAX / 4 {
+                return Err(invalid("image too large"));
+            }
             let len = (width as usize).checked_mul(height as usize).and_then(|n| n.checked_mul(4));
             let mut bgra = vec![0u8; len.ok_or_else(|| invalid("image too large"))?];
             converter.CopyPixels(std::ptr::null(), width * 4, &mut bgra)?;
@@ -71,6 +77,9 @@ pub fn decode(bytes: &[u8]) -> Result<Bitmap> {
 
 /// Encodes pixels as a PNG file.
 pub fn encode_png(bitmap: &Bitmap) -> Result<Vec<u8>> {
+    // The stride is `width * 4` in a u32: reject a width that would wrap
+    // it before either WIC call below uses it.
+    let stride = bitmap.width.checked_mul(4).ok_or_else(|| invalid("image too large"))?;
     with_com(|| {
         // SAFETY: as in `decode`; the bitmap is created from (a copy of)
         // the pixels, and the memory stream is read back within its size.
@@ -80,7 +89,7 @@ pub fn encode_png(bitmap: &Bitmap) -> Result<Vec<u8>> {
                 bitmap.width,
                 bitmap.height,
                 &GUID_WICPixelFormat32bppBGRA,
-                bitmap.width * 4,
+                stride,
                 &bitmap.bgra,
             )?;
             let stream = SHCreateMemStream(None).ok_or_else(|| invalid("no memory stream"))?;

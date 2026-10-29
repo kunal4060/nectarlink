@@ -21,6 +21,7 @@
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <mutex>
 #include <vector>
 
@@ -245,6 +246,11 @@ QSGNode *VideoView::updatePaintNode(QSGNode *old, UpdatePaintNodeData *)
 
 void video_frame(rust::Str stream, uint32_t width, uint32_t height, rust::Slice<const uint8_t> bgrx)
 {
+    // QImage takes int width/height and an int bytes-per-line: reject
+    // dimensions that would overflow either conversion before constructing it.
+    if (width == 0 || height == 0 || width > uint32_t(std::numeric_limits<int>::max()) / 4
+        || height > uint32_t(std::numeric_limits<int>::max()))
+        return;
     if (bgrx.size() < size_t(width) * height * 4)
         return;
     // One copy, into an image Qt owns, performed outside the shared mutex.

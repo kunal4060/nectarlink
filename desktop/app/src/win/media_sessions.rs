@@ -616,6 +616,12 @@ pub fn command(player: &str, action: MediaAction, position: Option<u64>) -> Resu
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
     }
+    // As in `snapshot` and `pause_for_call`: NectarLink's own session
+    // (a phone's media in the flyout) is never a command target, so a
+    // phone never gets its own music back through this path.
+    if player == AUMID {
+        return Err(MediaError::NotFound);
+    }
     let manager = MANAGER.get().ok_or(MediaError::Unsupported)?;
     let failed = |e: windows::core::Error| MediaError::Failed(e.to_string());
     let session = manager

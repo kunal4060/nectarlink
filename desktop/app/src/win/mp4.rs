@@ -355,6 +355,11 @@ fn write_sample(
     dur_hns: i64,
     clean_point: bool,
 ) -> windows::core::Result<()> {
+    // MFCreateMemoryBuffer takes a u32: a longer sample would truncate
+    // the buffer size and then overrun it in the copy below.
+    if bytes.len() > u32::MAX as usize {
+        return Err(windows::core::Error::from(windows::Win32::Foundation::E_FAIL));
+    }
     // SAFETY: buffer is sized to `bytes.len()`, locked while copied, and unlocked before WriteSample.
     unsafe {
         let buf: IMFMediaBuffer = MFCreateMemoryBuffer(bytes.len() as u32)?;

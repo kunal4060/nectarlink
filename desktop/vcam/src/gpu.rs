@@ -285,6 +285,8 @@ impl GpuPublisher {
                 || height > desc.Height
                 || desc.Width > MAX_WIDTH
                 || desc.Height > MAX_HEIGHT + 32
+                || !desc.Width.is_multiple_of(2)
+                || !desc.Height.is_multiple_of(2)
             {
                 return Ok(false);
             }
@@ -374,6 +376,15 @@ impl GpuPublisher {
                 // Retaining the decoder sample prevents its surface being recycled.
                 shared.source = Some(sample.clone());
                 let context = device.GetImmediateContext()?;
+                // A subresource index past the texture's subresources
+                // must fall back to CPU, not copy from an out-of-range
+                // subresource. Release the slot's keyed mutex first: the
+                // slot was already acquired above, and returning without
+                // releasing would deadlock the next publish.
+                if index as usize >= desc.MipLevels as usize * desc.ArraySize as usize {
+                    shared.mutex.ReleaseSync(1)?;
+                    return Ok(false);
+                }
                 context.CopySubresourceRegion(&shared.texture, 0, 0, 0, 0, texture, index, None);
                 context.Flush();
                 shared.mutex.ReleaseSync(1)?;
@@ -600,6 +611,13 @@ impl GpuReader {
             context.CopySubresourceRegion(staging, 0, 0, 0, 0, self.snapshot.as_ref().unwrap(), 0, None);
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             context.Map(staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+            // Map can succeed with a null pointer or a stride narrower
+            // than a coded row; either would read out of bounds below.
+            // Unmap before failing so the staging texture is not left mapped.
+            if mapped.pData.is_null() || (mapped.RowPitch as usize) < d.coded_w as usize {
+                context.Unmap(staging, 0);
+                return Err(E_INVALIDARG.into());
+            }
             let stride = mapped.RowPitch as usize;
             let width = d.width as usize;
             let height = d.height as usize;

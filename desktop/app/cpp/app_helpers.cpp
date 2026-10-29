@@ -100,6 +100,7 @@ void register_qml_app_engine(QQmlApplicationEngine &engine)
 
 #include <atomic>
 #include <cstdio>
+#include <limits>
 
 namespace {
 std::atomic<int> &qmlProblems()
@@ -341,6 +342,9 @@ rust::Vec<uint8_t> decode_image(rust::Slice<const uint8_t> bytes)
 {
     rust::Vec<uint8_t> result;
     if (bytes.empty())
+        return result;
+    // loadFromData takes an int length: a longer slice would truncate it.
+    if (bytes.size() > static_cast<size_t>(std::numeric_limits<int>::max()))
         return result;
     QImage img;
     if (!img.loadFromData(bytes.data(), static_cast<int>(bytes.size())))
