@@ -34,7 +34,10 @@ const SAFE_HANDOFF_EXTENSIONS: &[&str] = &[
     // Documents & text
     "pdf", "txt", "md", "rtf", "csv", "tsv", "json", "xml", "yaml", "yml", "doc", "docx", "xls", "xlsx",
     "ppt", "pptx", "odt", "ods", "odp", "epub", // Images
-    "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", // Audio & video
+    // No `svg`: an SVG opened directly can execute embedded script and
+    // load external resources, so it is not a safe non-executable document
+    // for automatic opening on arrival.
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", // Audio & video
     "mp3", "m4a", "wav", "flac", "ogg", "mp4", "mkv", "mov", "webm",
 ];
 
@@ -141,7 +144,15 @@ pub fn with_video_timestamp(url: &str, secs: u32) -> String {
     };
     let lower_host = link_host(before_frag).to_ascii_lowercase();
     if lower_host == "vimeo.com" || lower_host.ends_with(".vimeo.com") {
-        return format!("{before_frag}#t={secs}s");
+        // Keep any pre-existing non-timestamp fragment parameters instead
+        // of dropping them (replacing a previous `t=` if there is one).
+        let kept: Vec<&str> = match frag {
+            Some(f) => f.split('&').filter(|p| !p.starts_with("t=")).collect(),
+            None => Vec::new(),
+        };
+        let mut frag_parts = vec![format!("t={secs}s")];
+        frag_parts.extend(kept.iter().map(|s| (*s).to_owned()));
+        return format!("{before_frag}#{}", frag_parts.join("&"));
     }
     let (base, query) = match before_frag.split_once('?') {
         Some((b, q)) => (b, Some(q)),
@@ -174,7 +185,8 @@ pub fn with_video_timestamp(url: &str, secs: u32) -> String {
 /// platforms without a registered `geo:` handler can open it in the browser.
 #[must_use]
 pub fn geo_to_maps_https(uri: &str) -> Option<String> {
-    let rest = uri.trim().strip_prefix("geo:").or_else(|| uri.trim().strip_prefix("GEO:"))?;
+    let trimmed = uri.trim();
+    let rest = trimmed.get(..4).filter(|p| p.eq_ignore_ascii_case("geo:")).map(|_| &trimmed[4..])?;
     let (coords_part, query_part) = match rest.split_once('?') {
         Some((c, q)) => (c, Some(q)),
         None => (rest, None),
@@ -374,7 +386,17 @@ fn classify_link_token(url: &str) -> Option<HandoffLink> {
 }
 
 fn link_host(url: &str) -> &str {
-    url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("")
+    let authority =
+        url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("");
+    // Strip userinfo (`user:pass@host`) so a credential-bearing host
+    // string is never used as a label or for host classification, and
+    // strip the port so `example.com:8080` matches `example.com`.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    if authority.starts_with('[') {
+        authority.split(']').next().map(|h| &h[1..]).unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
 }
 
 fn is_map_url(host: &str, rest_after_scheme: &str) -> bool {

@@ -47,7 +47,8 @@ fn allowed(shared: &Shared, peer: &DeviceId) -> Result<()> {
 
 pub(crate) async fn threads(shared: &Shared, session: &Session, limit: u32) -> Result<Vec<SmsThread>> {
     allowed(shared, &session.peer)?;
-    let env = Envelope::new(types::SMS_THREADS, &SmsThreadsGet { limit: limit.min(sms::MAX_PAGE) })?;
+    let env =
+        Envelope::new(types::SMS_THREADS, &SmsThreadsGet { limit: limit.clamp(1, sms::MAX_PAGE) })?;
     let SmsThreads { threads } =
         session.request(env, crate::session::REQUEST_TIMEOUT).await?.expect_body(types::SMS_THREADS)?;
     Ok(threads)
@@ -63,7 +64,7 @@ pub(crate) async fn messages(
     allowed(shared, &session.peer)?;
     let env = Envelope::new(
         types::SMS_MESSAGES,
-        &SmsMessagesGet { thread, before, limit: limit.min(sms::MAX_PAGE) },
+        &SmsMessagesGet { thread, before, limit: limit.clamp(1, sms::MAX_PAGE) },
     )?;
     let SmsMessages { messages } =
         session.request(env, crate::session::REQUEST_TIMEOUT).await?.expect_body(types::SMS_MESSAGES)?;
@@ -148,7 +149,7 @@ async fn answer(shared: &Arc<Shared>, session: &Session, env: &Envelope) -> Resu
         types::SMS_THREADS => {
             let SmsThreadsGet { limit } = env.body()?;
             blocking(Box::new(move || {
-                let mut threads = platform.sms_threads(limit.min(sms::MAX_PAGE))?;
+                let mut threads = platform.sms_threads(limit.clamp(1, sms::MAX_PAGE))?;
                 for t in &mut threads {
                     if t.photo.as_ref().is_some_and(|p| p.len() > sms::MAX_PHOTO_BYTES) {
                         t.photo = None;
@@ -161,7 +162,7 @@ async fn answer(shared: &Arc<Shared>, session: &Session, env: &Envelope) -> Resu
         types::SMS_MESSAGES => {
             let SmsMessagesGet { thread, before, limit } = env.body()?;
             blocking(Box::new(move || {
-                let messages = platform.sms_messages(&thread, before, limit.min(sms::MAX_PAGE))?;
+                let messages = platform.sms_messages(&thread, before, limit.clamp(1, sms::MAX_PAGE))?;
                 fit(messages, |messages| Envelope::new(types::SMS_MESSAGES, &SmsMessages { messages }))
             }))
             .await
@@ -183,7 +184,11 @@ async fn answer(shared: &Arc<Shared>, session: &Session, env: &Envelope) -> Resu
             blocking(Box::new(move || {
                 let (mime, data) = platform.sms_part(&id)?;
                 if data.len() > sms::MAX_PART_BYTES {
-                    return Ok(Envelope::error(ErrorCode::Busy, "too large"));
+                    // A permanent size rejection, not a transient one: the
+                    // protocol has no dedicated size code, so use the
+                    // oversize code rather than `Busy` (which invites a
+                    // futile retry).
+                    return Ok(Envelope::error(ErrorCode::FrameTooLarge, "too large"));
                 }
                 Envelope::new(types::SMS_PART, &SmsPartData { mime, data }).map_err(|e| e.to_string())
             }))
@@ -197,6 +202,11 @@ async fn answer(shared: &Arc<Shared>, session: &Session, env: &Envelope) -> Resu
 }
 
 /// The envelope for as many of `items` (newest first) as fit in a frame.
+///
+/// A genuinely empty input still returns an empty envelope. But a
+/// non-empty input is never silently reduced to one: if even a single
+/// item doesn't fit, this errors instead of reporting "no items" for a
+/// list that does have items.
 pub(crate) fn fit<T: Clone>(
     mut items: Vec<T>,
     wrap: impl Fn(Vec<T>) -> std::result::Result<Envelope, nectarlink_protocol::ProtocolError>,
@@ -205,6 +215,9 @@ pub(crate) fn fit<T: Clone>(
         let env = wrap(items.clone()).map_err(|e| e.to_string())?;
         if env.to_cbor().len() + FRAME_MARGIN <= MAX_FRAME_LEN || items.is_empty() {
             return Ok(env);
+        }
+        if items.len() <= 1 {
+            return Err("a single item is too large for a frame".into());
         }
         // Drop the oldest quarter and try again.
         let keep = items.len() - items.len().div_ceil(4);

@@ -272,7 +272,7 @@ impl QueuePayload {
                     files
                         .first()
                         .and_then(|f| f.folder.as_deref())
-                        .and_then(|f| f.split('/').next())
+                        .and_then(|f| f.split('/').find(|s| !s.is_empty()))
                         .unwrap_or("Folder")
                         .to_owned()
                 } else {
@@ -388,8 +388,19 @@ pub const MAX_CHAT_THREADS_PER_PEER: usize = 200;
 pub const MAX_CHAT_MESSAGES_PER_THREAD: usize = 200;
 
 /// Deterministic thread ID for a notification-backed messaging conversation.
-pub fn chat_thread_id(app: &str, title: &str) -> String {
-    format!("chat:{}:{}", app.trim(), title.trim().to_lowercase())
+/// Group conversations carry a `group` segment so a group and a 1:1 chat in
+/// the same app with the same title no longer share one thread (their
+/// messages interleaved, and each upsert overwrote the other's
+/// reply-action id — a reply composed for the DM could go to the group).
+/// Direct chats keep the historical format, so existing DM threads are not
+/// split; pre-existing group threads created under the old format stay
+/// under their old ID as history alongside the new group thread.
+pub fn chat_thread_id(app: &str, title: &str, is_group: bool) -> String {
+    if is_group {
+        format!("chat:{}:group:{}", app.trim(), title.trim().to_lowercase())
+    } else {
+        format!("chat:{}:{}", app.trim(), title.trim().to_lowercase())
+    }
 }
 
 /// A persisted conversation from a messaging app notification (`MessagingStyle`).
@@ -685,7 +696,8 @@ impl Store {
     pub fn update_info(&self, id: &DeviceId, info: &DeviceInfo) -> Result<()> {
         let screen = encode_screen(info.screen.as_ref());
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "UPDATE peers SET name = ?2, kind = ?3, os = ?4, os_ver = ?5, model = ?6,
                     accent = COALESCE(?7, accent),
                     screen = CASE WHEN ?8 = '' THEN screen ELSE ?8 END,
@@ -704,14 +716,23 @@ impl Store {
                 ],
             )?;
             if valid_install_id(info).is_some() {
-                cleanup_peers(c, Some(id))?;
+                // No `cleanup_peers` here on purpose: merging same-install-ID
+                // peers is a pairing-time decision (see `upsert_peer`, gated
+                // by the UI via `reinstall_candidates`). Running it on every
+                // info update would let an already-paired peer absorb a
+                // different peer mid-session just by advertising its
+                // install ID in a hello update.
                 self.toggle_cache().clear();
             }
-            c.execute(
+            // Both updates commit together: previously the timeline rename
+            // was a separate autocommit statement whose failure left the
+            // peer row updated and the timeline stale (and vice versa).
+            tx.execute(
                 "UPDATE timeline SET device_name = ?2 WHERE device_id = ?1",
                 params![id.as_bytes().as_slice(), info.name],
-            )
-            .map(drop)
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -735,7 +756,14 @@ impl Store {
         caps: Option<&BTreeSet<String>>,
         power: Option<PowerLevel>,
     ) -> Result<()> {
-        let caps = caps.map(|c| c.iter().map(String::as_str).collect::<Vec<_>>().join(","));
+        // JSON, not comma-joined: a capability containing `,` must round-trip
+        // as one capability, not split into two on read (which could mint a
+        // gated capability the peer never announced as a separate token).
+        // `decode_caps` still reads legacy comma-joined rows.
+        let caps = caps
+            .map(|c| serde_json::to_string(&c.iter().collect::<Vec<_>>()))
+            .transpose()
+            .map_err(|e| Error::Internal(e.to_string()))?;
         self.with(|c| {
             c.execute(
                 "UPDATE peers SET caps = coalesce(?2, caps), power = coalesce(?3, power) WHERE id = ?1",
@@ -799,14 +827,42 @@ impl Store {
 
     /// Removes a device. Returns whether it existed.
     pub fn remove_peer(&self, id: &DeviceId) -> Result<bool> {
+        Ok(self.remove_peer_with_queue(id)?.0)
+    }
+
+    /// Removes a device together with its send-queue rows, in one
+    /// transaction, and returns the dropped queue payloads so the caller
+    /// can clean up their staged files afterwards. Doing peer removal and
+    /// queue deletion atomically is what lets `forget_peer` drop the queue
+    /// only once the peer is actually gone: deleting the queue first and
+    /// then failing to remove the peer would lose the queue while leaving
+    /// the peer paired.
+    pub fn remove_peer_with_queue(&self, id: &DeviceId) -> Result<(bool, Vec<(String, QueuePayload)>)> {
         let peer_str = id.to_string();
         self.with(|c| {
-            let _ = c.execute("DELETE FROM chat_messages WHERE peer = ?1", [&peer_str]);
-            let _ = c.execute("DELETE FROM chat_threads WHERE peer = ?1", [&peer_str]);
-            let removed = c.execute("DELETE FROM peers WHERE id = ?1", [id.as_bytes().as_slice()])? > 0;
+            let tx = c.unchecked_transaction()?;
+            let mut stmt =
+                tx.prepare_cached("SELECT id, payload_json FROM send_queue WHERE peer_id = ?1")?;
+            let rows: Vec<(String, String)> = stmt
+                .query_map([&peer_str], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            drop(stmt);
+            let dropped: Vec<(String, QueuePayload)> = rows
+                .into_iter()
+                .filter_map(|(qid, json)| serde_json::from_str::<QueuePayload>(&json).ok().map(|p| (qid, p)))
+                .collect();
+            tx.execute("DELETE FROM chat_messages WHERE peer = ?1", [&peer_str])?;
+            tx.execute("DELETE FROM chat_threads WHERE peer = ?1", [&peer_str])?;
+            // Unpairing must revoke the trust it removes: timeline history
+            // and pending send-queue rows for the device go with it instead
+            // of lingering queryable / counting against the queue caps.
+            tx.execute("DELETE FROM timeline WHERE device_id = ?1", [id.as_bytes().as_slice()])?;
+            tx.execute("DELETE FROM send_queue WHERE peer_id = ?1", [&peer_str])?;
+            let removed = tx.execute("DELETE FROM peers WHERE id = ?1", [id.as_bytes().as_slice()])? > 0;
+            tx.commit()?;
             // Its toggles went with it.
             self.toggle_cache().remove(id);
-            Ok(removed)
+            Ok((removed, dropped))
         })
     }
 
@@ -1036,7 +1092,7 @@ impl Store {
         if conv.messages.is_empty() || conv.title.trim().is_empty() {
             return Ok(None);
         };
-        let thread_id = chat_thread_id(&n.app, &conv.title);
+        let thread_id = chat_thread_id(&n.app, &conv.title, conv.group);
         let reply_action_id = n.actions.iter().find(|a| a.reply).map(|a| a.id.clone());
         let Some(latest) = conv.messages.last() else {
             return Ok(None);
@@ -1134,12 +1190,16 @@ impl Store {
                  ON CONFLICT(peer, thread_id) DO UPDATE SET
                     app = excluded.app,
                     app_name = excluded.app_name,
-                    notification_key = excluded.notification_key,
-                    reply_action_id = excluded.reply_action_id,
-                    title = excluded.title,
-                    is_group = excluded.is_group,
-                    snippet = excluded.snippet,
-                    last_sender = excluded.last_sender,
+                    -- Recency-guarded like `updated_ms`: a delayed or
+                    -- replayed older notification must not overwrite the
+                    -- current snippet/sender, resurrect a cleared thread
+                    -- (`active`), or swap in a dead reply-action id.
+                    notification_key = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.notification_key ELSE chat_threads.notification_key END,
+                    reply_action_id = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.reply_action_id ELSE chat_threads.reply_action_id END,
+                    title = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.title ELSE chat_threads.title END,
+                    is_group = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.is_group ELSE chat_threads.is_group END,
+                    snippet = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.snippet ELSE chat_threads.snippet END,
+                    last_sender = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN excluded.last_sender ELSE chat_threads.last_sender END,
                     updated_ms = MAX(chat_threads.updated_ms, excluded.updated_ms),
                     unread = CASE
                         WHEN ?15 != 0 THEN CASE
@@ -1148,7 +1208,7 @@ impl Store {
                         END
                         ELSE chat_threads.unread + ?17
                     END,
-                    active = 1,
+                    active = CASE WHEN excluded.updated_ms >= chat_threads.updated_ms THEN 1 ELSE chat_threads.active END,
                     avatar = COALESCE(excluded.avatar, chat_threads.avatar),
                     app_icon = COALESCE(excluded.app_icon, chat_threads.app_icon)",
                 params![
@@ -1172,7 +1232,7 @@ impl Store {
                 ],
             )?;
 
-            prune_chat_conn(&tx, &peer_str, &thread_id)?;
+            prune_chat_conn(&tx, &peer_str, &thread_id, crate::now_unix() * 1000)?;
             tx.commit()?;
             Ok(Some(thread_id))
         })
@@ -1346,22 +1406,31 @@ impl Store {
     pub fn delete_chat_thread(&self, peer: &DeviceId, thread_id: &str) -> Result<bool> {
         let peer_str = peer.to_string();
         self.with(|c| {
-            c.execute(
+            let tx = c.unchecked_transaction()?;
+            tx.execute(
                 "DELETE FROM chat_messages WHERE peer = ?1 AND thread_id = ?2",
                 params![peer_str, thread_id],
             )?;
-            c.execute(
-                "DELETE FROM chat_threads WHERE peer = ?1 AND thread_id = ?2",
-                params![peer_str, thread_id],
-            )
-            .map(|n| n > 0)
+            let removed = tx
+                .execute(
+                    "DELETE FROM chat_threads WHERE peer = ?1 AND thread_id = ?2",
+                    params![peer_str, thread_id],
+                )
+                .map(|n| n > 0)?;
+            // One transaction: previously a failure on the second delete
+            // left all messages deleted but the empty thread behind.
+            tx.commit()?;
+            Ok(removed)
         })
     }
 
     pub fn clear_chat_threads(&self) -> Result<usize> {
         self.with(|c| {
-            c.execute("DELETE FROM chat_messages", [])?;
-            c.execute("DELETE FROM chat_threads", [])
+            let tx = c.unchecked_transaction()?;
+            tx.execute("DELETE FROM chat_messages", [])?;
+            let removed = tx.execute("DELETE FROM chat_threads", [])?;
+            tx.commit()?;
+            Ok(removed)
         })
     }
 
@@ -1663,9 +1732,12 @@ impl Store {
             tx.commit()?;
             Ok(out)
         })?;
-        for (id, payload) in &expired {
-            cleanup_staged_payload(self.data_dir.as_deref(), id, payload.as_ref());
-        }
+        // Staged files are deliberately NOT deleted here: `retry_queue_item`
+        // revives `expired` items, and deleting their staging on expiry made
+        // every such retry fail with "File was deleted before sending".
+        // Truly terminal paths (`remove_queue_item`,
+        // `clear_finished_queue_items`, `drop_all_queue_for_peer`,
+        // `remove_peer_with_queue`) clean staging up.
         Ok(expired.len())
     }
 
@@ -1686,8 +1758,13 @@ impl Store {
             };
             let mut out = Vec::with_capacity(rows.len());
             for raw in rows {
-                if let Some((item, _, _, _)) = decode_queue_row(c, raw, false) {
-                    out.push(item);
+                // Log, don't silently drop, rows that fail to decode: an
+                // invisible row still counts against the queue caps and can
+                // stall the sender behind a `waiting` head item.
+                let row_id = raw.id.clone();
+                match decode_queue_row(c, raw, false) {
+                    Some((item, _, _, _)) => out.push(item),
+                    None => tracing::warn!(id = %row_id, "dropping undecodable send-queue row from listing"),
                 }
             }
             Ok(out)
@@ -1794,8 +1871,14 @@ impl Store {
     /// Transitions a queue item from `'waiting'` to `'sending'`.
     pub fn mark_queue_sending(&self, id: &str) -> Result<bool> {
         self.with(|c| {
-            c.execute("UPDATE send_queue SET status = 'sending', error_msg = NULL WHERE id = ?1", [id])
-                .map(|n| n > 0)
+            // Guarded to `'waiting'`: an expired or permanently failed item
+            // must not be put back into flight without a user retry (which
+            // refreshes its TTL), and a finished item must stay finished.
+            c.execute(
+                "UPDATE send_queue SET status = 'sending', error_msg = NULL WHERE id = ?1 AND status = 'waiting'",
+                [id],
+            )
+            .map(|n| n > 0)
         })
     }
 
@@ -1834,10 +1917,14 @@ impl Store {
         last_error: Option<&str>,
     ) -> Result<bool> {
         self.with(|c| {
+            // Guarded to in-flight states: a `failed`/`expired`/finished item
+            // must not be resurrected with its old, already-past `expires_at`
+            // by a stale sender thread (user retries go through
+            // `retry_queue_item`, which refreshes the TTL).
             c.execute(
                 "UPDATE send_queue
                  SET status = 'waiting', attempts = ?2, next_retry_ms = ?3, error_msg = ?4
-                 WHERE id = ?1",
+                 WHERE id = ?1 AND status IN ('sending', 'waiting')",
                 params![id, i64::from(attempts), next_retry_ms, last_error],
             )
             .map(|n| n > 0)
@@ -2014,17 +2101,32 @@ const fn bytes_from_len(len: usize) -> u64 {
 }
 
 fn cleanup_staged_payload(data_dir: Option<&Path>, id: &str, payload: Option<&QueuePayload>) {
-    if let Some(dir) = data_dir {
-        let _ = std::fs::remove_dir_all(dir.join("queue_staging").join(id));
+    // Containment: ids are locally generated, but a row read back from the
+    // DB must never turn a cleanup into an arbitrary delete. The staging
+    // directory is removed only for a single-component id, and a staged
+    // file only when it actually lives under the staging root.
+    let staging_root = data_dir.map(|dir| dir.join("queue_staging"));
+    if let Some(root) = &staging_root {
+        let single_component = !id.is_empty()
+            && id != "."
+            && id != ".."
+            && !id.contains('/')
+            && !id.contains('\\');
+        if single_component {
+            let _ = std::fs::remove_dir_all(root.join(id));
+        }
     }
     if let Some(p) = payload {
         for spec in p.files_vec() {
             if spec.staged {
-                let _ = std::fs::remove_file(&spec.path);
-                if let Some(parent) = spec.path.parent()
-                    && parent.file_name().and_then(|n| n.to_str()) == Some(id)
-                {
-                    let _ = std::fs::remove_dir_all(parent);
+                let under_staging = staging_root.as_ref().is_some_and(|root| spec.path.starts_with(root));
+                if under_staging {
+                    let _ = std::fs::remove_file(&spec.path);
+                    if let Some(parent) = spec.path.parent()
+                        && parent.file_name().and_then(|n| n.to_str()) == Some(id)
+                    {
+                        let _ = std::fs::remove_dir_all(parent);
+                    }
                 }
             }
         }
@@ -2167,22 +2269,18 @@ fn prune_chat_messages_conn(c: &Connection, peer_str: &str, thread_id: &str) -> 
     Ok(())
 }
 
-fn prune_chat_conn(c: &Connection, peer_str: &str, thread_id: &str) -> rusqlite::Result<()> {
+fn prune_chat_conn(c: &Connection, peer_str: &str, thread_id: &str, now_ms: i64) -> rusqlite::Result<()> {
     prune_chat_messages_conn(c, peer_str, thread_id)?;
-    let max_updated: Option<i64> = c
-        .query_row("SELECT MAX(updated_ms) FROM chat_threads WHERE peer = ?1", [peer_str], |r| r.get(0))
-        .optional()?
-        .flatten();
-    if let Some(latest_ms) = max_updated {
-        let retention_ms = CHAT_RETENTION_SECS * 1000;
-        if latest_ms > retention_ms {
-            let cutoff_ms = latest_ms - retention_ms;
-            c.execute(
-                "DELETE FROM chat_threads WHERE peer = ?1 AND updated_ms < ?2",
-                params![peer_str, cutoff_ms],
-            )?;
-        }
-    }
+    // Retention is wall-clock age, not "90 days before the newest thread":
+    // anchoring to MAX(updated_ms) let a single far-future peer timestamp
+    // mass-delete every other thread, and let history accumulate forever
+    // when no new messages arrived.
+    let retention_ms = CHAT_RETENTION_SECS * 1000;
+    let cutoff_ms = now_ms.saturating_sub(retention_ms);
+    c.execute(
+        "DELETE FROM chat_threads WHERE peer = ?1 AND updated_ms < ?2",
+        params![peer_str, cutoff_ms],
+    )?;
     c.execute(
         "DELETE FROM chat_threads
          WHERE peer = ?1
@@ -2339,6 +2437,19 @@ fn decode_screen(s: &str) -> Option<ScreenShape> {
     serde_json::from_str::<ScreenShape>(s).ok().and_then(ScreenShape::sanitized)
 }
 
+/// Decodes the stored `caps` column. Current rows are a JSON array (see
+/// `update_capabilities`); rows written before that change are comma-joined
+/// and are still read the old way, so existing peers keep their capabilities.
+fn decode_caps(raw: &str) -> BTreeSet<String> {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('[') {
+        if let Ok(caps) = serde_json::from_str::<Vec<String>>(trimmed) {
+            return caps.into_iter().collect();
+        }
+    }
+    trimmed.split(',').filter(|c| !c.is_empty()).map(str::to_owned).collect()
+}
+
 fn row_to_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRecord> {
     let id: Vec<u8> = row.get(0)?;
     let id: [u8; 32] = id
@@ -2367,7 +2478,7 @@ fn row_to_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerRecord> {
         last_seen: row.get(8)?,
         // Skip entries that no longer parse instead of failing the whole read.
         last_addrs: addrs.split(',').filter_map(|a| a.parse().ok()).collect(),
-        caps: caps.split(',').filter(|c| !c.is_empty()).map(str::to_owned).collect(),
+        caps: decode_caps(&caps),
         power: power_from_str(&power),
         wake_info: PcWakeInfo::from_storage_str(&wake_info),
     })

@@ -180,31 +180,47 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             Ok(true)
         }
         types::PHOTOS_ALBUMS | types::PHOTOS_LIST | types::PHOTOS_THUMBS => {
-            let reply = answer_query(shared, peer, env).await.unwrap_or_else(|e| {
-                tracing::debug!(error = %e, "bad photos request");
-                Envelope::error(ErrorCode::BadMessage, "invalid request")
+            // Reading the phone's photos takes a moment (and a large
+            // library takes a while): not on the session's loop, as with
+            // sms/contacts, so other envelopes are not parked behind it.
+            let (shared, session, env) = (shared.clone(), session.clone(), env.clone());
+            tokio::spawn(async move {
+                let reply = answer_query(&shared, peer, &env).await.unwrap_or_else(|e| {
+                    tracing::debug!(error = %e, "bad photos request");
+                    Envelope::error(ErrorCode::BadMessage, "invalid request")
+                });
+                let _ = session.send(reply.reply_to(env.id)).await;
             });
-            session.send(reply.reply_to(env.id)).await?;
             Ok(true)
         }
         types::PHOTOS_GET => {
             let get: PhotoGet = env.body()?;
-            let reply = match send_photos(shared, peer, get.requested_ids()).await {
-                Ok(transfer) => Envelope::new(types::PHOTOS_SENDING, &PhotoSending { transfer })?,
-                Err(Error::Denied) => {
-                    Envelope::error(ErrorCode::Denied, "photos or files are off for this device")
-                }
-                Err(Error::Unsupported) => {
-                    Envelope::error(ErrorCode::Unsupported, "this phone doesn't share photos")
-                }
-                Err(Error::NotFound) => Envelope::error(ErrorCode::NotFound, "no such photo"),
-                Err(Error::Protocol(_)) => Envelope::error(ErrorCode::BadMessage, "invalid photo request"),
-                Err(e) => {
-                    tracing::warn!(error = %e, "can't send a photo");
-                    Envelope::error(ErrorCode::Internal, "can't send it")
-                }
-            };
-            session.send(reply.reply_to(env.id)).await?;
+            let ids = get.requested_ids();
+            // Setting up the transfer takes a moment: not on the session's loop.
+            let (shared, session, env_id) = (shared.clone(), session.clone(), env.id);
+            tokio::spawn(async move {
+                let reply = match send_photos(&shared, peer, ids).await {
+                    Ok(transfer) => Envelope::new(types::PHOTOS_SENDING, &PhotoSending { transfer })
+                        .unwrap_or_else(|e| {
+                            Envelope::error(ErrorCode::Internal, e.to_string())
+                        }),
+                    Err(Error::Denied) => {
+                        Envelope::error(ErrorCode::Denied, "photos or files are off for this device")
+                    }
+                    Err(Error::Unsupported) => {
+                        Envelope::error(ErrorCode::Unsupported, "this phone doesn't share photos")
+                    }
+                    Err(Error::NotFound) => Envelope::error(ErrorCode::NotFound, "no such photo"),
+                    Err(Error::Protocol(_)) => {
+                        Envelope::error(ErrorCode::BadMessage, "invalid photo request")
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "can't send a photo");
+                        Envelope::error(ErrorCode::Internal, "can't send it")
+                    }
+                };
+                let _ = session.send(reply.reply_to(env_id)).await;
+            });
             Ok(true)
         }
         _ => Ok(false),
@@ -277,7 +293,9 @@ fn sanitize_albums(albums: Vec<PhotoAlbum>) -> Vec<PhotoAlbum> {
         .filter_map(|mut a| {
             let id = a.id.trim().to_owned();
             let name = a.name.trim().to_owned();
-            if id.is_empty() || name.is_empty() || a.count == 0 {
+            // An album that exists but has no photos yet is still an
+            // album: only a missing id or name filters it out.
+            if id.is_empty() || name.is_empty() {
                 return None;
             }
             a.id = id;
@@ -351,9 +369,11 @@ mod tests {
             PhotoAlbum { id: "b2".into(), name: "Empty".into(), count: 0, cover: None },
             PhotoAlbum { id: "b3".into(), name: "Bad cover".into(), count: 1, cover: Some("bad id".into()) },
         ]);
-        assert_eq!(albums.len(), 2);
+        // A still-empty album is kept (it exists, it just has no photos yet).
+        assert_eq!(albums.len(), 3);
         assert_eq!((albums[0].id.as_str(), albums[0].name.as_str()), ("b1", "Camera"));
-        assert_eq!(albums[1].cover, None);
+        assert_eq!(albums[1].name.as_str(), "Empty");
+        assert_eq!(albums[2].cover, None);
 
         let items = sanitize_items(vec![
             PhotoItem {

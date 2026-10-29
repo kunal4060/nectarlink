@@ -371,6 +371,10 @@ pub const DEVICE_TOGGLES: &[(&str, bool)] = &[
     ("commands", false),
     // Browsing the PC's files from anywhere is opt-in.
     ("remote_files", false),
+    // Opening a link sent by this device (on by default: link-open was
+    // previously ungated, so existing pairs keep working until the user
+    // turns it off for a device).
+    ("links", true),
 ];
 
 /// The default for a toggle, or `None` if no such toggle exists.
@@ -466,7 +470,12 @@ fn check(req: &Requirement, ctx: &Context<'_>) -> Check {
                 return Check::Met;
             }
             match unlock {
-                Unlock::Power(level) if power_rank(ctx.phone.power) < power_rank(level) => {
+                // Rank the device the requirement is about (`facts`), not
+                // always the phone: a desktop power shortfall must not be
+                // reported as a phone power upgrade. Desktop power unlocks
+                // stay unreachable in practice: `registry_is_consistent`
+                // forbids them.
+                Unlock::Power(level) if power_rank(facts.power) < power_rank(level) => {
                     Check::Unlockable(Upgrade::new(UpgradeAction::RaisePower(level)))
                 }
                 Unlock::Power(_) => Check::Impossible(UnsupportedReason::NotOnThisDevice),
@@ -496,17 +505,23 @@ fn check(req: &Requirement, ctx: &Context<'_>) -> Check {
                 Check::Unlockable(Upgrade::new(UpgradeAction::RaisePower(level)))
             }
         }
-        // An unparseable version doesn't block a feature: the phone only
-        // advertises capabilities it can actually provide.
+        // A missing or unparseable version doesn't meet a version gate:
+        // the version is announced by the peer, so fail closed rather than
+        // offering a feature on an OS build that may not support it. The
+        // reason stays generic (`NotOnThisDevice`): there is no
+        // unknown-version variant, and adding one would break the
+        // exhaustive reason match in the CLI.
         Requirement::AndroidAtLeast(needs) => match ctx.phone.android_release() {
             Some(release) if release < needs => Check::Impossible(UnsupportedReason::AndroidTooOld { needs }),
-            _ => Check::Met,
+            Some(_) => Check::Met,
+            None => Check::Impossible(UnsupportedReason::NotOnThisDevice),
         },
         Requirement::WindowsBuildAtLeast(needs_build) => match ctx.desktop.windows_build() {
             Some(build) if build < needs_build => {
                 Check::Impossible(UnsupportedReason::WindowsTooOld { needs_build })
             }
-            _ => Check::Met,
+            Some(_) => Check::Met,
+            None => Check::Impossible(UnsupportedReason::NotOnThisDevice),
         },
         Requirement::Path(path) => {
             if ctx.paths.contains(&path) {
@@ -644,7 +659,7 @@ pub const ANDROID_PAIR_FEATURES: &[FeatureDef] = &[
     FeatureDef {
         id: "pair.links",
         group: FeatureGroup::Device,
-        requires: &[peer("link.open")],
+        requires: &[peer("link.open"), DeviceToggle("links")],
         partial: None,
     },
 ];
@@ -676,13 +691,13 @@ pub const FEATURES: &[FeatureDef] = &[
     FeatureDef {
         id: "device.links_to_pc",
         group: FeatureGroup::Device,
-        requires: &[desktop("link.open", UPDATE)],
+        requires: &[desktop("link.open", UPDATE), DeviceToggle("links")],
         partial: None,
     },
     FeatureDef {
         id: "device.links_to_phone",
         group: FeatureGroup::Device,
-        requires: &[phone("link.open", UPDATE)],
+        requires: &[phone("link.open", UPDATE), DeviceToggle("links")],
         partial: None,
     },
     FeatureDef {

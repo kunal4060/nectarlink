@@ -275,11 +275,21 @@ pub(crate) async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendS
     }
     let _ = recv.stop(VarInt::from_u32(mirror::STOPPED));
     let _ = send.finish();
-    sink.ended();
+    // The screen's sound stream is separate: when the video ends, its
+    // audio must not keep playing on its own.
+    if mirroring == mirror::SCREEN {
+        shared.stop_mirror_audio(&peer);
+    }
+    // A loop replaced by a newer stream for the same session must not
+    // tear down the new stream's sink or report mirroring as off.
+    if !shared.mirror_stop_replaced(&peer, mirroring, mirror::OP_VIDEO, &stopped) {
+        shared.clear_mirror_stop(&peer, mirroring, mirror::OP_VIDEO, &stopped);
+        sink.ended();
+        shared.emit(NodeEvent::Mirroring { device: peer, session: mirroring, on: false });
+    }
     if let Some(row_id) = tl_row {
         shared.finish_timeline_session(row_id, started_at.elapsed().as_secs().max(1));
     }
-    shared.emit(NodeEvent::Mirroring { device: peer, session: mirroring, on: false });
 }
 
 /// A phone opened a sound stream (its header already read).
@@ -391,7 +401,15 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
         }
         types::MIRROR_KEYFRAME => {
             let MirrorSession { session: mirroring } = env.body()?;
-            tokio::task::spawn_blocking(move || platform.mirror_keyframe_requested(&peer, mirroring));
+            // Same toggle + capability gate as `MIRROR_RESIZE`/`MIRROR_POWER`
+            // (a keyframe only makes sense while this device captures):
+            // previously any paired peer could force keyframes with
+            // mirroring off. An active-session check is still missing —
+            // there is no core-side "currently sharing" registry yet (see
+            // the `MIRROR_POWER` note in the fix log).
+            if shared.toggle_on(&peer, TOGGLE) && shared.we_offer(mirror::CAPTURE) {
+                tokio::task::spawn_blocking(move || platform.mirror_keyframe_requested(&peer, mirroring));
+            }
         }
         types::MIRROR_RESIZE => {
             let resize: MirrorResize = env.body()?;
@@ -516,8 +534,15 @@ impl MirrorStream {
         if *resyncing && kind == PacketKind::Frame && !self.audio {
             return MirrorSend::NeedKeyframe;
         }
+        // A config packet waits for room, which can block indefinitely on
+        // a stalled peer: drop the lock first, so every other `send`
+        // caller doesn't wedge behind it. Re-acquire afterwards to apply
+        // the result below.
         let sent = if kind == PacketKind::Config {
-            self.queue.blocking_send((kind, time_us, data)).map_err(|_| ())
+            drop(resyncing);
+            let sent = self.queue.blocking_send((kind, time_us, data)).map_err(|_| ());
+            resyncing = self.resyncing.lock().unwrap_or_else(|e| e.into_inner());
+            sent
         } else {
             self.queue.try_send((kind, time_us, data)).map_err(|e| match e {
                 mpsc::error::TrySendError::Full(_) => (),
@@ -647,11 +672,65 @@ impl Shared {
     /// stream (`op`) of a mirroring.
     fn new_mirror_stop(&self, peer: &DeviceId, mirroring: u32, op: &'static str) -> Arc<tokio::sync::Notify> {
         let signal = Arc::new(tokio::sync::Notify::new());
+        // Stop the stream this one replaces: dropping the old signal
+        // without notifying it would leave its reader loop running.
+        if let Some(prev) = self
+            .mirror_stops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((*peer, mirroring, op), signal.clone())
+        {
+            prev.notify_one();
+        }
+        signal
+    }
+
+    /// Whether the stop signal for `peer`'s `mirroring`/`op` stream has
+    /// been replaced by a newer one: a replaced loop must not tear down
+    /// the new stream's sink.
+    fn mirror_stop_replaced(
+        &self,
+        peer: &DeviceId,
+        mirroring: u32,
+        op: &'static str,
+        signal: &Arc<tokio::sync::Notify>,
+    ) -> bool {
         self.mirror_stops
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert((*peer, mirroring, op), signal.clone());
-        signal
+            .get(&(*peer, mirroring, op))
+            .is_some_and(|cur| !Arc::ptr_eq(cur, signal))
+    }
+
+    /// Removes this stream's own stop signal, if it is still the current
+    /// one; whether it was removed.
+    fn clear_mirror_stop(
+        &self,
+        peer: &DeviceId,
+        mirroring: u32,
+        op: &'static str,
+        signal: &Arc<tokio::sync::Notify>,
+    ) -> bool {
+        let mut stops = self.mirror_stops.lock().unwrap_or_else(|e| e.into_inner());
+        if stops.get(&(*peer, mirroring, op)).is_some_and(|cur| Arc::ptr_eq(cur, signal)) {
+            stops.remove(&(*peer, mirroring, op));
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Stops the sound stream for `peer`'s screen mirroring, if one is
+    /// running. The audio loop then ends the sound itself.
+    fn stop_mirror_audio(&self, peer: &DeviceId) {
+        if let Some(signal) = self
+            .mirror_stops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&(*peer, mirror::SCREEN, mirror::OP_AUDIO))
+        {
+            signal.notify_one();
+        }
     }
 
     /// Stops showing (and playing) a mirroring of `peer` here (kept until

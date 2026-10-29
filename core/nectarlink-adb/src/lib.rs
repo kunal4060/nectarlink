@@ -15,10 +15,20 @@ use tokio_util::sync::CancellationToken;
 pub const DEFAULT_ADB_ADDR: SocketAddr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5037));
 
 /// Returns `true` if `serial` is non-empty and permitted by the optional
-/// `NECTARLINK_ADB_ONLY_SERIAL` filter.
+/// `NECTARLINK_ADB_ONLY_SERIAL` filter. Serials are interpolated raw into
+/// ADB commands, so only the characters a real serial can contain are
+/// allowed: letters, digits, `-`, `_`, `.`, and `:` (for `IP:port`
+/// serials). Whitespace, slashes, semicolons, and other shell/ADB
+/// metacharacters that could smuggle extra command fields are rejected.
 pub fn is_serial_allowed(serial: &str) -> bool {
     let trimmed = serial.trim();
     if trimmed.is_empty() {
+        return false;
+    }
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+    {
         return false;
     }
     if let Ok(only) = std::env::var("NECTARLINK_ADB_ONLY_SERIAL") {

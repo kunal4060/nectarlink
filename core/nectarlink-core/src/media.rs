@@ -209,7 +209,17 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
     let peer = session.peer;
     match env.t.as_str() {
         types::MEDIA_STATE => {
-            if shared.toggle_on(&peer, TOGGLE) {
+            // Player state is only believable from a peer that offers
+            // `media.control`: otherwise any peer could inject spoofed
+            // Now-Playing state into the UI. (This mirrors `shows_media`,
+            // which requires `media.remote` before state is sent out.)
+            let shares = shared
+                .store
+                .get_peer(&peer)
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.caps.contains(SHARES));
+            if shares && shared.toggle_on(&peer, TOGGLE) {
                 let state: MediaState = env.body()?;
                 let players =
                     state.players.into_iter().filter_map(MediaPlayer::sanitized).take(PLAYERS).collect();

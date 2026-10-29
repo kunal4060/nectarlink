@@ -25,6 +25,10 @@ pub(crate) const POWER: &str = "pc.power";
 pub const PC_WAKE: &str = wake::CAP;
 /// Offered by devices that open links sent to them.
 pub(crate) const LINKS: &str = "link.open";
+/// Per-device toggle that lets a peer open links on this device (on by
+/// default: opening a link was previously ungated, so existing pairs keep
+/// working until the user turns it off for a device).
+pub(crate) const LINKS_TOGGLE: &str = "links";
 /// Offered by devices that show live and completed task notifications from a peer.
 pub(crate) const TASK_NOTIFY: &str = types::TASK_NOTIFY;
 
@@ -450,6 +454,10 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             let LinkOpen { url, title: sender_title } = env.body()?;
             if !valid_link(&url) {
                 Envelope::error(ErrorCode::BadMessage, "not a web link")
+            } else if !shared.we_offer(LINKS) {
+                Envelope::error(ErrorCode::Unsupported, "this device doesn't open links on request")
+            } else if !shared.toggle_on(&peer, LINKS_TOGGLE) {
+                Envelope::error(ErrorCode::Denied, "opening links is off for this device")
             } else {
                 let platform = shared.platform.clone();
                 let url_for_open = url.clone();

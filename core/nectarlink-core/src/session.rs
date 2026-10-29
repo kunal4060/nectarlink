@@ -140,6 +140,8 @@ pub(crate) struct Session {
     sent_icons: crate::notifications::SentIcons,
     /// Artwork keys sent to this device (docs/protocol/media.md).
     sent_art: crate::notifications::SentIcons,
+    /// Bounds concurrent background RPC tasks for this peer (see `reader`).
+    background_rpc: Arc<tokio::sync::Semaphore>,
     pub(crate) cancel: CancellationToken,
 }
 
@@ -185,6 +187,7 @@ impl Session {
             usb_peers: shared.usb_peers.clone(),
             sent_icons: Default::default(),
             sent_art: Default::default(),
+            background_rpc: Arc::new(tokio::sync::Semaphore::new(MAX_BACKGROUND_RPC)),
             cancel: shared.cancel.child_token(),
         });
 
@@ -401,8 +404,15 @@ async fn reader(session: &Arc<Session>, mut recv: RecvStream, shared: &Weak<Shar
         }
         let Some(shared) = shared.upgrade() else { return };
         if is_background_rpc(&env.t) {
+            // Bounded: without this, one peer flooding background RPCs
+            // (storage/photos lists) spawns an unbounded number of tasks.
+            // The permit is held for the whole handler, so excess messages
+            // back-pressure on this session's reader instead of exhausting
+            // the runtime; other sessions are unaffected.
+            let Ok(permit) = session.background_rpc.clone().acquire_owned().await else { return };
             let session = session.clone();
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = handle(&shared, &session, env).await {
                     tracing::warn!(peer = %session.peer.short(), error = %e, "failed to handle message");
                 }
@@ -527,12 +537,24 @@ async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: Envelope) -> 
         t if (t == types::FILES_RESUME || t == types::FILES_CANCEL)
             && crate::transfer::handle_control(shared, peer, &env).await? => {}
         types::WAKE_RELAY => {
-            if let Ok(req) = env.body::<WakeRelay>() {
-                let bcast = req.broadcast.as_deref().and_then(|s| s.parse().ok());
-                let _ = wake::send_magic_packet(req.mac, bcast);
-            }
-            if env.id.is_some() {
-                session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
+            // Gated like other PC actions: without the `pc_actions` toggle
+            // for this peer, a paired device must not turn this device into
+            // a Wake-on-LAN relay for arbitrary MACs. A denied request gets
+            // an error reply, never a silent OK.
+            if !shared.toggle_on(&peer, crate::actions::POWER_TOGGLE) {
+                if env.id.is_some() {
+                    let reply =
+                        Envelope::error(ErrorCode::Unsupported, "wake relay is disabled for this device");
+                    session.send(reply.reply_to(env.id)).await?;
+                }
+            } else {
+                if let Ok(req) = env.body::<WakeRelay>() {
+                    let bcast = req.broadcast.as_deref().and_then(|s| s.parse().ok());
+                    let _ = wake::send_magic_packet(req.mac, bcast);
+                }
+                if env.id.is_some() {
+                    session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
+                }
             }
         }
         types::AUDIO_PCM => {
@@ -558,6 +580,10 @@ async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: Envelope) -> 
 
 /// Concurrent incoming data streams allowed from one peer at a time.
 const MAX_INCOMING_STREAMS: usize = 32;
+
+/// Concurrent background RPC handlers allowed for one peer at a time
+/// (storage/photos lists and similar slow requests off the control stream).
+const MAX_BACKGROUND_RPC: usize = 16;
 
 /// Streams the other device opens (file transfers), each handled on its own.
 async fn streams(session: &Arc<Session>, shared: &Weak<Shared>) {

@@ -39,7 +39,6 @@ pub struct ScreenRect {
     pub h: f32,
 }
 
-impl Eq for ScreenRect {}
 
 #[derive(Debug, Clone, Copy, PartialEq, uniffi::Record)]
 pub struct ScreenCorners {
@@ -49,7 +48,6 @@ pub struct ScreenCorners {
     pub bl: f32,
 }
 
-impl Eq for ScreenCorners {}
 
 #[derive(Debug, Clone, PartialEq, uniffi::Record)]
 pub struct ScreenShape {
@@ -64,7 +62,6 @@ pub struct ScreenShape {
     pub cutout_path: Option<String>,
 }
 
-impl Eq for ScreenShape {}
 
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct DeviceInfo {
@@ -552,7 +549,10 @@ impl std::fmt::Debug for Transfer {
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Enum)]
 pub enum FileToSend {
     /// An open, readable descriptor (Android: from a content URI). The core
-    /// takes ownership and closes it.
+    /// takes ownership and closes it. The descriptor must be open, must not
+    /// be 0, 1 or 2, and must not appear twice in one call; on any error the
+    /// core closes every handed-over descriptor in the call exactly once, so
+    /// the caller (Kotlin, which detaches it) must not close it afterwards.
     Fd {
         name: String,
         fd: i32,
@@ -2334,6 +2334,57 @@ impl From<core::Transfer> for Transfer {
     }
 }
 
+/// Whether `fd` is open, probed by duplicating it and dropping the
+/// duplicate (so the original is untouched). No `libc` dependency is
+/// available to this crate, so this is the std-only probe.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn fd_is_open(fd: i32) -> bool {
+    use std::os::fd::BorrowedFd;
+    // SAFETY: the caller checked `fd > 2`; borrowing a raw descriptor only
+    // duplicates it here and never closes the original.
+    unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned().is_ok()
+}
+
+/// Closes a handed-over descriptor exactly once; 0, 1 and 2 are never closed.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn close_handed_fd(fd: i32) {
+    use std::os::fd::FromRawFd;
+    if fd > 2 {
+        #[allow(unsafe_code)]
+        drop(unsafe { std::fs::File::from_raw_fd(fd) });
+    }
+}
+
+/// Converts a batch of files, validating every handed-over descriptor
+/// before converting any of them. On validation failure every descriptor in
+/// the batch is closed exactly once (they are detached on the Kotlin side,
+/// so nobody else closes them) instead of dropping already-converted files
+/// and leaking the rest.
+fn files_to_send(files: Vec<FileToSend>) -> Result<Vec<core::OutgoingFile>> {
+    #[cfg(unix)]
+    {
+        let mut seen = std::collections::HashSet::new();
+        let valid = files.iter().all(|file| match file {
+            FileToSend::Fd { fd, .. } => *fd > 2 && seen.insert(*fd) && fd_is_open(*fd),
+            FileToSend::Path { .. } => true,
+        });
+        if !valid {
+            let mut closed = std::collections::HashSet::new();
+            for file in files {
+                if let FileToSend::Fd { fd, .. } = file
+                    && closed.insert(fd)
+                {
+                    close_handed_fd(fd);
+                }
+            }
+            return Err(NectarlinkError::Internal { reason: "invalid file descriptor".into() });
+        }
+    }
+    files.into_iter().map(file_to_send).collect()
+}
+
 fn file_to_send(file: FileToSend) -> Result<core::OutgoingFile> {
     Ok(match file {
         FileToSend::Path { name, path, folder } => {
@@ -2342,11 +2393,13 @@ fn file_to_send(file: FileToSend) -> Result<core::OutgoingFile> {
         #[cfg(unix)]
         FileToSend::Fd { name, fd, folder } => {
             use std::os::fd::FromRawFd;
-            if fd < 0 {
+            if fd <= 2 || !fd_is_open(fd) {
                 return Err(NectarlinkError::Internal { reason: "invalid file descriptor".into() });
             }
             // SAFETY: the caller hands over an open descriptor it no longer
-            // uses (documented on `FileToSend::Fd`); the File closes it.
+            // uses (documented on `FileToSend::Fd`); the File closes it. The
+            // descriptor was validated above (open, not 0/1/2, not duplicated
+            // in this call), so this is the single owner from here on.
             #[allow(unsafe_code)]
             let file = unsafe { std::fs::File::from_raw_fd(fd) };
             core::OutgoingFile { name, folder, source: core::FileSource::File(file) }
@@ -3208,6 +3261,9 @@ pub struct NodeOptions {
 pub struct NectarlinkNode {
     runtime: Runtime,
     node: Node,
+    /// The event-dispatch task spawned by `start()`; aborted by `shutdown()`
+    /// so events stop arriving once the node is stopped.
+    events: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::fmt::Debug for NectarlinkNode {
@@ -3217,22 +3273,61 @@ impl std::fmt::Debug for NectarlinkNode {
 }
 
 impl NectarlinkNode {
-    /// Runs `fut` on the node's runtime and waits for it from the caller's
-    /// executor.
-    async fn run<T: Send + 'static>(&self, fut: impl Future<Output = T> + Send + 'static) -> T {
-        match self.runtime.spawn(fut).await {
-            Ok(value) => value,
-            Err(e) => std::panic::resume_unwind(e.into_panic()),
+    /// Runs a fire-and-forget `fut` on the node's runtime. A panicking or
+    /// cancelled task is logged, never re-raised: unwinding across the
+    /// UniFFI/JNI boundary would abort the host app process.
+    async fn run(&self, fut: impl Future<Output = ()> + Send + 'static) {
+        if let Err(e) = self.runtime.spawn(fut).await {
+            tracing::error!(
+                panicked = e.is_panic(),
+                cancelled = e.is_cancelled(),
+                "nectarlink-core task failed"
+            );
         }
     }
 
-    /// Runs `fut` on the node's runtime and blocks the calling thread until it finishes.
-    fn block_on_rt<T: Send + 'static>(&self, fut: impl Future<Output = T> + Send + 'static) -> T {
+    /// Runs a fallible `fut` on the node's runtime. A panicking or cancelled
+    /// task becomes `NectarlinkError::Internal`, never a panic on the
+    /// caller's (foreign) thread.
+    async fn run_result<T: Send + 'static>(
+        &self,
+        fut: impl Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T> {
+        match self.runtime.spawn(fut).await {
+            Ok(value) => value,
+            Err(e) => Err(NectarlinkError::Internal {
+                reason: if e.is_panic() {
+                    "nectarlink-core task panicked".into()
+                } else {
+                    "nectarlink-core task was cancelled".into()
+                },
+            }),
+        }
+    }
+
+    /// Runs `fut` on the node's runtime and blocks the calling thread until
+    /// it finishes. A panicking task (or a dropped runtime) is an error,
+    /// not a panic on this thread.
+    fn block_on_rt<T: Send + 'static>(
+        &self,
+        fut: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T, NectarlinkError> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.runtime.spawn(async move {
             let _ = tx.send(fut.await);
         });
-        rx.recv().expect("nectarlink-core runtime task panicked")
+        rx.recv().map_err(|_| NectarlinkError::Internal {
+            reason: "nectarlink-core runtime task panicked or was cancelled".into(),
+        })
+    }
+
+    /// `block_on_rt` for a fallible future: flattens the outer (runtime)
+    /// error and the future's own error into one `Result`.
+    fn block_on_rt_result<T: Send + 'static>(
+        &self,
+        fut: impl Future<Output = Result<T>> + Send + 'static,
+    ) -> Result<T, NectarlinkError> {
+        self.block_on_rt(fut)?
     }
 }
 
@@ -3261,13 +3356,15 @@ impl NectarlinkNode {
         config.downloads_dir = Some(PathBuf::from(options.downloads_dir));
         config.usb_port = options.usb_port;
         config.key_protector = Some(Arc::new(KeyProtectorAdapter(key_protector)));
-        config.capabilities.push(core::MIRROR_VIEW.into());
+        if !config.capabilities.iter().any(|c| c == core::MIRROR_VIEW) {
+            config.capabilities.push(core::MIRROR_VIEW.into());
+        }
         let node =
             runtime.block_on(Node::start(config, Arc::new(PlatformAdapter(platform, listener.clone()))))?;
 
         let mut events = node.events();
         let node_for_events = node.clone();
-        runtime.spawn(async move {
+        let events_task = runtime.spawn(async move {
             loop {
                 match events.recv().await {
                     Ok(event) => {
@@ -3277,8 +3374,19 @@ impl NectarlinkNode {
                     }
                     Err(RecvError::Lagged(missed)) => {
                         tracing::warn!(missed, "event listener fell behind; resynchronizing state");
-                        if let Ok(devices) = node_for_events.paired_devices() {
-                            for d in devices {
+                        // Battery, media, notifications, transfers and
+                        // mirroring/webcam state have no snapshot getter on
+                        // `Node`, so they cannot be re-emitted here; the
+                        // listener re-queries what it can on its side.
+                        let devices = match node_for_events.paired_devices() {
+                            Ok(devices) => devices,
+                            Err(e) => {
+                                tracing::warn!(error = %e, "lagged resync skipped: paired devices unavailable");
+                                listener.on_event(Event::QueueChanged);
+                                continue;
+                            }
+                        };
+                        for d in devices {
                                 listener.on_event(Event::LinkChanged {
                                     id: d.id.to_string(),
                                     link: d.link.into(),
@@ -3301,15 +3409,36 @@ impl NectarlinkNode {
                                         features: features(&matrix),
                                     });
                                 }
+                                if let Some(layout) = node_for_events.deck_layout(d.id) {
+                                    listener.on_event(Event::DeckLayout {
+                                        id: d.id.to_string(),
+                                        layout: layout.into(),
+                                    });
+                                }
+                                if let Some(state) = node_for_events.deck_state(d.id) {
+                                    listener.on_event(Event::DeckState {
+                                        id: d.id.to_string(),
+                                        state: state.into(),
+                                    });
+                                }
+                                if let Some(toggles) = node_for_events.phone_toggles(d.id) {
+                                    listener.on_event(Event::PhoneToggles {
+                                        id: d.id.to_string(),
+                                        toggles: toggles.into(),
+                                    });
+                                }
                             }
-                        }
                         listener.on_event(Event::QueueChanged);
                     }
                     Err(RecvError::Closed) => return,
                 }
             }
         });
-        Ok(Arc::new(NectarlinkNode { runtime, node }))
+        Ok(Arc::new(NectarlinkNode {
+            runtime,
+            node,
+            events: std::sync::Mutex::new(Some(events_task)),
+        }))
     }
 
     /// This device's ID (z-base-32).
@@ -3317,15 +3446,26 @@ impl NectarlinkNode {
         self.node.device_id().to_string()
     }
 
-    /// Stops networking and tells connected devices.
-    pub async fn shutdown(&self) {
+    /// Stops networking and tells connected devices, then stops event
+    /// delivery. A shutdown that does not finish within
+    /// `SHUTDOWN_TIMEOUT` is an error, not a silent success, and the event
+    /// task is aborted either way.
+    pub async fn shutdown(&self) -> Result<()> {
         let node = self.node.clone();
-        self.run(async move {
-            if tokio::time::timeout(SHUTDOWN_TIMEOUT, node.shutdown()).await.is_err() {
-                tracing::warn!("shutdown timed out");
-            }
-        })
-        .await;
+        let result = self
+            .run_result(async move {
+                if tokio::time::timeout(SHUTDOWN_TIMEOUT, node.shutdown()).await.is_err() {
+                    return Err(NectarlinkError::Internal {
+                        reason: "shutdown timed out".into(),
+                    });
+                }
+                Ok(())
+            })
+            .await;
+        if let Some(task) = self.events.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+        result
     }
 
     // ---- Pairing ----
@@ -3333,13 +3473,13 @@ impl NectarlinkNode {
     /// Enters pairing mode and returns the link to show as a QR code.
     pub async fn pairing_start_qr(&self) -> Result<String> {
         let node = self.node.clone();
-        self.run(async move { Ok(node.pairing_start_qr().await?.to_uri()) }).await
+        self.run_result(async move { Ok(node.pairing_start_qr().await?.to_uri()) }).await
     }
 
     /// Pairs with the device whose pairing link was scanned.
     pub async fn pairing_join(&self, link: String) -> Result<()> {
         let node = self.node.clone();
-        self.run(async move { Ok(node.pairing_join(&link).await?) }).await
+        self.run_result(async move { Ok(node.pairing_join(&link).await?) }).await
     }
 
     /// Starts nearby pairing with a discovered device in pairing mode; the
@@ -3347,7 +3487,7 @@ impl NectarlinkNode {
     pub async fn pairing_start_nearby(&self, peer: String) -> Result<()> {
         let peer = parse_id(&peer)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.pairing_start_nearby(peer).await?) }).await
+        self.run_result(async move { Ok(node.pairing_start_nearby(peer).await?) }).await
     }
 
     /// Answers the code comparison.
@@ -3372,13 +3512,13 @@ impl NectarlinkNode {
     pub async fn unpair(&self, id: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.unpair(id).await?) }).await
+        self.run_result(async move { Ok(node.unpair(id).await?) }).await
     }
 
     pub async fn ring(&self, id: String, on: bool) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.ring(id, on).await?) }).await
+        self.run_result(async move { Ok(node.ring(id, on).await?) }).await
     }
 
     /// Dismisses a paired phone's or tablet's notification there, after it
@@ -3386,7 +3526,7 @@ impl NectarlinkNode {
     pub async fn dismiss_peer_notification(&self, id: String, key: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.dismiss_notification(id, key).await?) }).await
+        self.run_result(async move { Ok(node.dismiss_notification(id, key).await?) }).await
     }
 
     pub fn capabilities(&self, id: String) -> Result<Vec<Feature>> {
@@ -3419,18 +3559,18 @@ impl NectarlinkNode {
     /// arrives as `Event::Transfer`.
     pub async fn send_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
         let id = parse_id(&id)?;
-        let files = files.into_iter().map(file_to_send).collect::<Result<Vec<_>>>()?;
+        let files = files_to_send(files)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_files(id, files).await?) }).await
+        self.run_result(async move { Ok(node.send_files(id, files).await?) }).await
     }
 
     /// Hands off a document to a paired PC and asks the PC to open it with the
     /// default application once it arrives (`docs/protocol/files.md`).
     pub async fn send_handoff_files(&self, id: String, files: Vec<FileToSend>) -> Result<String> {
         let id = parse_id(&id)?;
-        let files = files.into_iter().map(file_to_send).collect::<Result<Vec<_>>>()?;
+        let files = files_to_send(files)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_handoff_files(id, files).await?) }).await
+        self.run_result(async move { Ok(node.send_handoff_files(id, files).await?) }).await
     }
 
     /// Sends a voice recording and its markers to a paired PC; returns the
@@ -3445,7 +3585,7 @@ impl NectarlinkNode {
         let file = file_to_send(file)?;
         let markers = markers.into_iter().map(Into::into).collect();
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_recording(id, file, markers).await?) }).await
+        self.run_result(async move { Ok(node.send_recording(id, file, markers).await?) }).await
     }
 
     /// Accepts an incoming transfer waiting for user confirmation (LocalSend).
@@ -3482,6 +3622,8 @@ impl NectarlinkNode {
     }
 
     /// Returns the ID of the most recently queued active (`Waiting` or `Sending`) item for `peer_id`.
+    /// Note: `None` covers both "nothing queued" and a malformed `peer_id`;
+    /// callers that need to tell those apart must validate the id first.
     pub fn latest_queued_id_for_peer(&self, peer_id: String) -> Option<String> {
         let peer = parse_id(peer_id.trim()).ok()?;
         self.node.latest_queued_id_for_peer(peer)
@@ -3565,7 +3707,7 @@ impl NectarlinkNode {
     /// Probes `host:port` via the LocalSend v2.1 HTTP/HTTPS API and adds the peer if found.
     pub async fn probe_localsend_peer(&self, host: String, port: u16) -> Result<LocalSendPeer> {
         let node = self.node.clone();
-        self.run(async move { Ok(node.probe_localsend_peer(&host, port).await?.into()) }).await
+        self.run_result(async move { Ok(node.probe_localsend_peer(&host, port).await?.into()) }).await
     }
 
     // ---- Clipboard ----
@@ -3574,7 +3716,7 @@ impl NectarlinkNode {
     pub async fn send_clipboard(&self, id: String, text: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_clipboard(id, text).await?) }).await
+        self.run_result(async move { Ok(node.send_clipboard(id, text).await?) }).await
     }
 
     /// Puts text (and optional HTML and RTF rich text) on a paired PC's
@@ -3588,7 +3730,7 @@ impl NectarlinkNode {
     ) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_clipboard_rich(id, text, html, rtf).await?) }).await
+        self.run_result(async move { Ok(node.send_clipboard_rich(id, text, html, rtf).await?) }).await
     }
 
     /// Puts an image (`image/png` or `image/jpeg`) on a paired PC's
@@ -3596,7 +3738,7 @@ impl NectarlinkNode {
     pub async fn send_clipboard_image(&self, id: String, mime: String, bytes: Vec<u8>) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_clipboard_image(id, mime, bytes).await?) }).await
+        self.run_result(async move { Ok(node.send_clipboard_image(id, mime, bytes).await?) }).await
     }
 
     /// Whether the local clipboard history is enabled.
@@ -3645,7 +3787,7 @@ impl NectarlinkNode {
     pub async fn resend_clipboard_history(&self, clip_id: String, device_id: String) -> Result<()> {
         let peer = parse_id(&device_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.resend_clipboard_history(peer, &clip_id).await?) }).await
+        self.run_result(async move { Ok(node.resend_clipboard_history(peer, &clip_id).await?) }).await
     }
 
     // ---- Timeline ----
@@ -3753,7 +3895,7 @@ impl NectarlinkNode {
     ) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.media_command(id, player, action.into(), position).await?) }).await
+        self.run_result(async move { Ok(node.media_command(id, player, action.into(), position).await?) }).await
     }
 
     // ---- Notifications ----
@@ -3821,7 +3963,7 @@ impl NectarlinkNode {
         let id = parse_id(&id)?;
         let node = self.node.clone();
         let action = if sleep { core::PowerAction::Sleep } else { core::PowerAction::Lock };
-        self.run(async move { Ok(node.pc_power(id, action).await?) }).await
+        self.run_result(async move { Ok(node.pc_power(id, action).await?) }).await
     }
 
     /// Sends Wake-on-LAN magic packets for a paired PC over UDP to its stored
@@ -3830,14 +3972,14 @@ impl NectarlinkNode {
     pub async fn wake(&self, id: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.wake(id).await?) }).await
+        self.run_result(async move { Ok(node.wake(id).await?) }).await
     }
 
     /// Opens a web link on a paired PC.
     pub async fn open_link(&self, id: String, url: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.open_link(id, url).await?) }).await
+        self.run_result(async move { Ok(node.open_link(id, url).await?) }).await
     }
 
     // ---- Remote input (touchpad, keyboard, presentation) ----
@@ -3848,7 +3990,7 @@ impl NectarlinkNode {
     pub async fn remote_check(&self, id: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.remote_check(id).await?) }).await
+        self.run_result(async move { Ok(node.remote_check(id).await?) }).await
     }
 
     /// Moves a paired PC's mouse cursor by `(dx, dy)` logical pixels over
@@ -3856,7 +3998,7 @@ impl NectarlinkNode {
     pub async fn remote_move(&self, id: String, dx: f32, dy: f32) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.remote_move(id, dx, dy).await?) }).await
+        self.run_result(async move { Ok(node.remote_move(id, dx, dy).await?) }).await
     }
 
     /// Scrolls on a paired PC (`dy` > 0 scrolls down, `dx` > 0 scrolls right,
@@ -3864,7 +4006,7 @@ impl NectarlinkNode {
     pub async fn remote_scroll(&self, id: String, dx: f32, dy: f32, fast: bool) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             if fast {
                 Ok(node.remote_scroll_fast(id, dx, dy).await?)
             } else {
@@ -3893,7 +4035,7 @@ impl NectarlinkNode {
             }
         };
         let node = self.node.clone();
-        self.run(
+        self.run_result(
             async move { Ok(node.remote_input(id, core::RemoteInput::Button { button, action }).await?) },
         )
         .await
@@ -3903,7 +4045,7 @@ impl NectarlinkNode {
     pub async fn remote_text(&self, id: String, text: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.remote_input(id, core::RemoteInput::Text { text }).await?) }).await
+        self.run_result(async move { Ok(node.remote_input(id, core::RemoteInput::Text { text }).await?) }).await
     }
 
     /// Presses a named key or shortcut (`key`) with optional modifiers
@@ -3922,7 +4064,7 @@ impl NectarlinkNode {
             parsed_mods.push(km);
         }
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             Ok(node.remote_input(id, core::RemoteInput::Key { key, mods: parsed_mods }).await?)
         })
         .await
@@ -3941,7 +4083,7 @@ impl NectarlinkNode {
             _ => return Err(NectarlinkError::Internal { reason: format!("invalid slide action: {action}") }),
         };
         let node = self.node.clone();
-        self.run(async move { Ok(node.remote_input(id, core::RemoteInput::Slide { action }).await?) }).await
+        self.run_result(async move { Ok(node.remote_input(id, core::RemoteInput::Slide { action }).await?) }).await
     }
 
     /// Moves or hides the laser pointer overlay on a paired PC (`x`, `y` in
@@ -3949,7 +4091,7 @@ impl NectarlinkNode {
     pub async fn remote_laser(&self, id: String, on: bool, x: f32, y: f32) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.remote_laser(id, on, x, y).await?) }).await
+        self.run_result(async move { Ok(node.remote_laser(id, on, x, y).await?) }).await
     }
 
     // ---- Deck (macro pad) ----
@@ -3970,14 +4112,14 @@ impl NectarlinkNode {
     pub async fn deck_press(&self, id: String, tile: String) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.deck_press(id, tile).await?) }).await
+        self.run_result(async move { Ok(node.deck_press(id, tile).await?) }).await
     }
 
     /// Asks a paired PC to set its master volume (`0..=100`) and/or mute state (`pc.audio.set`).
     pub async fn set_pc_audio(&self, id: String, volume: Option<u8>, muted: Option<bool>) -> Result<()> {
         let id = parse_id(&id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.set_pc_audio(id, volume, muted).await?) }).await
+        self.run_result(async move { Ok(node.set_pc_audio(id, volume, muted).await?) }).await
     }
 
     /// The context chip suggestion for the most recently received text clip, if any.
@@ -3990,7 +4132,7 @@ impl NectarlinkNode {
     pub async fn mirror_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(Arc::new(MirrorStream(node.mirror_open(id).await?))) }).await
+        self.run_result(async move { Ok(Arc::new(MirrorStream(node.mirror_open(id).await?))) }).await
     }
 
     /// Opens this phone's sound stream to a PC that asked for it with the
@@ -3998,14 +4140,14 @@ impl NectarlinkNode {
     pub async fn mirror_open_audio(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(Arc::new(MirrorStream(node.mirror_open_audio(id).await?))) }).await
+        self.run_result(async move { Ok(Arc::new(MirrorStream(node.mirror_open_audio(id).await?))) }).await
     }
 
     /// Tells a paired PC that mirroring or remote keyboard input on `session` has stopped (`mirror.stop`).
     pub async fn mirror_stop(&self, pc_id: String, session: u32) -> Result<()> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             node.mirror_stop(id, session).await;
             Ok(())
         })
@@ -4036,14 +4178,14 @@ impl NectarlinkNode {
             screen_off: false,
             watch,
         };
-        self.run(async move { Ok(node.mirror_start(id, options).await?) }).await
+        self.run_result(async move { Ok(node.mirror_start(id, options).await?) }).await
     }
 
     /// Asks a paired PC for a fresh keyframe on its screen stream (`mirror.keyframe`).
     pub async fn request_pc_mirror_keyframe(&self, pc_id: String) -> Result<()> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             node.mirror_keyframe(id, core::MIRROR_SCREEN).await;
             Ok(())
         })
@@ -4055,7 +4197,7 @@ impl NectarlinkNode {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
         let input: core::MirrorInput = input.into();
-        self.run(async move { Ok(node.mirror_input(id, core::MIRROR_SCREEN, input).await?) }).await
+        self.run_result(async move { Ok(node.mirror_input(id, core::MIRROR_SCREEN, input).await?) }).await
     }
 
     /// Preferred webcam codecs accepted by the connected PC, with H.264 as fallback.
@@ -4067,7 +4209,7 @@ impl NectarlinkNode {
     pub async fn webcam_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(Arc::new(MirrorStream(node.webcam_open(id).await?))) }).await
+        self.run_result(async move { Ok(Arc::new(MirrorStream(node.webcam_open(id).await?))) }).await
     }
 
     /// Opens this phone's microphone stream to a paired PC (`docs/protocol/mic.md`):
@@ -4075,14 +4217,14 @@ impl NectarlinkNode {
     pub async fn mic_open(&self, pc_id: String) -> Result<Arc<MirrorStream>> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(Arc::new(MirrorStream(node.mic_open(id).await?))) }).await
+        self.run_result(async move { Ok(Arc::new(MirrorStream(node.mic_open(id).await?))) }).await
     }
 
     /// Stops this phone's microphone stream to a paired PC and tells the PC.
     pub async fn mic_stop(&self, pc_id: String) -> Result<()> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             node.mic_stop(id).await;
             Ok(())
         })
@@ -4093,7 +4235,7 @@ impl NectarlinkNode {
     pub async fn webcam_stop(&self, pc_id: String) -> Result<()> {
         let id = parse_id(&pc_id)?;
         let node = self.node.clone();
-        self.run(async move {
+        self.run_result(async move {
             node.webcam_stop(id).await;
             Ok(())
         })
@@ -4163,7 +4305,7 @@ impl NectarlinkNode {
                 can_hold: c.can_hold,
             }),
         };
-        self.run(async move { Ok(node.call_changed(call).await?) }).await
+        self.run_result(async move { Ok(node.call_changed(call).await?) }).await
     }
 
     /// A photo or screenshot just appeared on this phone: tells the PCs
@@ -4178,7 +4320,7 @@ impl NectarlinkNode {
             screenshot: photo.screenshot,
             thumb: photo.thumb,
         };
-        self.run(async move { Ok(node.photo_taken(photo).await?) }).await
+        self.run_result(async move { Ok(node.photo_taken(photo).await?) }).await
     }
 
     /// This phone's quick settings state (on startup and whenever any toggle
@@ -4186,7 +4328,7 @@ impl NectarlinkNode {
     pub async fn toggles_changed(&self, toggles: PhoneToggles) -> Result<()> {
         let node = self.node.clone();
         let toggles: core::PhoneToggles = toggles.into();
-        self.run(async move { Ok(node.toggles_changed(toggles).await?) }).await
+        self.run_result(async move { Ok(node.toggles_changed(toggles).await?) }).await
     }
 
     // ---- Continuity Camera ----
@@ -4206,8 +4348,13 @@ impl NectarlinkNode {
     ) -> Result<()> {
         let peer = parse_id(&pc_id)?;
         let mode = match mode.as_str() {
+            "photo" => core::CameraCaptureMode::Photo,
             "scan" => core::CameraCaptureMode::Scan,
-            _ => core::CameraCaptureMode::Photo,
+            _ => {
+                return Err(NectarlinkError::Internal {
+                    reason: format!("invalid camera capture mode: {mode:?}"),
+                })
+            }
         };
         let meta = core::CameraCaptureResultMeta {
             request_id,
@@ -4219,7 +4366,7 @@ impl NectarlinkNode {
             height,
         };
         let node = self.node.clone();
-        self.run(async move { Ok(node.send_camera_capture_result(peer, meta, data).await?) }).await
+        self.run_result(async move { Ok(node.send_camera_capture_result(peer, meta, data).await?) }).await
     }
 
     /// Cancels an in-flight Continuity Camera capture request on either side.
@@ -4231,7 +4378,7 @@ impl NectarlinkNode {
     ) -> Result<()> {
         let peer = parse_id(&peer_id)?;
         let node = self.node.clone();
-        self.run(async move { Ok(node.cancel_camera_capture(peer, request_id, reason).await?) }).await
+        self.run_result(async move { Ok(node.cancel_camera_capture(peer, request_id, reason).await?) }).await
     }
 
     /// Requests a Continuity Camera capture (`mode` is `"photo"` or `"scan"`) from a paired phone.
@@ -4243,11 +4390,16 @@ impl NectarlinkNode {
     ) -> Result<()> {
         let peer = parse_id(&peer_id)?;
         let mode = match mode.as_str() {
+            "photo" => core::CameraCaptureMode::Photo,
             "scan" => core::CameraCaptureMode::Scan,
-            _ => core::CameraCaptureMode::Photo,
+            _ => {
+                return Err(NectarlinkError::Internal {
+                    reason: format!("invalid camera capture mode: {mode:?}"),
+                })
+            }
         };
         let node = self.node.clone();
-        self.run(async move { Ok(node.request_camera_capture(peer, request_id, mode).await?) }).await
+        self.run_result(async move { Ok(node.request_camera_capture(peer, request_id, mode).await?) }).await
     }
 
     /// Reconnects to PCs that aren't connected and syncs connected ones.
@@ -4274,7 +4426,7 @@ impl NectarlinkNode {
         let peer_id = parse_id(&peer)?;
         let node = self.node.clone();
         let (size, data) =
-            self.block_on_rt(async move { node.watch_file_read(peer_id, offset, length).await })?;
+            self.block_on_rt_result(async move { node.watch_file_read(peer_id, offset, length).await })?;
         Ok(WatchFileChunk { size, data })
     }
 
@@ -4288,7 +4440,7 @@ impl NectarlinkNode {
         let peer_id = parse_id(&peer)?;
         let node = self.node.clone();
         let req_path = path.clone();
-        let entries = self.block_on_rt(async move { node.list_storage(&peer_id, &req_path).await })?;
+        let entries = self.block_on_rt_result(async move { node.list_storage(&peer_id, &req_path).await })?;
         let prefix = path.trim_matches('/');
         Ok(entries
             .into_iter()
@@ -4303,43 +4455,92 @@ impl NectarlinkNode {
     }
 
     /// Downloads a remote file from a connected paired device (`storage.read`) in
-    /// 128 KiB chunks into `local_dest`.
+    /// 128 KiB chunks into `local_dest`. The download goes to a temporary
+    /// file in the same directory and is renamed over `local_dest` only once
+    /// every byte of the advertised size has arrived; any failure deletes
+    /// the temporary file and leaves an existing `local_dest` untouched.
+    /// All file I/O is async, so a download cannot stall the runtime's
+    /// worker threads.
     pub fn download_remote_storage(&self, peer: String, remote_path: String, local_dest: String) -> bool {
         let Ok(peer_id) = parse_id(&peer) else {
             return false;
         };
         let node = self.node.clone();
         self.block_on_rt(async move {
-            use std::io::Write;
-            if let Some(parent) = std::path::Path::new(&local_dest).parent()
+            use tokio::io::AsyncWriteExt;
+            let dest = std::path::PathBuf::from(&local_dest);
+            if let Some(parent) = dest.parent()
                 && !parent.as_os_str().is_empty()
+                && tokio::fs::create_dir_all(parent).await.is_err()
             {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let Ok(mut f) = std::fs::File::create(&local_dest) else {
                 return false;
+            }
+            // A unique temporary name in the destination directory, so the
+            // final rename stays on one filesystem and cannot clobber a
+            // concurrent download of the same file.
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let tmp_name = format!(
+                ".{}.nectarlink-part-{}-{}",
+                dest.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "download".into()),
+                std::process::id(),
+                nanos
+            );
+            let tmp = dest.with_file_name(tmp_name);
+            let mut f = match tokio::fs::File::create(&tmp).await {
+                Ok(f) => f,
+                Err(_) => return false,
             };
-            let mut offset = 0u64;
-            let chunk_len = 128 * 1024u64;
-            loop {
-                let Ok((meta, chunk)) =
-                    node.storage_read(peer_id, remote_path.clone(), offset, Some(chunk_len)).await
-                else {
-                    return false;
-                };
-                if chunk.is_empty() {
-                    break;
+            let download = async {
+                let mut offset = 0u64;
+                let mut expected: Option<u64> = None;
+                let chunk_len = 128 * 1024u64;
+                loop {
+                    let (meta, chunk) = node
+                        .storage_read(peer_id, remote_path.clone(), offset, Some(chunk_len))
+                        .await
+                        .map_err(|_| ())?;
+                    match expected {
+                        Some(size) if meta.size != size => return Err(()),
+                        Some(_) => {}
+                        None => expected = Some(meta.size),
+                    }
+                    let size = expected.unwrap_or(0);
+                    if chunk.is_empty() {
+                        // A short stream is only complete at the advertised size.
+                        if offset == size {
+                            break;
+                        }
+                        return Err(());
+                    }
+                    if offset + chunk.len() as u64 > size {
+                        return Err(());
+                    }
+                    f.write_all(&chunk).await.map_err(|_| ())?;
+                    offset += chunk.len() as u64;
+                    if offset == size {
+                        break;
+                    }
                 }
-                if f.write_all(&chunk).is_err() {
-                    return false;
-                }
-                offset += chunk.len() as u64;
-                if offset >= meta.size || (chunk.len() as u64) < chunk_len {
-                    break;
+                f.flush().await.map_err(|_| ())?;
+                f.sync_all().await.map_err(|_| ())?;
+                drop(f);
+                tokio::fs::rename(&tmp, &dest).await.map_err(|_| ())?;
+                Ok::<(), ()>(())
+            }
+            .await;
+            match download {
+                Ok(()) => true,
+                Err(()) => {
+                    // `f` was moved into the download future and dropped
+                    // when it failed; only the temporary file is left.
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                    false
                 }
             }
-            true
         })
+        .unwrap_or(false)
     }
 
     /// Asks a connected paired peer on the target LAN to broadcast a Wake-on-LAN
@@ -4355,7 +4556,7 @@ impl NectarlinkNode {
             None => None,
         };
         let node = self.node.clone();
-        self.block_on_rt(async move { Ok(node.wake_via_relay(&peer_id, mac_bytes, bcast).await?) })
+        self.block_on_rt_result(async move { Ok(node.wake_via_relay(&peer_id, mac_bytes, bcast).await?) })
     }
 }
 
@@ -4664,22 +4865,33 @@ pub extern "system" fn Java_app_nectarlink_android_core_AndroidContext_nativeIns
     _class: jni_sys::jclass,
     context: jni_sys::jobject,
 ) {
-    static INSTALLED: std::sync::Once = std::sync::Once::new();
-    INSTALLED.call_once(|| {
-        // SAFETY: `env` is the calling thread's JNI environment, valid for
-        // this call; the global reference keeps `context` alive for good,
-        // and the JavaVM lives as long as the process.
-        unsafe {
-            let functions = &**env;
-            let mut vm: *mut jni_sys::JavaVM = std::ptr::null_mut();
-            if (functions.v1_1.GetJavaVM)(env, &mut vm) != jni_sys::JNI_OK || vm.is_null() {
-                return;
-            }
-            let global = (functions.v1_1.NewGlobalRef)(env, context);
-            if global.is_null() {
-                return;
-            }
-            nectarlink_core::install_android_context(vm.cast(), global.cast());
+    // Only marked complete on success: a transient failure (a null
+    // environment, `GetJavaVM` failing, `NewGlobalRef` returning null) must
+    // not permanently disable the Android context for the process.
+    static INSTALLED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if INSTALLED.get().is_some() {
+        return;
+    }
+    if env.is_null() || context.is_null() {
+        return;
+    }
+    // SAFETY: `env` is the calling thread's JNI environment, valid for this
+    // call (null-checked above); the global reference keeps `context` alive
+    // for good, and the JavaVM lives as long as the process.
+    let installed = unsafe {
+        let functions = &**env;
+        let mut vm: *mut jni_sys::JavaVM = std::ptr::null_mut();
+        if (functions.v1_1.GetJavaVM)(env, &mut vm) != jni_sys::JNI_OK || vm.is_null() {
+            return false;
         }
-    });
+        let global = (functions.v1_1.NewGlobalRef)(env, context);
+        if global.is_null() {
+            return false;
+        }
+        nectarlink_core::install_android_context(vm.cast(), global.cast());
+        true
+    };
+    if installed {
+        let _ = INSTALLED.set(());
+    }
 }

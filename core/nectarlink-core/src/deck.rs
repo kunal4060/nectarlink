@@ -239,6 +239,18 @@ pub fn is_valid_app_path(path: &str) -> bool {
     let lower = trimmed.to_ascii_lowercase();
     for ext in [".exe", ".lnk", ".desktop", ".appimage"] {
         if let Some(stem) = lower.strip_suffix(ext) {
+            // The extension branch used to return before the blocked
+            // directory checks below, so `/tmp/evil.exe` or
+            // `/dev/shm/x.desktop` passed while the Unix-executable
+            // branch blocks those directories. Apply the same parent
+            // check first (Unix absolute paths only; Windows paths
+            // below take the backslash form, which this does not cover).
+            if trimmed.starts_with('/')
+                && let Some((parent, _)) = trimmed.rsplit_once('/')
+                && is_blocked_parent(parent)
+            {
+                return false;
+            }
             let file_stem = stem.rsplit(['/', '\\']).next().unwrap_or(stem);
             return !file_stem.is_empty();
         }
@@ -266,13 +278,19 @@ pub fn is_valid_app_path(path: &str) -> bool {
     if parent_segments.split('/').any(|seg| seg.is_empty() || seg == ".") {
         return false;
     }
-    !matches!(parent, "/etc" | "/tmp" | "/var/tmp" | "/dev" | "/proc" | "/sys")
-        && !parent.starts_with("/etc/")
-        && !parent.starts_with("/tmp/")
-        && !parent.starts_with("/var/tmp/")
-        && !parent.starts_with("/dev/")
-        && !parent.starts_with("/proc/")
-        && !parent.starts_with("/sys/")
+    !is_blocked_parent(parent)
+}
+
+/// Whether a Unix absolute parent directory is one apps must never be
+/// launched from (system, temp, or device directories).
+fn is_blocked_parent(parent: &str) -> bool {
+    matches!(parent, "/etc" | "/tmp" | "/var/tmp" | "/dev" | "/proc" | "/sys")
+        || parent.starts_with("/etc/")
+        || parent.starts_with("/tmp/")
+        || parent.starts_with("/var/tmp/")
+        || parent.starts_with("/dev/")
+        || parent.starts_with("/proc/")
+        || parent.starts_with("/sys/")
 }
 
 /// Validates a command string for `RunCommand`.
@@ -370,7 +388,15 @@ pub struct DeckConfig {
 
 impl DeckConfig {
     pub fn is_valid(&self) -> bool {
-        self.pages.iter().flat_map(|p| p.tiles.iter()).all(DeckTileConfig::is_valid)
+        // Tile IDs are looked up across all pages (`tile()`), so a
+        // duplicate ID on another page is a real conflict, not a
+        // per-page coincidence: reject it here instead of letting
+        // `sanitized()` silently drop the second tile.
+        let mut tile_ids = BTreeSet::new();
+        self.pages
+            .iter()
+            .flat_map(|p| p.tiles.iter())
+            .all(|t| t.is_valid() && tile_ids.insert(t.id.clone()))
             && self.to_wire_layout().is_valid()
     }
 
@@ -403,6 +429,8 @@ impl DeckConfig {
                 if tiles.len() >= MAX_DECK_TILES_PER_PAGE {
                     break;
                 }
+                // First tile wins on a duplicate ID across pages (see
+                // `is_valid`, which rejects such configs outright).
                 if let Some(clean) = tile.sanitized()
                     && tile_ids.insert(clean.id.clone())
                 {
@@ -458,22 +486,46 @@ impl DeckConfig {
     }
 
     /// Loads `DeckConfig` from `path`, falling back to [`Self::default_deck`]
-    /// when the file does not exist or cannot be parsed/sanitized.
+    /// when the file does not exist. A file that exists but cannot be
+    /// parsed/sanitized is preserved next to it (`.json.corrupt`) instead
+    /// of being silently discarded: a torn write used to lose the whole
+    /// custom deck, and the next save then overwrote it permanently.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<DeckConfig>(&s).ok())
-            .and_then(DeckConfig::sanitized)
-            .unwrap_or_else(Self::default_deck)
+        match std::fs::read_to_string(path) {
+            Ok(s) => match serde_json::from_str::<DeckConfig>(&s).ok().and_then(DeckConfig::sanitized) {
+                Some(cfg) => cfg,
+                None => {
+                    let backup = path.with_extension("json.corrupt");
+                    let _ = std::fs::write(&backup, &s);
+                    Self::default_deck()
+                }
+            },
+            Err(_) => Self::default_deck(),
+        }
     }
 
-    /// Writes `self` as pretty-printed JSON to `path`.
+    /// Writes `self` as pretty-printed JSON to `path`, via a temp file in
+    /// the same directory plus an atomic rename, so a crash mid-save
+    /// cannot leave a torn `deck.json` behind.
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        let Some(name) = path.file_name() else {
+            return std::fs::write(path, json);
+        };
+        let tmp = path.with_file_name(format!("{}.tmp", name.to_string_lossy()));
+        if let Err(e) = std::fs::write(&tmp, &json) {
+            return Err(e);
+        }
+        match std::fs::rename(&tmp, path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e)
+            }
+        }
     }
 }
 
@@ -696,10 +748,13 @@ async fn run_pc_audio_set(shared: &Arc<Shared>, peer: &DeviceId, req: PcAudioSet
     }
     let is_phone_speaker_toggle =
         req.volume.is_some_and(|v| v == PHONE_SPEAKER_OFF || v == PHONE_SPEAKER_ON) && req.muted.is_none();
-    if !is_phone_speaker_toggle
-        && !shared.toggle_on(peer, crate::actions::POWER_TOGGLE)
-        && !shared.toggle_on(peer, INPUT_TOGGLE)
-    {
+    // The toggle check applies to every value, including the phone-speaker
+    // toggles (200/201): previously those skipped it entirely when `muted`
+    // was absent, so a peer with both toggles off could still start
+    // phone-as-speaker routing. (The `pc_actions` OR `remote_input` gate
+    // itself is intentional: `media.pc_audio` ties PC audio to
+    // `pc_actions`, and Deck volume tiles are `remote_input` actions.)
+    if !shared.toggle_on(peer, crate::actions::POWER_TOGGLE) && !shared.toggle_on(peer, INPUT_TOGGLE) {
         return Envelope::error(ErrorCode::Denied, "PC actions are turned off for this device");
     }
     let platform = shared.platform.clone();

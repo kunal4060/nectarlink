@@ -195,6 +195,12 @@ fn is_valid_url_host(host: &str) -> bool {
     if host.eq_ignore_ascii_case("localhost") {
         return true;
     }
+    // A bracketed IPv6 literal, already unbracketed by the caller
+    // (`http://[::1]/…`): it has no dots or labels, so the checks below
+    // would reject it and the IPv6 branch would be dead code.
+    if host.contains(':') {
+        return host.parse::<std::net::Ipv6Addr>().is_ok();
+    }
     if host.starts_with('.') || host.ends_with('.') || !host.contains('.') {
         return false;
     }
@@ -515,8 +521,9 @@ const STREET_DESIGNATORS: &[&str] = &[
     "close",
     "colony",
     "corso",
-    "court",
+    // Sorted: `binary_search` below depends on it (`cours` < `court`).
     "cours",
+    "court",
     "cres",
     "crescent",
     "ct",

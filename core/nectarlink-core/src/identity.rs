@@ -42,6 +42,15 @@ impl KeyProtector for PlainKeyProtector {
 }
 
 /// The best protector available on this platform.
+///
+/// On non-Windows platforms this is still [`PlainKeyProtector`]: the key
+/// file is only protected by its 0600 file permissions, so anyone who can
+/// read the user data dir (another local user, a backup, a stolen disk)
+/// can copy `identity.key` and impersonate this device to every paired
+/// peer. Embedders that have a platform keystore (macOS Keychain,
+/// libsecret on Linux, Android Keystore) should inject it via
+/// `NodeConfig.key_protector` instead of relying on this default; a real
+/// keystore-backed protector is still owed for those platforms.
 pub fn default_protector() -> Arc<dyn KeyProtector> {
     #[cfg(windows)]
     {
@@ -58,7 +67,16 @@ pub fn default_protector() -> Arc<dyn KeyProtector> {
 pub(crate) fn load_or_create(dir: &Path, protector: &dyn KeyProtector) -> Result<SecretKey> {
     let path = dir.join(FILE_NAME);
     match fs::read(&path) {
-        Ok(bytes) => decode(&bytes, protector),
+        Ok(bytes) => {
+            if protector.id() == 0 {
+                // Warn on every load, not just on first creation: an
+                // existing plain key is just as exposed as a new one.
+                tracing::warn!(
+                    "device key is stored without platform protection: anyone able to read the data dir can copy it and impersonate this device"
+                );
+            }
+            decode(&bytes, protector)
+        }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             let key = SecretKey::generate();
             if protector.id() == 0 {
@@ -102,12 +120,34 @@ fn decode(bytes: &[u8], protector: &dyn KeyProtector) -> Result<SecretKey> {
 fn write_atomically(path: &Path, data: &[u8]) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
-        let mut file = fs::File::create(&tmp)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
+        // `create_new` (O_EXCL) instead of truncating create: a pre-planted
+        // symlink at the tmp path must fail, not redirect the key bytes
+        // into an attacker-readable file or over an unrelated file.
+        // Permissions are set at creation, not after, so the bytes are
+        // never briefly world-readable.
+        let create = || {
+            let mut opts = fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            opts.open(&tmp)
+        };
+        let mut file = match create() {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                // A leftover tmp from a crashed write is a regular file and
+                // can be replaced; a symlink must never be followed.
+                if fs::symlink_metadata(&tmp)?.file_type().is_symlink() {
+                    return Err(io::Error::other("refusing to write through a symlinked temp key file"));
+                }
+                fs::remove_file(&tmp)?;
+                create()?
+            }
+            Err(e) => return Err(e),
+        };
         file.write_all(data)?;
         file.sync_all()?;
     }

@@ -475,6 +475,14 @@ pub fn seed_from_grid(pixels: &[Rgb], width: u32, height: u32) -> Option<Rgb> {
     if pixels.is_empty() {
         return None;
     }
+    // The grid below indexes `width * height` pixels: a short slice
+    // (e.g. dimensions taken from untrusted media metadata) must not
+    // panic the caller. `trim_borders` returns short slices unchanged,
+    // so check here, before it runs.
+    let needed = (width as usize).checked_mul(height as usize)?;
+    if pixels.len() < needed {
+        return None;
+    }
     // Single-pixel / very small input fast path (e.g., solid desktop background).
     if pixels.len() < 16 || width < 4 || height < 4 {
         let mut weighted: Option<(f64, Rgb)> = None;

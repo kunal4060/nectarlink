@@ -102,9 +102,16 @@ pub(crate) async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendS
     }
     let _ = recv.stop(VarInt::from_u32(mic::STOPPED));
     let _ = send.finish();
-    sink.ended();
-    if shared.clear_mic_stop(&peer, &stopped) {
-        shared.emit(NodeEvent::Mic { device: peer, on: false });
+    // A loop replaced by a newer stream must not tear down the new
+    // stream's sink: `ended()` runs only when no newer signal took over.
+    // (An explicit stop removed the signal already, so `clear_mic_stop`
+    // is false there — but the sink still needs ending, and the off
+    // event was already emitted by `stop_mic`.)
+    if !shared.mic_stop_replaced(&peer, &stopped) {
+        sink.ended();
+        if shared.clear_mic_stop(&peer, &stopped) {
+            shared.emit(NodeEvent::Mic { device: peer, on: false });
+        }
     }
 }
 
@@ -137,10 +144,19 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             // The PC's side: stop listening; the phone's: stop recording. A phone that
             // declines before any sound came has no stream to stop, but the PC still
             // hears that the microphone is off, so it stops waiting.
-            if !shared.stop_mic(&peer) {
-                shared.emit(NodeEvent::Mic { device: peer, on: false });
+            let listening = shared.stop_mic(&peer);
+            // A stop from a peer whose mic toggle is off, with nothing
+            // listening here, is spurious: don't tear anything down or
+            // emit a mic-off event for it. When the toggle is on, the
+            // stop must still reach the platform (that is how a phone
+            // stops a PC-requested recording), and when a stream is
+            // listening, it is torn down regardless of the toggle.
+            if listening || shared.toggle_on(&peer, TOGGLE) {
+                if !listening {
+                    shared.emit(NodeEvent::Mic { device: peer, on: false });
+                }
+                tokio::task::spawn_blocking(move || platform.mic_stop_requested(&peer));
             }
-            tokio::task::spawn_blocking(move || platform.mic_stop_requested(&peer));
             if env.id.is_some() {
                 session.send(Envelope::empty(types::OK).reply_to(env.id)).await?;
             }
@@ -186,6 +202,16 @@ impl Shared {
             prev.notify_one();
         }
         signal
+    }
+
+    /// Whether the mic stop signal for `peer` has been replaced by a
+    /// newer stream's signal.
+    fn mic_stop_replaced(&self, peer: &DeviceId, signal: &Arc<tokio::sync::Notify>) -> bool {
+        self.mic_stops
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer)
+            .is_some_and(|cur| !Arc::ptr_eq(cur, signal))
     }
 
     fn clear_mic_stop(&self, peer: &DeviceId, signal: &Arc<tokio::sync::Notify>) -> bool {

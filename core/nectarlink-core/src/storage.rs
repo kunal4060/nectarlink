@@ -15,7 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use iroh::endpoint::{RecvStream, SendStream};
+use iroh::endpoint::{RecvStream, SendStream, VarInt};
 pub use nectarlink_protocol::messages::{
     StorageChanged, StorageDelete, StorageEntries, StorageEntry, StorageList, StorageMkdir, StorageRead,
     StorageReadMeta, StorageRename, StorageWriteAccept, StorageWriteDone, StorageWriteOffer,
@@ -44,6 +44,27 @@ pub const REMOTE_FILES_TOGGLE: &str = "remote_files";
 const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
 const CHUNK_SIZE: usize = 64 * 1024;
 const MAX_OPEN_FOLDERS_PER_PEER: usize = 256;
+/// How long an interrupted storage-write staging file is kept for resume.
+/// Enforced by [`sweep_stale_staging`], which runs on every new write for
+/// the peer and from `transfer::clean_incoming` at node start.
+const STAGING_TTL: Duration = Duration::from_secs(60 * 60);
+
+/// Deletes `.part` files in `peer_dir` older than [`STAGING_TTL`], so
+/// abandoned or maliciously-started uploads do not fill the disk forever.
+/// Only the file's own mtime is consulted, never the parent directory's.
+pub(crate) fn sweep_stale_staging(peer_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(peer_dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().unwrap_or_default() > STAGING_TTL);
+        if stale && path.extension().is_some_and(|ext| ext == "part") {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 const CHANGED_DEBOUNCE: Duration = Duration::from_millis(250);
 
 /// Why a phone storage operation failed on the platform side.
@@ -100,7 +121,12 @@ impl StorageState {
     pub fn record_open_folder(&mut self, peer: DeviceId, path: &str) {
         let set = self.open_folders.entry(peer).or_default();
         if set.len() >= MAX_OPEN_FOLDERS_PER_PEER && !set.contains(path) {
-            set.clear();
+            // Evict a single entry, not the whole set: clearing all 256
+            // watched folders would silently stop change notifications for
+            // every folder the PC already had open.
+            if let Some(old) = set.iter().next().cloned() {
+                set.remove(&old);
+            }
         }
         set.insert(path.to_owned());
     }
@@ -168,6 +194,12 @@ fn check_phone_allowed(
     peer: &DeviceId,
     cap: &str,
 ) -> std::result::Result<(), (ErrorCode, String)> {
+    // All storage streams arrive over a session, which is only established
+    // with paired devices — but do not rely on that alone. Fail closed on
+    // a store error.
+    if !shared.store.is_paired(peer).unwrap_or(false) {
+        return Err((ErrorCode::Unpaired, "device is not paired".into()));
+    }
     if !shared.we_offer(cap) {
         return Err((ErrorCode::Unsupported, format!("{cap} is not offered by this device")));
     }
@@ -505,15 +537,30 @@ pub(crate) async fn serve_read(
         }
     });
 
+    // A file that shrinks between `storage_open_read` and the re-open must
+    // not be delivered truncated as a success: the reader loop above
+    // breaks on EOF, so count what actually went out and reset the stream
+    // (surfacing as a read error on the client) instead of finishing
+    // cleanly when fewer than `to_send` bytes were produced.
+    let mut sent: u64 = 0;
+    let mut short = false;
     while let Some(chunk) = rx.recv().await {
         match chunk {
             Ok(bytes) => {
+                sent = sent.saturating_add(bytes.len() as u64);
                 if send.write_chunk(bytes).await.is_err() {
                     return;
                 }
             }
-            Err(_) => return,
+            Err(_) => {
+                short = true;
+                break;
+            }
         }
+    }
+    if short || sent < to_send {
+        let _ = send.reset(VarInt::from_u32(ErrorCode::Internal.close_code()));
+        return;
     }
     let _ = send.finish();
 }
@@ -568,6 +615,11 @@ pub(crate) async fn serve_write(
         let _ = write_frame(&mut send, &reply.to_cbor()).await;
         let _ = send.finish();
         return;
+    }
+    // Drop this peer's abandoned staging files so interrupted uploads do
+    // not accumulate forever (see `sweep_stale_staging`).
+    if let Some(parent) = part_path.parent() {
+        sweep_stale_staging(parent);
     }
 
     let existing_len = tokio::fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
@@ -1098,7 +1150,29 @@ impl FolderStorage {
             self.ensure_inside(&canon_root, &canon_parent)?;
         }
         if std::fs::rename(staged, &dest).is_err() {
-            std::fs::copy(staged, &dest).map_err(|e| StorageError::Failed(e.to_string()))?;
+            // Another volume: copy to a temp file in the same directory
+            // and rename it over `dest`. Copying straight onto `dest`
+            // would truncate the existing file and leave a partial one
+            // there if the copy then failed midway.
+            let tmp = dest.parent().map(|parent| {
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                parent.join(format!(".nectarlink-tmp-{nanos}"))
+            });
+            let copied = match &tmp {
+                Some(tmp) => std::fs::copy(staged, tmp)
+                    .and_then(|_| std::fs::rename(tmp, &dest))
+                    .map(|_| ()),
+                None => Err(std::io::Error::new(std::io::ErrorKind::NotFound, "no parent directory")),
+            };
+            if let Err(e) = copied {
+                if let Some(tmp) = &tmp {
+                    let _ = std::fs::remove_file(tmp);
+                }
+                return Err(StorageError::Failed(e.to_string()));
+            }
         }
         if let Some(ms) = modified.filter(|m| *m >= 0)
             && let Some(st) = UNIX_EPOCH.checked_add(Duration::from_millis(ms as u64))
@@ -1124,6 +1198,11 @@ impl FolderStorage {
     pub fn rename(&self, from: &str, to: &str) -> std::result::Result<(), StorageError> {
         let src = self.resolve_existing(from, false)?;
         let dst = self.resolve_target(to)?;
+        // `std::fs::rename` silently overwrites on Unix: refuse rather
+        // than destroy the destination file without confirmation.
+        if dst.exists() {
+            return Err(StorageError::Invalid("destination already exists".into()));
+        }
         if let Some(parent) = dst.parent() {
             std::fs::create_dir_all(parent).map_err(|e| StorageError::Failed(e.to_string()))?;
             let canon_root = self.canonical_root()?;
@@ -1145,9 +1224,43 @@ impl FolderStorage {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "trashed".into());
-            let dest = trash_dir.join(name);
+            // Trash by bare basename: a second trashed file with the same
+            // name would overwrite the first. Suffix like `unique_path`.
+            let dest = {
+                let first = trash_dir.join(&name);
+                if !first.exists() {
+                    first
+                } else {
+                    let (stem, ext) = match name.rfind('.') {
+                        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+                        _ => (name.as_str(), ""),
+                    };
+                    (2..)
+                        .map(|n| trash_dir.join(format!("{stem} ({n}){ext}")))
+                        .find(|p| !p.exists())
+                        .unwrap_or_else(|| {
+                            let nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0);
+                            trash_dir.join(format!("{stem} ({nanos}){ext}"))
+                        })
+                }
+            };
             if std::fs::rename(&target, &dest).is_err() {
-                std::fs::copy(&target, &dest).map_err(|e| StorageError::Failed(e.to_string()))?;
+                // Copy via a temp file so a failed copy leaves neither a
+                // partial trash file nor a destroyed original behind.
+                let nanos = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp = trash_dir.join(format!(".nectarlink-tmp-{nanos}"));
+                let copied =
+                    std::fs::copy(&target, &tmp).and_then(|_| std::fs::rename(&tmp, &dest)).map(|_| ());
+                if let Err(e) = copied {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(StorageError::Failed(e.to_string()));
+                }
                 std::fs::remove_file(&target).map_err(|e| StorageError::Failed(e.to_string()))?;
             }
             return Ok(());

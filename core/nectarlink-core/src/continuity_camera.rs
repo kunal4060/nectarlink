@@ -3,7 +3,11 @@
 //! document (`camera.capture.request`), and the phone streams the captured
 //! image back on a dedicated `camera` / `result` stream.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use iroh::endpoint::{RecvStream, SendStream};
 use nectarlink_protocol::{
@@ -22,6 +26,38 @@ pub const TOGGLE: &str = "photos";
 
 const RESULT_TIMEOUT: Duration = Duration::from_secs(60);
 const CHUNK_BYTES: usize = 64 * 1024;
+
+/// Capture requests this device actually issued, by (peer, request_id).
+/// A result stream is only accepted for an outstanding request: without
+/// this, any paired device could push files into the downloads folder
+/// unasked. Entries expire after [`RESULT_TIMEOUT`] (a capture that takes
+/// longer than that to come back is rejected) and are consumed on receipt
+/// or cleared on cancel.
+///
+/// This lives here, process-wide, rather than on `Shared`: adding a field
+/// to `Shared` is a `node.rs` change, outside this module's scope. A
+/// `Shared` field keyed the same way would be the cleaner home for it.
+static PENDING_REQUESTS: Mutex<HashMap<(DeviceId, String), Instant>> = Mutex::new(HashMap::new());
+
+fn register_pending(peer: DeviceId, request_id: &str) {
+    let mut pending = PENDING_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    pending.retain(|_, at| at.elapsed() < RESULT_TIMEOUT);
+    pending.insert((peer, request_id.to_owned()), Instant::now());
+}
+
+/// Consumes the outstanding request for `request_id` from `peer`, if any.
+fn take_pending(peer: DeviceId, request_id: &str) -> bool {
+    let mut pending = PENDING_REQUESTS.lock().unwrap_or_else(|e| e.into_inner());
+    pending.retain(|_, at| at.elapsed() < RESULT_TIMEOUT);
+    pending.remove(&(peer, request_id.to_owned())).is_some()
+}
+
+fn clear_pending(peer: DeviceId, request_id: &str) {
+    PENDING_REQUESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&(peer, request_id.to_owned()));
+}
 
 /// Whether a Continuity Camera `request_id` meets the protocol bounds.
 pub fn valid_request_id(id: &str) -> bool {
@@ -48,7 +84,10 @@ pub(crate) async fn request_on_session(
         return Err(Error::Denied);
     }
     let env = Envelope::new(types::CAMERA_CAPTURE_REQUEST, &CameraCaptureRequest { request_id, mode })?;
-    session.send(env).await
+    // Only a request that actually went out can later bring a result back.
+    // This is also the queue drain's send point, so queued requests are
+    // registered when they are finally sent, not when they are enqueued.
+    session.send(env).await.inspect(|_| register_pending(session.peer, &request_id))
 }
 
 /// Asks a paired phone to open its camera UI and capture a photo or scan a document.
@@ -156,6 +195,7 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
             if !valid_request_id(&cancel.request_id) {
                 return Err(Error::Protocol("invalid continuity camera request_id".into()));
             }
+            clear_pending(session.peer, &cancel.request_id);
             shared.platform.camera_capture_cancelled(&session.peer, &cancel.request_id);
             shared.emit(NodeEvent::CameraCaptureCancelled {
                 device: session.peer,
@@ -289,6 +329,12 @@ async fn take_result(
     }
     if !shared.toggle_on(&peer, TOGGLE) {
         return Err((ErrorCode::Denied, "photos sharing is turned off"));
+    }
+    // Unsolicited results — no request from this device, or the request
+    // already completed, was cancelled, or expired — are refused before
+    // any bytes are read or saved.
+    if !take_pending(peer, &meta.request_id) {
+        return Err((ErrorCode::Denied, "no outstanding continuity camera request for this id"));
     }
 
     let size = usize::try_from(meta.size).map_err(|_| (ErrorCode::BadMessage, "image too large"))?;

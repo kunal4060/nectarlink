@@ -53,9 +53,18 @@ pub fn is_otp_clip(text: &str) -> bool {
 }
 
 /// Whether `trimmed` is nothing but a standalone 4-8 digit code, `"G-123456"`,
-/// `"123-456"` or `"1234-5678"`.
+/// `"123-456"`, `"1234-5678"`, or a space-grouped code like `"123 456"`.
 pub fn is_bare_code(trimmed: &str) -> bool {
     if (4..=8).contains(&trimmed.len()) && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        return true;
+    }
+    if let Some((first, rest)) = trimmed.split_once(' ')
+        && (3..=4).contains(&first.len())
+        && (3..=4).contains(&rest.len())
+        && first.bytes().all(|b| b.is_ascii_digit())
+        && rest.bytes().all(|b| b.is_ascii_digit())
+        && (4..=8).contains(&(first.len() + rest.len()))
+    {
         return true;
     }
     if let Some((prefix, rest)) = trimmed.split_once('-') {

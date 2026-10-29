@@ -210,12 +210,13 @@ pub fn format_clip_display(raw_text: &str) -> (String, Option<String>) {
         .trim();
 
     let lower_prefix = unquoted.get(..8).map(str::to_ascii_lowercase).unwrap_or_default();
-    if (lower_prefix.starts_with("http://")
-        || lower_prefix.starts_with("https://")
-        || lower_prefix.starts_with("geo:"))
+    // A short `geo:` link (`geo:0,0` is 7 bytes) has no 8-byte prefix, so
+    // test it against the full string instead of the truncated prefix.
+    let is_geo = unquoted.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("geo:"));
+    if (lower_prefix.starts_with("http://") || lower_prefix.starts_with("https://") || is_geo)
         && !unquoted.contains(char::is_whitespace)
     {
-        if lower_prefix.starts_with("geo:") {
+        if is_geo {
             let (title, raw) = crate::handoff::timeline_link_title_and_detail(unquoted, None);
             return (title, Some(raw));
         }

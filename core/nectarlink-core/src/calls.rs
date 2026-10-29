@@ -263,11 +263,28 @@ pub(crate) async fn handle(shared: &Arc<Shared>, session: &Arc<Session>, env: &E
                     (None, _) => Envelope::error(ErrorCode::Unsupported, "unknown action"),
                     (Some(command), Some(call)) if call.id == id && command.fits(&call.state) => {
                         let platform = shared.platform.clone();
-                        match tokio::task::spawn_blocking(move || platform.call_command(&id, command))
-                            .await
-                            .unwrap_or_else(|e| Err(e.to_string()))
+                        let shared = shared.clone();
+                        // Re-check on the blocking thread, just before the
+                        // platform acts: the call may have ended (or been
+                        // replaced) between the check above and dispatch.
+                        // This narrows, but cannot fully close, the race —
+                        // the platform itself is the final authority on
+                        // whether the call is still there.
+                        match tokio::task::spawn_blocking(move || {
+                            let still =
+                                shared.calls.get().is_some_and(|c| c.id == id && command.fits(&c.state));
+                            if !still {
+                                return Err("the call ended or changed".to_string());
+                            }
+                            platform.call_command(&id, command)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(e.to_string()))
                         {
                             Ok(()) => Envelope::empty(types::OK),
+                            Err(reason) if reason == "the call ended or changed" => {
+                                Envelope::error(ErrorCode::NotFound, "no such call")
+                            }
                             Err(reason) => {
                                 tracing::warn!(reason, action = command.as_str(), "a call action failed");
                                 Envelope::error(ErrorCode::Internal, "the phone couldn't do it")

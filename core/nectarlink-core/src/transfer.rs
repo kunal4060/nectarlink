@@ -225,9 +225,12 @@ fn items(entries: &[FileEntry]) -> Vec<String> {
 /// A name Windows can store: no reserved device names (`CON`, `COM1`…),
 /// characters it rejects, or trailing dots and spaces.
 pub(crate) fn storable_name(name: &str) -> String {
+    // `/` and `\` are also replaced: a name that reaches here without
+    // protocol validation must not be able to escape its directory via
+    // `dir.join(name)`.
     let mut clean: String = name
         .chars()
-        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c })
+        .map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '/' | '\\') { '_' } else { c })
         .collect();
     while clean.ends_with(['.', ' ']) {
         clean.pop();
@@ -276,6 +279,16 @@ pub(crate) fn unique_path(dir: &Path, name: &str) -> PathBuf {
         .map(|n| dir.join(format!("{stem} ({n}){ext}")))
         .find(|p| !p.exists())
         .unwrap_or_else(|| dir.join(format!("{stem} ({}){ext}", new_id())))
+}
+
+/// Serializes a `unique_path` claim with the following create/rename, so
+/// two concurrent incoming transfers cannot pick the same destination and
+/// have the second rename overwrite the first. Held only across synchronous
+/// filesystem work inside `spawn_blocking` closures, never across `.await`.
+static UNIQUE_DEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn unique_dest_lock() -> std::sync::MutexGuard<'static, ()> {
+    UNIQUE_DEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub(crate) fn new_id() -> String {
@@ -851,8 +864,14 @@ pub(crate) async fn deliver_queued_files(
         if shutdown.is_cancelled() {
             break TransferState::Failed(TransferFailure::Interrupted);
         }
-        let Ok(Some((current, _, _, _))) = shared.store.get_queue_item(&item.id) else {
-            break TransferState::Cancelled;
+        // A store error is not a cancellation: only a genuinely missing
+        // item cancels. On error, fail as Interrupted so the queue entry
+        // (and any staging) survives for a retry instead of being deleted
+        // by the Cancelled arm below.
+        let current = match shared.store.get_queue_item(&item.id) {
+            Ok(Some((current, _, _, _))) => current,
+            Ok(None) => break TransferState::Cancelled,
+            Err(_) => break TransferState::Failed(TransferFailure::Interrupted),
         };
         if let crate::QueueStatus::Failed { error } | crate::QueueStatus::Expired { error } = current.status {
             break TransferState::Failed(TransferFailure::Other(error));
@@ -1183,6 +1202,7 @@ async fn send_until_done(
                 _ = tokio::time::sleep(Duration::from_secs(1)) => continue,
             }
         };
+        let done_before = reporter.transfer.done;
         match attempt(reporter, &session, &mut files, cancel, pause_rx).await {
             Attempt::Done => return TransferState::Done { saved: Vec::new() },
             Attempt::Cancelled => return TransferState::Cancelled,
@@ -1195,8 +1215,15 @@ async fn send_until_done(
             }
             Attempt::Fatal(failure) => return TransferState::Failed(failure),
             Attempt::Retry => {
-                // Made it this far: give the device a fresh window to come back.
-                give_up_at = Instant::now() + RETRY_FOR;
+                // Only progress earns a fresh window. A peer that connects
+                // but fails every stream without sending a byte must not
+                // reset the deadline forever; once it lapses, give up
+                // instead of spinning on a broken peer.
+                if reporter.transfer.done > done_before {
+                    give_up_at = Instant::now() + RETRY_FOR;
+                } else if Instant::now() >= give_up_at {
+                    return TransferState::Failed(TransferFailure::Unreachable);
+                }
                 tracing::debug!(id = %reporter.transfer.id, "transfer interrupted; will resume");
                 reporter.set(TransferState::Waiting);
                 tokio::select! {
@@ -1262,7 +1289,8 @@ async fn attempt(
         Reply::Failed => return Attempt::Retry,
     };
 
-    let mut done: u64 = files.iter().zip(&have).map(|((entry, _), have)| (*have).min(entry.size)).sum();
+    let mut done: u64 =
+        files.iter().zip(&have).map(|((entry, _), have)| (*have).min(entry.size)).fold(0, u64::saturating_add);
     reporter.transfer.done = done;
     if reporter.update_queue && done > 0 {
         let files_done = reporter.files_completed(done);
@@ -1423,6 +1451,9 @@ pub(crate) async fn handle_control(shared: &Arc<Shared>, peer: DeviceId, env: &E
             if !ctrl.is_valid() {
                 return Err(Error::Protocol("invalid files.resume".into()));
             }
+            if !shared.store.is_paired(&peer).unwrap_or(false) {
+                return Err(Error::Protocol("device is not paired".into()));
+            }
             shared.resume_transfer_from_peer(&ctrl.id, peer);
             Ok(true)
         }
@@ -1430,6 +1461,9 @@ pub(crate) async fn handle_control(shared: &Arc<Shared>, peer: DeviceId, env: &E
             let ctrl: FilesControl = env.body()?;
             if !ctrl.is_valid() {
                 return Err(Error::Protocol("invalid files.cancel".into()));
+            }
+            if !shared.store.is_paired(&peer).unwrap_or(false) {
+                return Err(Error::Protocol("device is not paired".into()));
             }
             shared.cancel_transfer_from_peer(&ctrl.id, peer).await;
             Ok(true)
@@ -1583,6 +1617,11 @@ async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendStream, mut 
     } else if !shared.toggle_on(&peer, TOGGLE) {
         return refuse(&mut send, ErrorCode::Denied, "files are off for this device").await;
     }
+    // Sessions are only established with paired devices, but do not rely
+    // on that alone: fail closed on a store error.
+    if !shared.store.is_paired(&peer).unwrap_or(false) {
+        return refuse(&mut send, ErrorCode::Unpaired, "device is not paired").await;
+    }
     let dir = shared.incoming_dir().join(peer.to_string()).join(&offer.id);
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         tracing::warn!(error = %e, "can't store incoming files");
@@ -1630,7 +1669,7 @@ async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendStream, mut 
         names: items(&offer.files),
         files: offer.files.len(),
         total: offer.total_size(),
-        done: have.iter().sum(),
+        done: have.iter().copied().fold(0, u64::saturating_add),
         state: TransferState::Running,
         recording: offer.recording,
         markers: offer.markers.clone(),
@@ -1706,7 +1745,13 @@ async fn receive(shared: Arc<Shared>, peer: DeviceId, mut send: SendStream, mut 
             }
         },
         Err(state) => {
-            if state == TransferState::Cancelled {
+            // An integrity failure deletes the staging dir too: the corrupt
+            // prefix cannot be identified (the digest covers the whole
+            // file), so keeping it would make every resume re-download the
+            // tail and fail the same check forever.
+            if state == TransferState::Cancelled
+                || matches!(state, TransferState::Failed(TransferFailure::Integrity))
+            {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 if let Some(parent) = dir.parent() {
                     let _ = tokio::fs::remove_dir(parent).await;
@@ -1769,7 +1814,7 @@ async fn receive_bytes(
     cancel: &CancellationToken,
     pause_rx: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::result::Result<(), TransferState> {
-    let mut done: u64 = have.iter().sum();
+    let mut done: u64 = have.iter().copied().fold(0, u64::saturating_add);
     for (i, (file, have)) in offer.files.iter().zip(have).enumerate() {
         let part_path = part(i);
         let mut out =
@@ -1777,8 +1822,16 @@ async fn receive_bytes(
                 TransferState::Failed(TransferFailure::Other(format!("can't write: {}", e.kind())))
             })?;
         // A part file longer than `have` (it changed or failed a prior check) starts from `have`.
-        if *have < out.metadata().await.map(|m| m.len()).unwrap_or(0) {
-            out.set_len(*have).await.ok();
+        // A failed truncate must not be swallowed: appending after the
+        // longer stale file would produce a file longer than `file.size`
+        // and a guaranteed integrity failure on completion.
+        if *have < out.metadata().await.map(|m| m.len()).unwrap_or(0)
+            && let Err(e) = out.set_len(*have).await
+        {
+            return Err(TransferState::Failed(TransferFailure::Other(format!(
+                "can't truncate part file: {}",
+                e.kind()
+            ))));
         }
         let mut hasher = if file.blake3.is_some() {
             let have_bytes = *have;
@@ -1901,41 +1954,69 @@ async fn store(
     let parts: Vec<PathBuf> = (0..entries.len()).map(part).collect();
     let dir = dir.to_owned();
     tokio::task::spawn_blocking(move || {
+        // Hold the destination lock for the whole move so a concurrent
+        // transfer cannot claim the same unique path in between.
+        let _dest_guard = unique_dest_lock();
         std::fs::create_dir_all(&target)?;
         // A sent folder lands under a name of its own: `Trip`, or
         // `Trip (2)` when there already is one.
         let mut folders: HashMap<String, PathBuf> = HashMap::new();
         let mut saved = Vec::with_capacity(entries.len());
-        for (entry, part) in entries.iter().zip(parts) {
-            let at = match entry.folder.as_deref() {
-                None => target.clone(),
-                Some(folder) => {
-                    let mut names = folder.split('/').map(storable_name);
-                    let top = names.next().unwrap_or_else(|| "Folder".into());
-                    let mut at = match folders.get(&top) {
-                        Some(at) => at.clone(),
-                        None => {
-                            let at = unique_path(&target, &top);
-                            std::fs::create_dir(&at)?;
-                            folders.insert(top, at.clone());
-                            saved.push(at.clone());
-                            at
-                        }
-                    };
-                    at.extend(names);
-                    std::fs::create_dir_all(&at)?;
-                    at
+        let mut created: Vec<PathBuf> = Vec::with_capacity(entries.len());
+        let store_res: std::io::Result<()> = (|| {
+            for (entry, part) in entries.iter().zip(parts) {
+                let at = match entry.folder.as_deref() {
+                    None => target.clone(),
+                    Some(folder) => {
+                        let mut names = folder.split('/').map(storable_name);
+                        let top = names.next().unwrap_or_else(|| "Folder".into());
+                        let mut at = match folders.get(&top) {
+                            Some(at) => at.clone(),
+                            None => {
+                                let at = unique_path(&target, &top);
+                                std::fs::create_dir(&at)?;
+                                folders.insert(top, at.clone());
+                                saved.push(at.clone());
+                                at
+                            }
+                        };
+                        at.extend(names);
+                        std::fs::create_dir_all(&at)?;
+                        at
+                    }
+                };
+                let to = unique_path(&at, &storable_name(&entry.name));
+                if std::fs::rename(&part, &to).is_err() {
+                    // Another volume: copy, then drop the part file. A
+                    // failed copy must not leave a partial file at `to`.
+                    if let Err(e) = std::fs::copy(&part, &to) {
+                        let _ = std::fs::remove_file(&to);
+                        return Err(e);
+                    }
+                    // Track `to` before dropping the part, so a failure
+                    // here still rolls the delivery back.
+                    created.push(to.clone());
+                    std::fs::remove_file(&part)?;
+                } else {
+                    created.push(to.clone());
                 }
-            };
-            let to = unique_path(&at, &storable_name(&entry.name));
-            if std::fs::rename(&part, &to).is_err() {
-                // Another volume: copy, then drop the part file.
-                std::fs::copy(&part, &to)?;
-                std::fs::remove_file(&part)?;
+                if entry.folder.is_none() {
+                    saved.push(to);
+                }
             }
-            if entry.folder.is_none() {
-                saved.push(to);
+            Ok(())
+        })();
+        if let Err(e) = store_res {
+            // Roll back this call's deliveries: without this, a failure on
+            // file N left files 1..N-1 in Downloads looking delivered while
+            // the transfer reported Failed.
+            for p in &created {
+                let _ = std::fs::remove_file(p);
             }
+            for p in &saved {
+                let _ = std::fs::remove_dir(p);
+            }
+            return Err(e);
         }
         let _ = std::fs::remove_dir_all(&dir);
         if let Some(parent) = dir.parent() {
@@ -1958,6 +2039,20 @@ pub(crate) fn clean_incoming(dir: &Path) {
     let Ok(peers) = std::fs::read_dir(dir) else { return };
     for peer in peers.flatten() {
         let path = peer.path();
+        // Storage-write staging also lives under this root, at
+        // `incoming/storage/<peer>/`. It is NOT a legacy transfer dir: never
+        // delete it wholesale (its own mtime only changes when a peer
+        // subdirectory is created, so the whole tree would look stale at
+        // once). Sweep only its stale `.part` files, per peer.
+        if peer.file_name().to_str() == Some("storage") {
+            if let Ok(peer_dirs) = std::fs::read_dir(&path) {
+                for peer_dir in peer_dirs.flatten() {
+                    crate::storage::sweep_stale_staging(&peer_dir.path());
+                    let _ = std::fs::remove_dir(peer_dir.path());
+                }
+            }
+            continue;
+        }
         // Transfers from before they were kept per peer: `incoming/<offer>`.
         if peer.file_name().to_str().and_then(|n| n.parse::<DeviceId>().ok()).is_none() {
             if is_stale(&peer) {
