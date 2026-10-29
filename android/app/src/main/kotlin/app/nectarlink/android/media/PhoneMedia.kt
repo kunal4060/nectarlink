@@ -251,7 +251,14 @@ class PhoneMedia(context: Context, private val onChange: (List<MediaPlayer>) -> 
             MediaAction.PAUSE -> controls.pause()
             MediaAction.NEXT -> controls.skipToNext()
             MediaAction.PREVIOUS -> controls.skipToPrevious()
-            MediaAction.SEEK -> controls.seekTo(position?.toLong() ?: throw MediaFailure.Unsupported())
+            MediaAction.SEEK -> {
+                // An unchecked ULong -> Long used to wrap huge PC seeks
+                // negative; clamp to the track (or to >= 0 when unknown).
+                val wanted = position ?: throw MediaFailure.Unsupported()
+                val raw = wanted.coerceAtMost(Long.MAX_VALUE.toULong()).toLong()
+                val duration = controller.metadata?.getLong(MediaMetadata.METADATA_KEY_DURATION)?.takeIf { it > 0 }
+                controls.seekTo(if (duration != null) raw.coerceIn(0, duration) else raw.coerceAtLeast(0))
+            }
         }
     }
 

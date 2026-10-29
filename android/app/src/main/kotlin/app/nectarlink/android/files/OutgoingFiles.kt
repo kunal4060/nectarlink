@@ -12,10 +12,25 @@ import app.nectarlink.core.FileToSend
 
 /** Files the user picked or shared, as the core takes them: name and an open descriptor. */
 internal object OutgoingFiles {
+    /** Opened files, plus how many items couldn't be opened (dropped, not sent). */
+    data class Opened(val files: List<FileToSend>, val skipped: Int)
+
     /** Skips items that can't be opened (the result says how many were). */
-    fun open(context: Context, uris: List<Uri>): List<FileToSend> = uris.mapNotNull { uri ->
-        val fd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull() ?: return@mapNotNull null
-        FileToSend.Fd(name = displayName(context, uri), fd = fd.detachFd(), folder = null)
+    fun open(context: Context, uris: List<Uri>): List<FileToSend> = openCounted(context, uris).files
+
+    /** Like [open], but also reports how many items were skipped. */
+    fun openCounted(context: Context, uris: List<Uri>): Opened {
+        var skipped = 0
+        val files = uris.mapNotNull { uri ->
+            val fd = runCatching { context.contentResolver.openFileDescriptor(uri, "r") }.getOrNull()
+            if (fd == null) {
+                skipped++
+                null
+            } else {
+                FileToSend.Fd(name = displayName(context, uri), fd = fd.detachFd(), folder = null)
+            }
+        }
+        return Opened(files, skipped)
     }
 
     /** Why a folder can't be sent. */
@@ -71,8 +86,11 @@ internal object OutgoingFiles {
     }
 
     /** A name without the characters folder paths use; the core checks the rest. */
-    private fun safeName(name: String): String =
-        name.replace('/', '_').replace('\\', '_').trim().ifEmpty { "file" }.take(200)
+    private fun safeName(name: String): String {
+        val cleaned = name.replace('/', '_').replace('\\', '_').trim().ifEmpty { "file" }.take(200)
+        // "." and ".." as a path segment would traverse out of the folder.
+        return if (cleaned == "." || cleaned == "..") "file" else cleaned
+    }
 
     private fun displayName(context: Context, uri: Uri): String =
         runCatching {

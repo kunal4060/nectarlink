@@ -42,9 +42,13 @@ object WatchOffers {
         ) {
             return opened
         }
+        // One id per PC+player: keying the notification by PC alone used
+        // to replace a first offer with a second from the same PC, and
+        // hashCode() ids collided across offers.
+        val notificationId = idFor("$pcId/$player")
         val open = PendingIntent.getActivity(
             context,
-            "$pcId/$player".hashCode(),
+            notificationId,
             watch,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
@@ -61,14 +65,23 @@ object WatchOffers {
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .build()
         val shown = runCatching {
-            NotificationManagerCompat.from(context).notify(TAG, pcId.hashCode(), notification)
+            NotificationManagerCompat.from(context).notify(TAG, notificationId, notification)
         }.isSuccess
         return shown || opened
     }
 
+    /** Stable notification ids per PC+player, allocated once. */
+    private val ids = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val nextId = java.util.concurrent.atomic.AtomicInteger(1)
+    private fun idFor(key: String) = ids.computeIfAbsent(key) { nextId.getAndIncrement() }
+
     /** Takes the offer's notification away (the Watch screen opened). */
     fun dismiss(context: Context, pcId: String) {
-        runCatching { NotificationManagerCompat.from(context).cancel(TAG, pcId.hashCode()) }
+        // Dismiss is keyed by PC only, so cancel every player offer from it.
+        val prefix = "$pcId/"
+        ids.entries.filter { it.key.startsWith(prefix) }.forEach { (_, id) ->
+            runCatching { NotificationManagerCompat.from(context).cancel(TAG, id) }
+        }
     }
 
     /** As long as the PC keeps an offer open (docs/protocol/media.md §4). */

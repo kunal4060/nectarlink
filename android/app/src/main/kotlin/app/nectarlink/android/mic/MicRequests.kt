@@ -80,7 +80,13 @@ class MicStartActivity : ComponentActivity() {
     private var pcId: String? = null
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) pcId?.let { MicService.start(this, it) }
+        if (granted) {
+            pcId?.let { MicService.start(this, it) }
+        } else {
+            // A denial used to just close the screen, leaving the PC
+            // waiting for a stream that never comes.
+            pcId?.let { (application as NectarlinkApplication).core.declineMicRequest(it) }
+        }
         finish()
     }
 
@@ -96,7 +102,10 @@ class MicStartActivity : ComponentActivity() {
         if (MicService.hasPermission(this)) {
             MicService.start(this, pc)
             finish()
-        } else if (savedInstanceState == null) {
+        } else {
+            // Recreated (e.g. rotated) while the permission dialog was up,
+            // the old code did nothing here and sat on a blank screen.
+            // Re-asking is safe: the launcher delivers one result per ask.
             permission.launch(Manifest.permission.RECORD_AUDIO)
         }
     }

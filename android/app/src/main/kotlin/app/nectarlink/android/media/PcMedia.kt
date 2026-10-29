@@ -134,7 +134,7 @@ class PcMedia(
         val decoded = list.mapNotNull { player ->
             val key = player.artKey ?: return@mapNotNull null
             val bytes = player.art ?: return@mapNotNull null
-            val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@mapNotNull null
+            val bmp = decodeArtwork(bytes) ?: return@mapNotNull null
             "$pc/$key" to (bmp to extractArtworkSeedColor(bmp, "$pc/$key"))
         }
         main.post {
@@ -341,6 +341,24 @@ class PcMedia(
         }
     }
 
+    /**
+     * Decodes PC-sent artwork bounded in both bytes and pixels: decoding
+     * full-size used to OOM-crash the app, and the resend on reconnect
+     * crashed it again. Oversized or undecodable art is dropped, not shown.
+     */
+    private fun decodeArtwork(bytes: ByteArray): Bitmap? {
+        if (bytes.size > MAX_ARTWORK_BYTES) return null
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+        var sample = 1
+        while (maxOf(bounds.outWidth / sample, bounds.outHeight / sample) > MAX_ARTWORK_PX) sample *= 2
+        return BitmapFactory.decodeByteArray(
+            bytes, 0, bytes.size,
+            BitmapFactory.Options().apply { inSampleSize = sample },
+        )
+    }
+
     private fun hide() {
         main.removeCallbacks(stalePauseTimeout)
         shown = null
@@ -432,6 +450,12 @@ class PcMedia(
     internal fun pressed(action: MediaAction) = main.post { command(action) }
 
     companion object {
+        /** Largest PC artwork accepted, in bytes (PhoneMedia downscales its own art to 360px). */
+        private const val MAX_ARTWORK_BYTES = 2 * 1024 * 1024
+
+        /** Largest decoded artwork side, in pixels. */
+        private const val MAX_ARTWORK_PX = 512
+
         private const val CHANNEL = "pc_media"
         private const val NOTIFICATION_TAG = "pc_media"
         private const val NOTIFICATION_ID = 1

@@ -31,6 +31,8 @@ class KeystoreKeyProtector : KeyProtector {
         cipher.doFinal(ciphertext, IV_LENGTH, ciphertext.size - IV_LENGTH)
     }
 
+    /** Synchronised: two concurrent first-run calls used to both generate the same alias. */
+    @Synchronized
     private fun key(): SecretKey {
         val store = KeyStore.getInstance(KEYSTORE).apply { load(null) }
         (store.getKey(ALIAS, null) as? SecretKey)?.let { return it }

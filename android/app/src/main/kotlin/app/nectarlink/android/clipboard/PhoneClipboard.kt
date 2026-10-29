@@ -23,6 +23,9 @@ object PhoneClipboard {
     /** The largest image sent (docs/protocol/clipboard.md). */
     private const val MAX_IMAGE_BYTES = 32L * 1024 * 1024
 
+    /** Largest side of an image decoded for format conversion, in pixels. */
+    private const val MAX_CONVERT_PX = 2048
+
     /** Where images from a PC are kept while they're on the clipboard. */
     private const val IMAGE_DIR = "clipboard"
 
@@ -191,7 +194,17 @@ object PhoneClipboard {
         when (val mime = resolver.getType(uri)) {
             "image/png", "image/jpeg" -> ImageResult.Ready(ImageData(mime, bytes))
             else -> {
-                val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return ImageResult.Unreadable
+                // Bounds first, then a downsampled decode: a 32 MB source
+                // can be hundreds of megapixels, which used to OOM the app.
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return ImageResult.Unreadable
+                var sample = 1
+                while (maxOf(bounds.outWidth / sample, bounds.outHeight / sample) > MAX_CONVERT_PX) sample *= 2
+                val bitmap = BitmapFactory.decodeByteArray(
+                    bytes, 0, bytes.size,
+                    BitmapFactory.Options().apply { inSampleSize = sample },
+                ) ?: return ImageResult.Unreadable
                 val png = java.io.ByteArrayOutputStream().also { bitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
                 bitmap.recycle()
                 if (png.size() > MAX_IMAGE_BYTES) ImageResult.TooLarge else ImageResult.Ready(ImageData("image/png", png.toByteArray()))

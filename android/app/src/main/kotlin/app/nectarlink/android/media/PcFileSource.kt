@@ -3,6 +3,7 @@ package app.nectarlink.android.media
 
 import android.media.MediaDataSource
 import java.io.IOException
+import java.util.concurrent.CancellationException
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -51,8 +52,10 @@ class ChunkedReader(
 
     /** As [MediaDataSource.readAt]: how many bytes it put in [buffer], or -1 at the end. */
     fun readAt(position: Long, buffer: ByteArray, offset: Int, size: Int): Int {
-        if (closed || position >= fileSize) return -1
+        if (closed || position < 0 || position >= fileSize) return -1
         if (size <= 0) return 0
+        // Malformed player reads used to throw ArrayIndexOutOfBounds here.
+        if (offset < 0 || offset + size > buffer.size) return -1
         val index = position / CHUNK
         val data = try {
             val wanted = chunk(index)
@@ -68,6 +71,11 @@ class ChunkedReader(
             }
         } catch (e: RejectedExecutionException) {
             return -1
+        } catch (e: CancellationException) {
+            // close() cancels in-flight reads via shutdownNow: a clean
+            // stop, not a player error, when this source is closed.
+            if (closed) return -1
+            throw IOException("the PC's file read was cancelled", e)
         } catch (e: ExecutionException) {
             forget(index)
             throw IOException("can't read the PC's file", e.cause)

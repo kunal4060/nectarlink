@@ -42,7 +42,15 @@ internal object TransferNotifications {
 
     private val lastPosted = java.util.concurrent.ConcurrentHashMap<String, Pair<Long, Int>>()
 
-    private fun idOf(transfer: Transfer) = transfer.id.hashCode()
+    /**
+     * Stable ids per transfer, allocated once: hashCode()s collided, so one
+     * transfer's progress or tap target could overwrite another's. Entries
+     * are kept for the app's lifetime, as ids must stay stable across
+     * progress updates, the received notice, and Cancel.
+     */
+    private val ids = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val nextId = java.util.concurrent.atomic.AtomicInteger(1)
+    private fun idOf(transfer: Transfer) = ids.computeIfAbsent(transfer.id) { nextId.getAndIncrement() }
 
     private fun title(context: Context, transfer: Transfer): String = transferTitle(context.resources, transfer)
 
@@ -124,8 +132,9 @@ internal object TransferNotifications {
 
     /**
      * Files from a PC are saved: tap to open the first one, or the
-     * Downloads list when a folder came. When `openOnArrival` is true for a
-     * single safe document, attempts to open it immediately with the default app.
+     * Downloads list when a folder came. A handoff document is never opened
+     * on arrival: the user opens it by tapping the notification, so they
+     * can decline or inspect it first.
      */
     fun received(context: Context, transfer: Transfer, files: List<ReceivedFiles.Published>, pcName: String) {
         if (files.isEmpty()) return
@@ -134,12 +143,6 @@ internal object TransferNotifications {
             files.size == 1 &&
             transfer.files.toInt() == 1 &&
             app.nectarlink.core.isSafeHandoffDocument(first.name)
-        val directView = Intent(Intent.ACTION_VIEW)
-            .setDataAndType(first.uri, first.mime)
-            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        if (isHandoffDoc) {
-            runCatching { context.startActivity(directView) }
-        }
         if (!allowed(context)) return
         val open = if (transfer.files.toInt() == transfer.names.size) {
             Intent.createChooser(

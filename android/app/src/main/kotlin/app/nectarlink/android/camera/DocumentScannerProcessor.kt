@@ -66,6 +66,9 @@ data class QuadCorners(
  */
 object DocumentScannerProcessor {
     private const val MAX_WORK_SIDE = 180
+
+    /** Largest source side rectify works from (matches its output cap). */
+    private const val MAX_RECTIFY_SIDE = 2200
     private const val MIN_QUAD_AREA_FRACTION = 0.15f
     private const val MIN_INTERIOR_ANGLE_DEG = 45f
     private const val MAX_INTERIOR_ANGLE_DEG = 135f
@@ -552,16 +555,31 @@ object DocumentScannerProcessor {
         val w = bitmap.width
         val h = bitmap.height
         if (w < 16 || h < 16) return DEFAULT_QUAD
-        val pixels = IntArray(w * h)
-        bitmap.getPixels(pixels, 0, w, 0, 0, w, h)
-        val luma = ByteArray(w * h) { i ->
-            val c = pixels[i]
-            val r = c ushr 16 and 0xFF
-            val g = c ushr 8 and 0xFF
-            val b = c and 0xFF
-            ((77 * r + 150 * g + 29 * b) ushr 8).toByte()
+        // Downscale first: the working size is 180px, but the old code
+        // allocated full-resolution pixel/luma arrays and OOM-crashed on
+        // high-res captures before ever getting there.
+        val scale = min(1f, MAX_WORK_SIDE.toFloat() / max(w, h).toFloat())
+        val small = if (scale < 1f) {
+            Bitmap.createScaledBitmap(bitmap, (w * scale).roundToInt().coerceAtLeast(16), (h * scale).roundToInt().coerceAtLeast(16), true)
+        } else {
+            bitmap
         }
-        return detectDocumentQuad(luma, w, h)
+        try {
+            val sw = small.width
+            val sh = small.height
+            val pixels = IntArray(sw * sh)
+            small.getPixels(pixels, 0, sw, 0, 0, sw, sh)
+            val luma = ByteArray(sw * sh) { i ->
+                val c = pixels[i]
+                val r = c ushr 16 and 0xFF
+                val g = c ushr 8 and 0xFF
+                val b = c and 0xFF
+                ((77 * r + 150 * g + 29 * b) ushr 8).toByte()
+            }
+            return detectDocumentQuad(luma, sw, sh)
+        } finally {
+            if (small !== bitmap) small.recycle()
+        }
     }
 
     /**
@@ -572,6 +590,34 @@ object DocumentScannerProcessor {
         bitmap: Bitmap,
         normalizedQuad: QuadCorners,
         enhance: Boolean = true,
+    ): Bitmap {
+        // Work from a source capped at the output cap (2200px): the old
+        // code allocated a full-resolution pixel array first, which
+        // OOM-crashed on high-res captures. The quad is normalized, so it
+        // still maps onto the downscaled source.
+        val longest = max(bitmap.width, bitmap.height)
+        val work = if (longest > MAX_RECTIFY_SIDE) {
+            val scale = MAX_RECTIFY_SIDE.toFloat() / longest.toFloat()
+            Bitmap.createScaledBitmap(
+                bitmap,
+                (bitmap.width * scale).roundToInt().coerceAtLeast(64),
+                (bitmap.height * scale).roundToInt().coerceAtLeast(64),
+                true,
+            )
+        } else {
+            bitmap
+        }
+        try {
+            return rectifyFrom(work, normalizedQuad, enhance)
+        } finally {
+            if (work !== bitmap) work.recycle()
+        }
+    }
+
+    private fun rectifyFrom(
+        bitmap: Bitmap,
+        normalizedQuad: QuadCorners,
+        enhance: Boolean,
     ): Bitmap {
         val w = bitmap.width
         val h = bitmap.height

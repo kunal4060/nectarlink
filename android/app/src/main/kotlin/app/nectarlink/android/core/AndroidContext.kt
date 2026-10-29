@@ -14,12 +14,15 @@ object AndroidContext {
 
     fun install(context: Context) {
         if (installed) return
-        installed = true
+        // Marked installed only on success: a failed load used to disable
+        // this feature for the whole process, falling back to public DNS
+        // until a force-restart.
         runCatching {
             // The core's library, as JNA loads it for everything else: the same copy.
             System.loadLibrary("nectarlink_ffi")
             nativeInstall(context.applicationContext)
-        }.onFailure { Log.w(TAG, "the core can't read the phone's DNS servers", it) }
+        }.onSuccess { installed = true }
+            .onFailure { Log.w(TAG, "the core can't read the phone's DNS servers", it) }
     }
 
     @JvmStatic private external fun nativeInstall(context: Context)

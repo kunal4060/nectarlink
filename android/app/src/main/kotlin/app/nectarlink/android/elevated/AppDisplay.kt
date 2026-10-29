@@ -2,6 +2,7 @@
 package app.nectarlink.android.elevated
 
 import android.annotation.SuppressLint
+import android.app.KeyguardManager
 import android.content.Context
 import android.content.ContextWrapper
 import android.hardware.display.DisplayManager
@@ -70,6 +71,14 @@ class AppDisplay(
             })
             data.flush()
             if (!fullScreen) {
+                // Never open an app while the phone is locked: the window
+                // used to sit on an ALWAYS_UNLOCKED display, so a paired PC
+                // could open and control any app (banking included) past
+                // the lock screen. Fail closed when the lock state is unknown.
+                if (isDeviceLocked()) {
+                    System.err.println("refusing to launch $pkg while the phone is locked")
+                    return
+                }
                 launch(pkg, displayId)
                 watchActivities(displayId)
                 keepActive(displayId)
@@ -244,10 +253,17 @@ class AppDisplay(
         }
     }
 
+    /** Whether the phone is locked now; true when that can't be told (fail closed). */
+    private fun isDeviceLocked(): Boolean = runCatching {
+        val keyguard = ShellContext.get().getSystemService(KeyguardManager::class.java) ?: return@runCatching true
+        keyguard.isKeyguardLocked
+    }.getOrDefault(true)
+
     private fun createDisplay(w: Int, h: Int, d: Int, surface: Surface): VirtualDisplay {
         var flags = PUBLIC or OWN_CONTENT_ONLY or SUPPORTS_TOUCH or ROTATES_WITH_CONTENT or DESTROY_CONTENT_ON_REMOVAL
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            flags = flags or TRUSTED or OWN_DISPLAY_GROUP or ALWAYS_UNLOCKED or TOUCH_FEEDBACK_DISABLED
+            // No ALWAYS_UNLOCKED: the window follows the phone's lock state.
+            flags = flags or TRUSTED or OWN_DISPLAY_GROUP or TOUCH_FEEDBACK_DISABLED
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
             flags = flags or OWN_FOCUS or DEVICE_DISPLAY_GROUP
@@ -397,7 +413,6 @@ class AppDisplay(
         private const val DESTROY_CONTENT_ON_REMOVAL = 1 shl 8
         private const val TRUSTED = 1 shl 10
         private const val OWN_DISPLAY_GROUP = 1 shl 11
-        private const val ALWAYS_UNLOCKED = 1 shl 12
         private const val TOUCH_FEEDBACK_DISABLED = 1 shl 13
         private const val OWN_FOCUS = 1 shl 14
         private const val DEVICE_DISPLAY_GROUP = 1 shl 15

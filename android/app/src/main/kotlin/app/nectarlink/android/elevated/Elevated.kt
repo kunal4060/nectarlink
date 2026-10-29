@@ -136,6 +136,8 @@ object Elevated {
     suspend fun setUpWithRoot(): Boolean = withContext(Dispatchers.IO) {
         if (!isRootAvailable()) return@withContext false
         val started = lock.withLock {
+            // An explicit start: the user asked for Elevated again.
+            stoppedByUser = false
             if (running) return@withLock true
             _state.value = State.Starting
             tryStartWithRootLocked()
@@ -170,9 +172,17 @@ object Elevated {
 
     private var retryJob: Job? = null
     @Volatile private var retryAttempt = 0
+    /**
+     * Set by [stop]: the user turned Elevated off. Watchers and retries
+     * must not restart it; only an explicit [start] clears it (pairing and
+     * root setup route through [start]). In-memory only: a process restart
+     * resumes the previous auto-start behaviour.
+     */
+    @Volatile private var stoppedByUser = false
 
     /** The network changed: try now, and keep trying from a short delay. */
     fun onNetworkChanged() {
+        if (stoppedByUser) return
         retryAttempt = 0
         scope.launch { start() }
     }
@@ -191,6 +201,7 @@ object Elevated {
 
     /** Tries again later, while it can still work: set up, not running, on Wi-Fi (or through root). */
     private fun scheduleRetry() {
+        if (stoppedByUser) return
         if (!(paired() || usesRoot()) || running || BankingPause.isPaused(context)) return
         if (!usesRoot() && !onWifi()) return
         val wait = RETRY_MS[retryAttempt.coerceAtMost(RETRY_MS.lastIndex)]
@@ -291,6 +302,8 @@ object Elevated {
             return@withContext false
         }
         val started = lock.withLock {
+            // An explicit start: the user asked for Elevated again.
+            stoppedByUser = false
             if (running) return@withLock true
             _state.value = State.Starting
             if (usesRoot() && tryStartWithRootLocked()) {
@@ -573,9 +586,15 @@ object Elevated {
     }
 
     /** Stops the helper and disconnects. */
-    suspend fun stop() = withContext(Dispatchers.IO) { lock.withLock { stopLocked() } }
+    suspend fun stop() = withContext(Dispatchers.IO) {
+        lock.withLock {
+            stoppedByUser = true
+            stopLocked()
+        }
+    }
 
     private fun stopLocked() {
+        cancelRetry()
         screenOffRequested = false
         rootActive = false
         input = null
@@ -760,19 +779,31 @@ object Elevated {
     /**
      * Writes [line] to the helper. Android doesn't allow socket writes on
      * the main thread (they throw, which read as the helper having gone);
-     * a line sent from there goes out on [offMain], in order.
+     * a line sent from there goes out on [offMain], in order. Every other
+     * thread goes through the same single executor, so a queued
+     * main-thread line can never overtake — or be overtaken by — a direct
+     * write (which used to invert press/release ordering).
      */
     private fun send(writer: Writer, line: String): Boolean {
         if (Looper.myLooper() == Looper.getMainLooper()) {
             offMain.execute { sendNow(writer, line) }
             return true
         }
-        return sendNow(writer, line)
+        if (Thread.currentThread().name == OFF_MAIN_NAME) return sendNow(writer, line)
+        return try {
+            offMain.submit<Boolean> { sendNow(writer, line) }.get()
+        } catch (e: Exception) {
+            Log.i(TAG, "the input helper went away", e)
+            false
+        }
     }
 
     private val offMain = java.util.concurrent.Executors.newSingleThreadExecutor { r ->
-        Thread(r, "elevated-send").apply { isDaemon = true }
+        Thread(r, OFF_MAIN_NAME).apply { isDaemon = true }
     }
+
+    /** The [offMain] thread's name, so [send] never waits on itself. */
+    private const val OFF_MAIN_NAME = "elevated-send"
 
     private fun sendNow(writer: Writer, line: String): Boolean = try {
         require('\r' !in line && '\n' !in line)

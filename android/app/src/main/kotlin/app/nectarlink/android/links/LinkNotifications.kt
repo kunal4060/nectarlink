@@ -30,6 +30,8 @@ object LinkNotifications {
     private const val TAG = "link"
     private const val CLIP_TAG = "clip_suggestion"
     private const val CLIP_NOTIFICATION_ID = 0x434C4950 // "CLIP"
+    /** Fresh ids for link notifications (see [show]); the clip chip keeps one id by design. */
+    private val nextNotificationId = java.util.concurrent.atomic.AtomicInteger(1)
 
     fun createChannel(context: Context) {
         context.getSystemService(NotificationManager::class.java).createNotificationChannel(
@@ -45,26 +47,37 @@ object LinkNotifications {
             return false
         }
         val handoff = app.nectarlink.core.extractHandoffLink(url)
-        val viewIntent = if (url.startsWith("geo:", ignoreCase = true)) {
-            val geoIntent = Intent(Intent.ACTION_VIEW, url.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            if (geoIntent.resolveActivity(context.packageManager) != null) {
-                geoIntent
-            } else {
-                val webFallback = app.nectarlink.core.geoToMapsHttps(url) ?: url
-                Intent(Intent.ACTION_VIEW, webFallback.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        // Only web and map links may be opened, and only when the user taps
+        // the notification: a PC-sent link must never open a dialer, a
+        // composer, or another app's deep link on its own. Anything else
+        // shows as text only, with no tap target.
+        val scheme = url.substringBefore(':').lowercase()
+        val viewIntent = when (scheme) {
+            "geo" -> {
+                val geoIntent = Intent(Intent.ACTION_VIEW, url.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                if (geoIntent.resolveActivity(context.packageManager) != null) {
+                    geoIntent
+                } else {
+                    val webFallback = app.nectarlink.core.geoToMapsHttps(url) ?: url
+                    Intent(Intent.ACTION_VIEW, webFallback.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
             }
-        } else {
-            Intent(Intent.ACTION_VIEW, url.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            "http", "https" ->
+                Intent(Intent.ACTION_VIEW, url.toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            else -> null
         }
-        // When NectarLink is in the foreground, Android allows opening the target right away.
-        runCatching { context.startActivity(viewIntent) }
 
-        val open = PendingIntent.getActivity(
-            context,
-            url.hashCode(),
-            viewIntent,
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
+        // A fresh id per link: hashCode()s collided, so tapping an older
+        // link could open a newer one's target (and vice versa).
+        val notificationId = nextNotificationId.getAndIncrement()
+        val open = viewIntent?.let {
+            PendingIntent.getActivity(
+                context,
+                notificationId,
+                it,
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        }
         val from = pcName.ifEmpty { context.getString(R.string.your_pc) }
         val title = when (handoff?.kind) {
             app.nectarlink.core.HandoffKind.MAP_LOCATION -> context.getString(R.string.handoff_map_from, from)
@@ -77,18 +90,19 @@ object LinkNotifications {
             app.nectarlink.core.HandoffKind.VIDEO_LINK -> context.getString(R.string.handoff_action_continue_video)
             else -> context.getString(R.string.clip_action_open)
         }
-        val notification = NotificationCompat.Builder(context, CHANNEL)
+        val builder = NotificationCompat.Builder(context, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
             .setContentText(shown)
             .setStyle(NotificationCompat.BigTextStyle().bigText(shown))
-            .setContentIntent(open)
-            .addAction(0, actionLabel, open)
             .setAutoCancel(true)
             .setCategory(NotificationCompat.CATEGORY_RECOMMENDATION)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
-            .build()
-        return runCatching { NotificationManagerCompat.from(context).notify(TAG, url.hashCode(), notification) }.isSuccess
+        if (open != null) {
+            builder.setContentIntent(open)
+            builder.addAction(0, actionLabel, open)
+        }
+        return runCatching { NotificationManagerCompat.from(context).notify(TAG, notificationId, builder.build()) }.isSuccess
     }
 
     /** Short action chip label for a [ClipKind]. */

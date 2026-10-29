@@ -1209,7 +1209,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      */
     fun sendFiles(pcId: String, uris: List<Uri>, handoff: Boolean = false) {
         scope.launch(Dispatchers.IO) {
-            send(pcId, OutgoingFiles.open(context, uris), handoff)
+            val opened = OutgoingFiles.openCounted(context, uris)
+            send(pcId, opened.files, handoff, skipped = opened.skipped, requested = uris.size)
         }
     }
 
@@ -1229,10 +1230,16 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
         }
     }
 
-    private fun send(pcId: String, files: List<FileToSend>, handoff: Boolean = false) {
+    private fun send(pcId: String, files: List<FileToSend>, handoff: Boolean = false, skipped: Int = 0, requested: Int = files.size) {
         if (files.isEmpty()) {
             _messages.tryEmit(context.getString(R.string.transfer_nothing))
             return
+        }
+        if (skipped > 0) {
+            // Partial sends used to look complete on both sides. No string
+            // resource covers this yet (resources are out of this fix's
+            // scope), so the count is reported as a plain message.
+            _messages.tryEmit("$skipped of $requested files could not be opened and were not sent")
         }
         scope.launch(Dispatchers.IO) {
             startJob?.join()
@@ -1721,6 +1728,12 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
     fun clearReceivedFileHistory() {
         scope.launch(Dispatchers.IO) {
             startJob?.join()
+            // Clearing mid-transfer deleted the file being received. Skip
+            // the whole clear while any transfer is still unfinished.
+            if (_state.value.transfers.any { !it.isFinished() }) {
+                Log.w(TAG, "not clearing received files while a transfer is unfinished")
+                return@launch
+            }
             java.io.File(context.cacheDir, "received").listFiles()?.forEach { file ->
                 runCatching { file.deleteRecursively() }
             }
@@ -1784,7 +1797,7 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                         _messages.tryEmit(msg)
                     }
                 }
-                TimelineKind.FILE, TimelineKind.PHOTO, TimelineKind.RECORDING -> {
+                TimelineKind.FILE, TimelineKind.PHOTO -> {
                     val target = entry.target
                     when {
                         target.startsWith("content://") -> sendFiles(entry.deviceId, listOf(Uri.parse(target)))
@@ -1939,7 +1952,22 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
                 else PairingState.Failed(PairingFailure.Declined),
             )
         }
-        scope.launch(Dispatchers.IO) { runCatching { node?.pairingConfirm(matches) } }
+        // A failed confirmation used to be swallowed here, leaving the
+        // screen on "confirmed" while the PC was never paired. On failure,
+        // fall back to Failed (unless the state already moved on, e.g. to
+        // Paired); success is confirmed by the core's Paired event.
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching { node?.pairingConfirm(matches) }.isSuccess && node != null
+            if (!ok && matches) {
+                _state.update { s ->
+                    if (s.pairing == PairingState.Confirmed(comparing.peer, comparing.code)) {
+                        s.copy(pairing = PairingState.Failed(PairingFailure.Other("pairing confirmation failed")))
+                    } else {
+                        s
+                    }
+                }
+            }
+        }
     }
 
     /** Keeps local discovery working while the pairing screen is open. */
@@ -2329,6 +2357,8 @@ class Core(context: Context, private val scope: CoroutineScope) : EventListener 
      * Blocks; call off the main thread.
      */
     fun readWatchFile(pcId: String, offset: Long, length: Long): ByteArray {
+        // Negative values used to wrap to near-2^64 via toULong().
+        if (offset < 0 || length < 0) throw java.io.IOException("negative watch-file offset or length")
         val running = node ?: throw java.io.IOException("NectarLink isn't running")
         return running.watchFileRead(pcId, offset.toULong(), length.toULong()).data
     }

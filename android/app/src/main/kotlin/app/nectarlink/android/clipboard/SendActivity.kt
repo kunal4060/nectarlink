@@ -115,8 +115,14 @@ class SendActivity : ComponentActivity() {
     }
 
     private fun targetPcId(): String? {
-        val explicit = intent?.getStringExtra(EXTRA_PC_ID)?.takeIf { it.isNotBlank() }
-        if (explicit != null) return explicit
+        // EXTRA_PC_ID is trusted only from this app's own intents (the tile
+        // and notification intents) or from a Direct Share shortcut, whose
+        // id Android supplies. Any other app could otherwise forge the
+        // extra on an ACTION_SEND and forward files/text to a paired PC
+        // without the user picking that PC.
+        if (intent?.action == ACTION_SEND_CLIPBOARD || intent?.action == ACTION_SEND_FILES) {
+            intent?.getStringExtra(EXTRA_PC_ID)?.takeIf { it.isNotBlank() }?.let { return it }
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val shortcutId = intent?.getStringExtra(Intent.EXTRA_SHORTCUT_ID)
             DirectShareTargets.pcIdFromShortcutId(shortcutId)?.let { return it }

@@ -34,7 +34,9 @@ object ReceivedFiles {
             item.walkTopDown().filter { it.isFile }.mapNotNull { file ->
                 val fileParent = file.parentFile ?: return@mapNotNull null
                 val itemParent = item.parentFile ?: return@mapNotNull null
-                val folder = fileParent.relativeTo(itemParent).invariantSeparatorsPath
+                // A non-descendant entry used to throw here and abort the
+                // whole folder publish; publish it flat instead.
+                val folder = runCatching { fileParent.relativeTo(itemParent).invariantSeparatorsPath }.getOrNull()
                 publishFile(context, file, folder)
             }.toList().also {
                 item.walkBottomUp().filter { it.isDirectory }.forEach { dir ->
@@ -76,13 +78,21 @@ object ReceivedFiles {
         Published(uri, file.name, mime)
     }.getOrNull()
 
+    /** Drops ".", ".." and empty segments so a received folder can't escape Download/Nectarlink. */
+    private fun cleanFolder(folder: String?): String? =
+        folder?.split('/', '\\')
+            ?.map { it.trim() }
+            ?.filter { it.isNotEmpty() && it != "." && it != ".." }
+            ?.joinToString("/")
+            ?.takeIf { it.isNotEmpty() }
+
     @RequiresApi(Build.VERSION_CODES.Q)
     private fun toMediaStore(context: Context, file: File, displayName: String, mime: String, folder: String?): Uri {
         val resolver = context.contentResolver
         val values = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
             put(MediaStore.MediaColumns.MIME_TYPE, mime)
-            put(MediaStore.MediaColumns.RELATIVE_PATH, listOfNotNull(Environment.DIRECTORY_DOWNLOADS, "Nectarlink", folder).joinToString("/"))
+            put(MediaStore.MediaColumns.RELATIVE_PATH, listOfNotNull(Environment.DIRECTORY_DOWNLOADS, "Nectarlink", cleanFolder(folder)).joinToString("/"))
             put(MediaStore.MediaColumns.IS_PENDING, 1)
         }
         val uri = checkNotNull(resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values))
@@ -99,7 +109,7 @@ object ReceivedFiles {
     /** Android 8–9: the app's own Downloads folder, shared through a FileProvider. */
     private fun toAppDownloads(context: Context, file: File, displayName: String, folder: String?): Uri {
         val base = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "Nectarlink")
-        val dir = (if (folder == null) base else File(base, folder)).apply { mkdirs() }
+        val dir = (if (cleanFolder(folder) == null) base else File(base, cleanFolder(folder))).apply { mkdirs() }
         val baseFile = File(displayName)
         var target = File(dir, baseFile.name)
         var n = 2

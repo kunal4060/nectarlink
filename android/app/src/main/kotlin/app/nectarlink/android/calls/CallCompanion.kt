@@ -4,6 +4,8 @@ package app.nectarlink.android.calls
 import android.app.AppOpsManager
 import android.content.Context
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.Process
 import android.telecom.Call
 import android.telecom.CallAudioState
@@ -109,14 +111,27 @@ class CallCompanion : InCallService() {
         return true
     }
 
+    /** Guards a delayed DTMF stop against a newer digit's tone. */
+    private var dtmfToken = 0
+    private val dtmfHandler = Handler(Looper.getMainLooper())
+
     private fun dtmf(digit: Char): Boolean {
         val call = call ?: return false
         call.playDtmfTone(digit)
-        call.stopDtmfTone()
+        // Stopping at once used to give the tone zero duration, so PC
+        // keypad presses never registered on IVR menus. It plays for
+        // DTMF_MS; a newer digit's stop only stops its own tone.
+        val token = ++dtmfToken
+        dtmfHandler.postDelayed({
+            if (token == dtmfToken) runCatching { call.stopDtmfTone() }
+        }, DTMF_MS)
         return true
     }
 
     companion object {
+        /** How long a PC keypad tone plays before it is stopped. */
+        private const val DTMF_MS = 120L
+
         @Volatile private var instance: CallCompanion? = null
 
         /** Whether Telecom has bound it (there's a call, and the phone allows companions). */

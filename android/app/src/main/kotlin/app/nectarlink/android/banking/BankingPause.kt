@@ -133,13 +133,41 @@ object BankingPause {
     fun resume(context: Context) {
         val saved = prefs(context)
         if (!saved.getBoolean(PAUSED, false)) return
+        // The saved record is the only copy of what was on: it is cleared
+        // only once every restore succeeded. Clearing it on a failure (e.g.
+        // the permission to change settings was revoked) used to destroy
+        // the record and leave everything off, with no retry.
+        if (!canChangeSettings(context)) {
+            Log.w(TAG, "can't turn things back on: no permission to change settings; keeping the saved state")
+            return
+        }
         val resolver = context.contentResolver
-        runCatching {
-            if (saved.getBoolean(WAS_DEVELOPER, false)) Settings.Global.putInt(resolver, DEVELOPER, 1)
-            if (saved.getBoolean(WAS_USB_DEBUGGING, false)) Settings.Global.putInt(resolver, USB_DEBUGGING, 1)
-            if (saved.getBoolean(WAS_WIRELESS_DEBUGGING, false)) Settings.Global.putInt(resolver, WIRELESS_DEBUGGING, 1)
-            if (saved.getBoolean(WAS_ACCESSIBILITY, false)) setAccessibility(context, true)
-        }.onFailure { Log.w(TAG, "couldn't turn everything back on", it) }
+        val failures = mutableListOf<String>()
+        fun restore(name: String, wasOn: Boolean, write: () -> Unit) {
+            if (!wasOn) return
+            runCatching(write).onFailure {
+                Log.w(TAG, "couldn't turn $name back on", it)
+                failures += name
+            }
+        }
+        restore("developer options", saved.getBoolean(WAS_DEVELOPER, false)) {
+            Settings.Global.putInt(resolver, DEVELOPER, 1)
+        }
+        restore("USB debugging", saved.getBoolean(WAS_USB_DEBUGGING, false)) {
+            Settings.Global.putInt(resolver, USB_DEBUGGING, 1)
+        }
+        restore("wireless debugging", saved.getBoolean(WAS_WIRELESS_DEBUGGING, false)) {
+            Settings.Global.putInt(resolver, WIRELESS_DEBUGGING, 1)
+        }
+        restore("accessibility", saved.getBoolean(WAS_ACCESSIBILITY, false)) {
+            setAccessibility(context, true)
+        }
+        if (failures.isNotEmpty()) {
+            // Stay paused, keep the record and the notification: the next
+            // resume attempt retries the restores instead of losing them.
+            Log.w(TAG, "not clearing the saved state; failed to restore: ${failures.joinToString()}")
+            return
+        }
         saved.edit(commit = true) {
             remove(PAUSED)
             remove(WAS_DEVELOPER)

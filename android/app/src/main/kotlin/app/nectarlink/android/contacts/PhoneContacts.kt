@@ -77,9 +77,11 @@ internal class PhoneContacts(context: Context, private val onChange: () -> Unit)
             resolver.query(Phone.CONTENT_URI, columns, null, null, order)?.use { c ->
                 while (c.moveToNext()) {
                     val contactId = c.getLong(0)
-                    val name = c.getString(1)?.trim().orEmpty()
                     val number = c.getString(4)?.trim().orEmpty()
-                    if (name.isEmpty() || number.isEmpty()) continue
+                    if (number.isEmpty()) continue
+                    // Number-only contacts used to be dropped entirely;
+                    // the number itself is their display name.
+                    val name = c.getString(1)?.trim().orEmpty().ifEmpty { number }
                     val draft = drafts.getOrPut(contactId) {
                         Draft(
                             id = contactId.toString(),

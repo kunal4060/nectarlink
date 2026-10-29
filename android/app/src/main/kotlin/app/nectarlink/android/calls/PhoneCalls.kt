@@ -45,7 +45,7 @@ internal class PhoneCalls(
     private val context = context.applicationContext
     private val main = Handler(Looper.getMainLooper())
     /** Contact lookups and reports, in order, off the main thread. */
-    private val worker = Executors.newSingleThreadExecutor()
+    private var worker = Executors.newSingleThreadExecutor()
     private var receiver: BroadcastReceiver? = null
     private var logObserver: ContentObserver? = null
     private val notifyLog = Runnable { onLogChanged() }
@@ -74,6 +74,10 @@ internal class PhoneCalls(
 
     fun start() {
         instance = this
+        if (worker.isShutdown) worker = Executors.newSingleThreadExecutor()
+        // A ringer muted by silencing a call, then lost to a crash or kill,
+        // stays muted forever unless it is undone here at the next start.
+        if (prefs().getBoolean(PREF_MUTED_RINGER, false)) restoreRinger()
         if (receiver == null && canFollow(context)) {
             receiver = object : BroadcastReceiver() {
                 override fun onReceive(context: Context, intent: Intent) {
@@ -117,6 +121,7 @@ internal class PhoneCalls(
         current = null
         // The IDLE broadcast that would unmute it no longer arrives.
         restoreRinger()
+        worker.shutdown()
     }
 
     private fun stateChanged(state: String, number: String?) {
@@ -179,7 +184,9 @@ internal class PhoneCalls(
         val number = call.number
         val incoming = call.incoming
         val since = call.since
-        worker.execute { send(call.id, phase, incoming, number, since, missedCheck) }
+        // Dropped after stop(): the executor is shut down there, and a
+        // late companion callback must not crash on a rejected task.
+        runCatching { worker.execute { send(call.id, phase, incoming, number, since, missedCheck) } }
     }
 
     private fun send(
@@ -415,6 +422,12 @@ internal class PhoneCalls(
     fun dial(number: String): Boolean {
         val trimmed = number.trim()
         if (trimmed.isEmpty()) return false
+        // MMI/USSD codes (*, #) are never dialled from a PC: Telecom may
+        // execute them (call forwarding, balance codes) with no confirmation.
+        if ('*' in trimmed || '#' in trimmed) {
+            Log.w(TAG, "refusing to dial an MMI/USSD code from a PC")
+            return false
+        }
         lastDialed = trimmed to System.currentTimeMillis()
         val uri = Uri.fromParts("tel", trimmed, null)
         return runCatching {
@@ -456,6 +469,8 @@ internal class PhoneCalls(
 
     private var mutedRinger = false
 
+    private fun prefs() = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
     @SuppressLint("MissingPermission")
     private fun silence(telecom: TelecomManager) {
         // Telecom's own silencing needs a permission only system apps get on
@@ -466,12 +481,16 @@ internal class PhoneCalls(
             val audio = context.getSystemService(AudioManager::class.java)
             audio.adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_MUTE, 0)
             mutedRinger = true
+            // Persisted, not just in memory: an app kill while silenced
+            // used to leave the ringer muted indefinitely.
+            runCatching { prefs().edit().putBoolean(PREF_MUTED_RINGER, true).apply() }
         }
     }
 
     private fun restoreRinger() {
-        if (!mutedRinger) return
+        if (!mutedRinger && !prefs().getBoolean(PREF_MUTED_RINGER, false)) return
         mutedRinger = false
+        runCatching { prefs().edit().remove(PREF_MUTED_RINGER).apply() }
         runCatching {
             context.getSystemService(AudioManager::class.java).adjustStreamVolume(AudioManager.STREAM_RING, AudioManager.ADJUST_UNMUTE, 0)
         }
@@ -479,6 +498,8 @@ internal class PhoneCalls(
 
     companion object {
         private const val TAG = "PhoneCalls"
+        private const val PREFS = "phone_calls"
+        private const val PREF_MUTED_RINGER = "muted_ringer"
 
         @Volatile private var instance: PhoneCalls? = null
 

@@ -16,8 +16,7 @@ import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * Plays live PCM-16LE audio frames streamed from a paired PC (`pc.audio.relay`)
- * through the phone's full media DSP pipeline (`PERFORMANCE_MODE_NONE`) so OEM
- * speaker tuning / Dolby Atmos / bass enhancement remain active, while a
+ * through the phone's low-latency path (`PERFORMANCE_MODE_LOW_LATENCY`), while a
  * dedicated `THREAD_PRIORITY_URGENT_AUDIO` worker maintains a tight ~35–45 ms
  * jitter cushion without ever calling `pause()`/`flush()` mid-stream.
  */
@@ -46,14 +45,19 @@ class PcSpeakerPlayer(
 
     fun playFrame(sampleRate: Int, channels: Int, pcm: ByteArray) {
         if (pcm.isEmpty() || sampleRate <= 0 || channels <= 0) return
+        // No resampling or remixing happens here, so a rate or channel
+        // count outside what the track is built for must be dropped, not
+        // relabelled: coercing 192 kHz to 96 kHz played at half speed, and
+        // labelling 3+ channels as stereo garbled them.
+        if (sampleRate !in 8_000..96_000 || channels > 2) return
         activity.markActive()
         if (!_playing.value) {
             _playing.value = true
         }
         ensureWatchdog()
 
-        val safeRate = sampleRate.coerceIn(8_000, 96_000)
-        val safeChannels = if (channels >= 2) 2 else 1
+        val safeRate = sampleRate
+        val safeChannels = channels
         val frameBytes = safeChannels * 2
         // Cap queued backlog at ~40 ms so Wi-Fi bursts never build up latency
         // and we never need to flush the hardware AudioTrack.

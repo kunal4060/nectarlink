@@ -392,6 +392,7 @@ internal fun buildNormalizedSvgPath(
 /** Reports the battery whenever it changes meaningfully. */
 class BatteryMonitor(private val context: Context, private val onChange: (Battery) -> Unit) {
     private var last: Battery? = null
+    private var started = false
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -435,6 +436,8 @@ class BatteryMonitor(private val context: Context, private val onChange: (Batter
     }
 
     fun start() {
+        if (started) return
+        started = true
         // ACTION_BATTERY_CHANGED is sticky: the current state arrives at once.
         ContextCompat.registerReceiver(
             context, receiver, IntentFilter(Intent.ACTION_BATTERY_CHANGED), ContextCompat.RECEIVER_NOT_EXPORTED,
@@ -442,6 +445,8 @@ class BatteryMonitor(private val context: Context, private val onChange: (Batter
     }
 
     fun stop() {
+        if (!started) return
+        started = false
         runCatching { context.unregisterReceiver(receiver) }
         last = null
     }
@@ -747,11 +752,17 @@ class NetworkMonitor(context: Context, private val onChange: () -> Unit) {
         }
     }
 
+    private var started = false
+
     fun start() {
+        if (started) return
+        started = true
         connectivity?.registerDefaultNetworkCallback(callback)
     }
 
     fun stop() {
+        if (!started) return
+        started = false
         runCatching { connectivity?.unregisterNetworkCallback(callback) }
     }
 }
@@ -823,7 +834,11 @@ class AccentMonitor(private val context: Context, private val onChange: (UInt?) 
         emitIfChanged(force = true)
     }
 
+    private var started = false
+
     fun start() {
+        if (started) return
+        started = true
         prefs?.registerOnSharedPreferenceChangeListener(prefsListener)
         runCatching {
             val uri = Settings.Secure.getUriFor("theme_customization_overlay_packages")
@@ -844,6 +859,8 @@ class AccentMonitor(private val context: Context, private val onChange: (UInt?) 
     }
 
     fun stop() {
+        if (!started) return
+        started = false
         prefs?.unregisterOnSharedPreferenceChangeListener(prefsListener)
         runCatching { context.contentResolver.unregisterContentObserver(secureObserver) }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {

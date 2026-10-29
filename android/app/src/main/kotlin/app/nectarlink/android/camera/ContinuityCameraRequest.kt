@@ -75,6 +75,12 @@ object ContinuityCameraRequests {
             mode = cleanMode,
             pcName = fromName,
         )
+        // A second request supersedes the first: take the first PC's
+        // notification away instead of orphaning its request.
+        val previous = _active.value
+        if (previous != null && (previous.pcId != pcId || previous.requestId != requestId)) {
+            runCatching { NotificationManagerCompat.from(context).cancel(TAG, previous.pcId.hashCode()) }
+        }
         _active.value = req
 
         val openIntent = Intent(context, ContinuityCameraActivity::class.java).apply {
@@ -88,15 +94,16 @@ object ContinuityCameraRequests {
         }
 
         // Launch directly if the app is currently foregrounded or allowed to start activities.
-        runCatching { context.startActivity(openIntent) }
+        val launched = runCatching { context.startActivity(openIntent) }.isSuccess
 
+        var posted = false
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
         ) {
             createChannel(context)
             val openPending = PendingIntent.getActivity(
                 context,
-                requestId.hashCode(),
+                pendingIdFor(requestId),
                 openIntent,
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
@@ -121,12 +128,23 @@ object ContinuityCameraRequests {
                 .setCategory(NotificationCompat.CATEGORY_CALL)
                 .setPriority(NotificationCompat.PRIORITY_HIGH)
                 .build()
-            runCatching {
+            posted = runCatching {
                 NotificationManagerCompat.from(context).notify(TAG, pcId.hashCode(), notification)
-            }
+            }.isSuccess
         }
-        return true
+        // False when neither the activity launch nor the notification got
+        // through: the PC must not be told a capture screen was shown.
+        return launched || posted
     }
+
+    /**
+     * Stable PendingIntent ids per request: requestId.hashCode() collided
+     * across requests, so tapping one request could open another's.
+     */
+    private val pendingIds = java.util.concurrent.ConcurrentHashMap<String, Int>()
+    private val nextPendingId = java.util.concurrent.atomic.AtomicInteger(1)
+    private fun pendingIdFor(requestId: String) =
+        pendingIds.computeIfAbsent(requestId) { nextPendingId.getAndIncrement() }
 
     /** Called when the PC cancels an active `camera.capture` request. */
     fun cancelFromPc(context: Context, pcId: String, requestId: String) {
